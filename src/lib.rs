@@ -1,5 +1,6 @@
 use after_effects as ae;
 
+mod gpu;
 mod refract;
 
 // ---- Parameter IDs ----

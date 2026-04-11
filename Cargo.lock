@@ -603,6 +603,7 @@ version = "1.0.0"
 dependencies = [
  "after-effects",
  "bytemuck",
+ "cc",
  "cudarc",
  "pipl",
  "rayon",

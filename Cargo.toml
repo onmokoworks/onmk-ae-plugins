@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 [dependencies]
 after-effects = { git = "https://github.com/virtualritz/after-effects.git" }
 rayon = "1"
-cudarc = { version = "0.19", default-features = false, features = ["driver", "std", "fallback-dynamic-loading", "cuda-version-from-build-system"] }
+cudarc = { version = "0.19", default-features = false, features = ["driver", "std", "fallback-dynamic-loading", "cuda-version-from-build-system", "nvrtc"] }
 bytemuck = { version = "1", features = ["derive"] }
 
 [profile.release]
@@ -18,3 +18,4 @@ codegen-units = 1
 
 [build-dependencies]
 pipl = { git = "https://github.com/virtualritz/after-effects.git" }
+cc = "1"

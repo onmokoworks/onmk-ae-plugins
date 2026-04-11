@@ -496,9 +496,28 @@ fn render_cpu(
     let (src, w, h) = layer_to_flat(in_layer);
     let mask = get_layer_flat(params, Params::MaskLayer, in_data, w, h);
     let bg = get_layer_flat(params, Params::BgLayer, in_data, w, h);
-    let result = refract::render(&rp, &src, mask.as_deref(), bg.as_deref(), w, h);
+    let result = dispatch_render(&rp, &src, mask.as_deref(), bg.as_deref(), w, h);
     flat_to_layer(&result, out_layer, w, h);
     Ok(())
+}
+
+/// Choose GPU or CPU backend based on the `use_gpu` param and CUDA availability.
+/// GPU failures silently fall back to CPU so a broken CUDA environment never
+/// breaks rendering.
+fn dispatch_render(
+    rp: &RefractParams,
+    src: &[u8],
+    mask: Option<&[u8]>,
+    bg: Option<&[u8]>,
+    w: usize,
+    h: usize,
+) -> Vec<u8> {
+    if rp.use_gpu && gpu::available() {
+        if let Some(result) = gpu::render(rp, src, mask, bg, w, h) {
+            return result;
+        }
+    }
+    refract::render(rp, src, mask, bg, w, h)
 }
 
 fn get_layer_flat(
@@ -611,7 +630,7 @@ fn smart_render_cpu(
     let mask = checkout_layer_flat(&cb, MASK_CHECKOUT_ID as u32, w, h);
     let bg = checkout_layer_flat(&cb, BG_CHECKOUT_ID as u32, w, h);
 
-    let result = refract::render(&rp, &src, mask.as_deref(), bg.as_deref(), w, h);
+    let result = dispatch_render(&rp, &src, mask.as_deref(), bg.as_deref(), w, h);
     flat_to_layer(&result, &mut output_world, w, h);
 
     cb.checkin_layer_pixels(0)?;

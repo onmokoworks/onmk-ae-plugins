@@ -28,6 +28,7 @@ enum Params {
     MaskLayer,
     BgLayer,
     Mix,
+    UseGpu,
 }
 
 // ---- Plugin global state ----
@@ -307,6 +308,15 @@ impl AdobePluginGlobal for Plugin {
             }),
         )?;
 
+        params.add(
+            Params::UseGpu,
+            "Use GPU (CUDA)",
+            ae::CheckBoxDef::setup(|f| {
+                f.set_default(true);
+                f.set_label("Enable");
+            }),
+        )?;
+
         Ok(())
     }
 
@@ -372,6 +382,7 @@ pub struct RefractParams {
     pub edge_blur: f64,
     pub use_6ch: bool,
     pub mix: f32,
+    pub use_gpu: bool,
 }
 
 fn get_params(params: &ae::Parameters<Params>) -> Result<RefractParams, ae::Error> {
@@ -396,6 +407,7 @@ fn get_params(params: &ae::Parameters<Params>) -> Result<RefractParams, ae::Erro
         edge_blur: params.get(Params::EdgeBlur)?.as_float_slider()?.value().max(0.0),
         use_6ch: params.get(Params::Use6ch)?.as_checkbox()?.value(),
         mix: (params.get(Params::Mix)?.as_float_slider()?.value().clamp(0.0, 100.0) / 100.0) as f32,
+        use_gpu: params.get(Params::UseGpu)?.as_checkbox()?.value(),
     })
 }
 
@@ -521,7 +533,7 @@ fn get_layer_flat(
 // 9 = Samples, 10 = FresnelPower, 11 = Shininess, 12 = Diffuseness,
 // 13 = LightAngleX, 14 = LightAngleY, 15 = Saturation,
 // 16 = HeightStrength, 17 = HeightBlur, 18 = EdgeBlur, 19 = Use6ch,
-// 20 = MaskLayer, 21 = BgLayer, 22 = Mix
+// 20 = MaskLayer, 21 = BgLayer, 22 = Mix, 23 = UseGpu
 
 const MASK_PARAM_INDEX: i32 = 20;
 const BG_PARAM_INDEX: i32 = 21;

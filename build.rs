@@ -30,8 +30,7 @@ fn main() {
         Property::AE_Effect_Global_OutFlags_2(
             OutFlags2::FloatColorAware
                 | OutFlags2::SupportsSmartRender
-                | OutFlags2::SupportsThreadedRendering
-                | OutFlags2::SupportsGpuRenderF32,
+                | OutFlags2::SupportsThreadedRendering,
         ),
         Property::AE_Effect_Match_Name("RefractionDispersion"),
         Property::AE_Reserved_Info(13),

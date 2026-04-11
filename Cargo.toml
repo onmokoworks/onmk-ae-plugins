@@ -1,0 +1,18 @@
+[package]
+name = "refraction-dispersion"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+after-effects = { git = "https://github.com/virtualritz/after-effects.git" }
+rayon = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[build-dependencies]
+pipl = { git = "https://github.com/virtualritz/after-effects.git" }

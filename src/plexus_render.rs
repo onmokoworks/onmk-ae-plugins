@@ -56,10 +56,25 @@ fn draw_point_dot(pos: Vec3, config: &PlexusRenderConfig, output: &mut [u8]) {
 
     let radius = (config.point_size * perspective_scale * 0.5).max(0.5);
 
-    let min_x = ((local_x - radius).floor() as isize).max(0) as usize;
-    let max_x = ((local_x + radius).ceil() as isize).min(config.width.saturating_sub(1) as isize) as usize;
-    let min_y = ((local_y - radius).floor() as isize).max(0) as usize;
-    let max_y = ((local_y + radius).ceil() as isize).min(config.height.saturating_sub(1) as isize) as usize;
+    // Clamp signed bounds to the viewport before casting to usize — see
+    // detailed note in renderer::draw_particle. Negative isize values silently
+    // wrap to huge usize values and cause runaway draw loops.
+    let w = config.width as isize;
+    let h = config.height as isize;
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let min_xi = (local_x - radius).floor() as isize;
+    let max_xi = (local_x + radius).ceil() as isize;
+    let min_yi = (local_y - radius).floor() as isize;
+    let max_yi = (local_y + radius).ceil() as isize;
+    if max_xi < 0 || max_yi < 0 || min_xi >= w || min_yi >= h {
+        return;
+    }
+    let min_x = min_xi.max(0) as usize;
+    let max_x = max_xi.min(w - 1).max(0) as usize;
+    let min_y = min_yi.max(0) as usize;
+    let max_y = max_yi.min(h - 1).max(0) as usize;
 
     if min_x > max_x || min_y > max_y {
         return;

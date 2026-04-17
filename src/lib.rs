@@ -219,15 +219,22 @@ impl From<PresetColor> for ae::Pixel8 {
     }
 }
 
+/// Current preset format version. Fields not present in older presets are
+/// filled in by `#[serde(default)]`, so forward-compat is automatic as long
+/// as we never rename / repurpose a field.
+const PRESET_VERSION: u32 = 3;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct PresetSnapshot {
     version: u32,
     name: String,
+    // ---- Emitter ----
     emitter_type: i32,
     position_point: (f32, f32),
     position_z: f64,
     image_proxy_scale: i32,
+    path_sample_density: f64,
     emitter_size_linked: bool,
     emitter_size_x: f64,
     emitter_size_y: f64,
@@ -235,6 +242,7 @@ struct PresetSnapshot {
     birth_rate: f64,
     lifespan: f64,
     lifespan_var: f64,
+    // ---- Motion ----
     speed: f64,
     speed_var: f64,
     direction_x: f64,
@@ -245,6 +253,7 @@ struct PresetSnapshot {
     size_var: f64,
     rotation: f64,
     rotation_speed: f64,
+    // ---- Physics ----
     gravity_strength: f64,
     wind_x: f64,
     wind_y: f64,
@@ -254,6 +263,7 @@ struct PresetSnapshot {
     air_resistance: f64,
     bounce_enabled: bool,
     bounce_damping: f64,
+    // ---- Appearance ----
     color_mode: i32,
     color_start: PresetColor,
     color_end: PresetColor,
@@ -267,6 +277,7 @@ struct PresetSnapshot {
     size_life_mid_a: f64,
     size_life_mid_b: f64,
     size_life_end: f64,
+    // ---- Rendering ----
     shape: i32,
     image_color_mode: i32,
     image_fit_mode: i32,
@@ -281,6 +292,7 @@ struct PresetSnapshot {
     dof_aperture: f64,
     size_multiplier: f64,
     composite_on_orig: bool,
+    // ---- Child ----
     child_enabled: bool,
     child_count: i32,
     child_inherit_vel: f64,
@@ -288,81 +300,161 @@ struct PresetSnapshot {
     child_speed: f64,
     child_spread: f64,
     child_size_scale: f64,
+    // ---- System ----
     seed: i32,
-    path_sample_density: f64,
+    // ---- Plexus ----
+    plugin_mode: i32,
+    point_a_enabled: bool,
+    point_a_source_type: i32,
+    point_a_grid_res_x: i32,
+    point_a_grid_res_y: i32,
+    point_a_grid_res_z: i32,
+    point_a_grid_spacing: f64,
+    point_a_max_points: i32,
+    point_b_enabled: bool,
+    point_b_source_type: i32,
+    point_b_grid_res_x: i32,
+    point_b_grid_res_y: i32,
+    point_b_grid_spacing: f64,
+    noise_enabled: bool,
+    noise_amplitude: f64,
+    noise_frequency: f64,
+    noise_speed: f64,
+    noise_octaves: i32,
+    noise_axis_scale: i32,
+    lines_enabled: bool,
+    lines_max_distance: f64,
+    lines_width: f64,
+    lines_opacity_falloff: f64,
+    lines_color: PresetColor,
+    mesh_enabled: bool,
+    mesh_max_edge: f64,
+    mesh_opacity: f64,
+    mesh_color: PresetColor,
+    beams_enabled: bool,
+    beams_source_group: i32,
+    beams_max_distance: f64,
+    beams_width: f64,
+    beams_color: PresetColor,
+    plexus_point_size: f64,
+    plexus_point_color: PresetColor,
 }
 
 impl Default for PresetSnapshot {
+    // IMPORTANT: every numeric default here MUST match the `f.set_default(…)`
+    // of the corresponding parameter in `params_setup`. When the two diverge,
+    // a preset file that omits a field (older-version preset, hand-edited
+    // JSON, corrupted write) is loaded via `#[serde(default)]` and silently
+    // rewrites that param to a wrong value on `apply_preset`. A few of these
+    // were dangerously wrong in v2 (size_life_* at 35–100 vs. param range
+    // 0.0–5.0; size_multiplier at 100.0 vs. range 0.01–10.0), so fixing them
+    // is the main reason the preset format was bumped to v3.
     fn default() -> Self {
         Self {
-            version: 2,
+            version: PRESET_VERSION,
             name: String::new(),
             emitter_type: 1,
             position_point: (50.0, 50.0),
             position_z: 0.0,
-            image_proxy_scale: 1,
+            image_proxy_scale: 3,          // param default: /8
+            path_sample_density: 10.0,
             emitter_size_linked: true,
-            emitter_size_x: 100.0,
-            emitter_size_y: 100.0,
-            emitter_size_z: 100.0,
+            emitter_size_x: 0.0,
+            emitter_size_y: 0.0,
+            emitter_size_z: 0.0,
             birth_rate: 180.0,
             lifespan: 1.6,
-            lifespan_var: 0.1,
+            lifespan_var: 0.15,
             speed: 240.0,
-            speed_var: 0.1,
+            speed_var: 0.2,
             direction_x: 0.0,
             direction_y: -1.0,
             direction_z: 0.0,
             spread: 18.0,
-            initial_size: 6.0,
+            initial_size: 9.0,
             size_var: 0.2,
             rotation: 0.0,
             rotation_speed: 0.0,
-            gravity_strength: 0.0,
+            gravity_strength: 160.0,
             wind_x: 0.0,
             wind_y: 0.0,
-            turb_strength: 0.0,
-            turb_scale: 50.0,
+            turb_strength: 12.0,
+            turb_scale: 0.75,
             turb_speed: 1.0,
             air_resistance: 0.3,
             bounce_enabled: false,
             bounce_damping: 0.5,
-            color_mode: 1,
+            color_mode: 2,                 // Gradient
             color_start: PresetColor { alpha: 255, red: 255, green: 255, blue: 255 },
-            color_end: PresetColor { alpha: 0, red: 255, green: 255, blue: 255 },
-            opacity_curve_preset: 1,
+            color_end: PresetColor { alpha: 255, red: 255, green: 255, blue: 255 },
+            opacity_curve_preset: 3,       // Fade Out
             opacity_start: 100.0,
             opacity_mid_a: 90.0,
             opacity_mid_b: 45.0,
             opacity_end: 0.0,
-            size_curve_preset: 1,
-            size_life_start: 100.0,
-            size_life_mid_a: 100.0,
-            size_life_mid_b: 65.0,
-            size_life_end: 35.0,
+            size_curve_preset: 3,          // Shrink
+            size_life_start: 1.0,
+            size_life_mid_a: 1.0,
+            size_life_mid_b: 0.65,
+            size_life_end: 0.35,
             shape: 1,
             image_color_mode: 1,
             image_fit_mode: 1,
-            use_source_alpha: false,
-            source_premultiplied: false,
-            image_alpha_clip: 0.0,
-            blend_mode: 1,
-            motion_blur: 0.0,
+            use_source_alpha: true,
+            source_premultiplied: true,
+            image_alpha_clip: 0.01,
+            blend_mode: 1,                 // Normal
+            motion_blur: 0.2,
             edge_softness: 0.0,
             dof_enabled: false,
-            dof_focal_dist: 500.0,
-            dof_aperture: 50.0,
-            size_multiplier: 100.0,
+            dof_focal_dist: 0.0,
+            dof_aperture: 5.0,
+            size_multiplier: 1.15,
             composite_on_orig: true,
             child_enabled: false,
             child_count: 3,
-            child_inherit_vel: 0.5,
-            child_lifespan: 0.8,
-            child_speed: 60.0,
-            child_spread: 90.0,
-            child_size_scale: 0.5,
+            child_inherit_vel: 0.65,
+            child_lifespan: 0.5,
+            child_speed: 80.0,
+            child_spread: 110.0,
+            child_size_scale: 0.4,
             seed: 12345,
-            path_sample_density: 10.0,
+            // ---- Plexus defaults (match params_setup) ----
+            plugin_mode: 1,                // Particles
+            point_a_enabled: true,
+            point_a_source_type: 1,
+            point_a_grid_res_x: 10,
+            point_a_grid_res_y: 10,
+            point_a_grid_res_z: 1,
+            point_a_grid_spacing: 50.0,
+            point_a_max_points: 5000,
+            point_b_enabled: false,
+            point_b_source_type: 1,
+            point_b_grid_res_x: 10,
+            point_b_grid_res_y: 10,
+            point_b_grid_spacing: 50.0,
+            noise_enabled: false,
+            noise_amplitude: 50.0,
+            noise_frequency: 0.01,
+            noise_speed: 1.0,
+            noise_octaves: 2,
+            noise_axis_scale: 1,
+            lines_enabled: true,
+            lines_max_distance: 120.0,
+            lines_width: 1.0,
+            lines_opacity_falloff: 0.8,
+            lines_color: PresetColor { alpha: 255, red: 255, green: 255, blue: 255 },
+            mesh_enabled: false,
+            mesh_max_edge: 150.0,
+            mesh_opacity: 30.0,
+            mesh_color: PresetColor { alpha: 255, red: 100, green: 150, blue: 255 },
+            beams_enabled: false,
+            beams_source_group: 1,
+            beams_max_distance: 300.0,
+            beams_width: 2.0,
+            beams_color: PresetColor { alpha: 255, red: 100, green: 200, blue: 255 },
+            plexus_point_size: 4.0,
+            plexus_point_color: PresetColor { alpha: 255, red: 255, green: 255, blue: 255 },
         }
     }
 }
@@ -558,13 +650,14 @@ impl AdobePluginGlobal for Plugin {
                 f.set_slider_min(-2000.0); f.set_slider_max(2000.0);
                 f.set_default(0.0); f.set_precision(1);
             }))?;
-            params.add(Params::ImageSourceLayer, "Image Source", ae::LayerDef::new())?;
-            params.add(Params::ImageProxyScale, "Image Proxy", ae::PopupDef::setup(|f| {
-                f.set_options(&["Full", "/2", "/4", "/8"]);
-                f.set_default(3);
-            }))?;
+            params.add(Params::ImageSourceLayer, "Emitter Source Layer", ae::LayerDef::new())?;
             params.add(Params::RefreshImageCache, "Refresh Image Cache", ae::ButtonDef::setup(|f| {
                 f.set_label("Refresh");
+            }))?;
+            params.add(Params::PathSampleDensity, "Path Density", ae::FloatSliderDef::setup(|f| {
+                f.set_valid_min(1.0); f.set_valid_max(100.0);
+                f.set_slider_min(1.0); f.set_slider_max(50.0);
+                f.set_default(10.0); f.set_precision(0);
             }))?;
             params.add(Params::EmitterSizeLinked, "Uniform Box Size", ae::CheckBoxDef::setup(|f| {
                 f.set_default(true); f.set_label("Enable");
@@ -776,6 +869,11 @@ impl AdobePluginGlobal for Plugin {
                 f.set_options(&["Circle", "Square", "Triangle", "Star", "Line", "Image"]);
                 f.set_default(1);
             }), ae::ParamFlag::SUPERVISE, ae::ParamUIFlags::empty())?;
+            params.add(Params::SpriteSourceLayer, "Sprite Source", ae::LayerDef::new())?;
+            params.add(Params::ImageProxyScale, "Image Proxy", ae::PopupDef::setup(|f| {
+                f.set_options(&["Full", "/2", "/4", "/8"]);
+                f.set_default(3);
+            }))?;
             params.add(Params::EdgeSoftness, "Edge Softness", ae::FloatSliderDef::setup(|f| {
                 f.set_valid_min(0.0); f.set_valid_max(1.0);
                 f.set_slider_min(0.0); f.set_slider_max(1.0);
@@ -802,7 +900,7 @@ impl AdobePluginGlobal for Plugin {
             }))?;
             params.add(Params::BlendModeParam, "Blend Mode", ae::PopupDef::setup(|f| {
                 f.set_options(&["Normal", "Add", "Screen"]);
-                f.set_default(2);
+                f.set_default(1);
             }))?;
             params.add(Params::MotionBlur, "Motion Blur", ae::FloatSliderDef::setup(|f| {
                 f.set_valid_min(0.0); f.set_valid_max(1.0);
@@ -1071,14 +1169,6 @@ impl AdobePluginGlobal for Plugin {
 
             Ok(())
         })?;
-
-        // ---- Added params (appended to preserve AE param order) ----
-        params.add(Params::SpriteSourceLayer, "Sprite Source", ae::LayerDef::new())?;
-        params.add(Params::PathSampleDensity, "Path Density", ae::FloatSliderDef::setup(|f| {
-            f.set_valid_min(1.0); f.set_valid_max(100.0);
-            f.set_slider_min(1.0); f.set_slider_max(50.0);
-            f.set_default(10.0); f.set_precision(0);
-        }))?;
 
         Ok(())
     }
@@ -1451,12 +1541,13 @@ fn capture_preset(params: &ae::Parameters<Params>) -> Result<PresetSnapshot, ae:
     let name = format!("preset_{:04}{:02}{:02}_{:02}{:02}{:02}", year, month, day, hours, minutes, seconds);
 
     Ok(PresetSnapshot {
-        version: 2,
+        version: PRESET_VERSION,
         name,
         emitter_type: params.get(Params::EmitterType)?.as_popup()?.value(),
         position_point: params.get(Params::PositionPoint)?.as_point()?.value(),
         position_z: params.get(Params::PositionZ)?.as_float_slider()?.value(),
         image_proxy_scale: params.get(Params::ImageProxyScale)?.as_popup()?.value(),
+        path_sample_density: params.get(Params::PathSampleDensity)?.as_float_slider()?.value(),
         emitter_size_linked: params.get(Params::EmitterSizeLinked)?.as_checkbox()?.value(),
         emitter_size_x: params.get(Params::EmitterSizeX)?.as_float_slider()?.value(),
         emitter_size_y: params.get(Params::EmitterSizeY)?.as_float_slider()?.value(),
@@ -1518,7 +1609,42 @@ fn capture_preset(params: &ae::Parameters<Params>) -> Result<PresetSnapshot, ae:
         child_spread: params.get(Params::ChildSpread)?.as_float_slider()?.value(),
         child_size_scale: params.get(Params::ChildSizeScale)?.as_float_slider()?.value(),
         seed: params.get(Params::Seed)?.as_slider()?.value(),
-        path_sample_density: params.get(Params::PathSampleDensity)?.as_float_slider()?.value(),
+        // ---- Plexus ----
+        plugin_mode: params.get(Params::PluginMode)?.as_popup()?.value(),
+        point_a_enabled: params.get(Params::PointAEnabled)?.as_checkbox()?.value(),
+        point_a_source_type: params.get(Params::PointASourceType)?.as_popup()?.value(),
+        point_a_grid_res_x: params.get(Params::PointAGridResX)?.as_slider()?.value(),
+        point_a_grid_res_y: params.get(Params::PointAGridResY)?.as_slider()?.value(),
+        point_a_grid_res_z: params.get(Params::PointAGridResZ)?.as_slider()?.value(),
+        point_a_grid_spacing: params.get(Params::PointAGridSpacing)?.as_float_slider()?.value(),
+        point_a_max_points: params.get(Params::PointAMaxPoints)?.as_slider()?.value(),
+        point_b_enabled: params.get(Params::PointBEnabled)?.as_checkbox()?.value(),
+        point_b_source_type: params.get(Params::PointBSourceType)?.as_popup()?.value(),
+        point_b_grid_res_x: params.get(Params::PointBGridResX)?.as_slider()?.value(),
+        point_b_grid_res_y: params.get(Params::PointBGridResY)?.as_slider()?.value(),
+        point_b_grid_spacing: params.get(Params::PointBGridSpacing)?.as_float_slider()?.value(),
+        noise_enabled: params.get(Params::NoiseEnabled)?.as_checkbox()?.value(),
+        noise_amplitude: params.get(Params::NoiseAmplitude)?.as_float_slider()?.value(),
+        noise_frequency: params.get(Params::NoiseFrequency)?.as_float_slider()?.value(),
+        noise_speed: params.get(Params::NoiseSpeed)?.as_float_slider()?.value(),
+        noise_octaves: params.get(Params::NoiseOctaves)?.as_slider()?.value(),
+        noise_axis_scale: params.get(Params::NoiseAxisScale)?.as_popup()?.value(),
+        lines_enabled: params.get(Params::LinesEnabled)?.as_checkbox()?.value(),
+        lines_max_distance: params.get(Params::LinesMaxDistance)?.as_float_slider()?.value(),
+        lines_width: params.get(Params::LinesWidth)?.as_float_slider()?.value(),
+        lines_opacity_falloff: params.get(Params::LinesOpacityFalloff)?.as_float_slider()?.value(),
+        lines_color: params.get(Params::LinesColor)?.as_color()?.value().into(),
+        mesh_enabled: params.get(Params::MeshEnabled)?.as_checkbox()?.value(),
+        mesh_max_edge: params.get(Params::MeshMaxEdge)?.as_float_slider()?.value(),
+        mesh_opacity: params.get(Params::MeshOpacity)?.as_float_slider()?.value(),
+        mesh_color: params.get(Params::MeshColor)?.as_color()?.value().into(),
+        beams_enabled: params.get(Params::BeamsEnabled)?.as_checkbox()?.value(),
+        beams_source_group: params.get(Params::BeamsSourceGroup)?.as_popup()?.value(),
+        beams_max_distance: params.get(Params::BeamsMaxDistance)?.as_float_slider()?.value(),
+        beams_width: params.get(Params::BeamsWidth)?.as_float_slider()?.value(),
+        beams_color: params.get(Params::BeamsColor)?.as_color()?.value().into(),
+        plexus_point_size: params.get(Params::PlexusPointSize)?.as_float_slider()?.value(),
+        plexus_point_color: params.get(Params::PlexusPointColor)?.as_color()?.value().into(),
     })
 }
 
@@ -1633,6 +1759,43 @@ fn apply_preset(params: &ae::Parameters<Params>, preset: &PresetSnapshot) -> Res
     set_float_param(&mut params_copy, Params::ChildSizeScale, preset.child_size_scale)?;
     set_slider_param(&mut params_copy, Params::Seed, preset.seed)?;
     set_float_param(&mut params_copy, Params::PathSampleDensity, preset.path_sample_density)?;
+
+    // ---- Plexus ----
+    set_popup_param(&mut params_copy, Params::PluginMode, preset.plugin_mode)?;
+    set_checkbox_param(&mut params_copy, Params::PointAEnabled, preset.point_a_enabled)?;
+    set_popup_param(&mut params_copy, Params::PointASourceType, preset.point_a_source_type)?;
+    set_slider_param(&mut params_copy, Params::PointAGridResX, preset.point_a_grid_res_x)?;
+    set_slider_param(&mut params_copy, Params::PointAGridResY, preset.point_a_grid_res_y)?;
+    set_slider_param(&mut params_copy, Params::PointAGridResZ, preset.point_a_grid_res_z)?;
+    set_float_param(&mut params_copy, Params::PointAGridSpacing, preset.point_a_grid_spacing)?;
+    set_slider_param(&mut params_copy, Params::PointAMaxPoints, preset.point_a_max_points)?;
+    set_checkbox_param(&mut params_copy, Params::PointBEnabled, preset.point_b_enabled)?;
+    set_popup_param(&mut params_copy, Params::PointBSourceType, preset.point_b_source_type)?;
+    set_slider_param(&mut params_copy, Params::PointBGridResX, preset.point_b_grid_res_x)?;
+    set_slider_param(&mut params_copy, Params::PointBGridResY, preset.point_b_grid_res_y)?;
+    set_float_param(&mut params_copy, Params::PointBGridSpacing, preset.point_b_grid_spacing)?;
+    set_checkbox_param(&mut params_copy, Params::NoiseEnabled, preset.noise_enabled)?;
+    set_float_param(&mut params_copy, Params::NoiseAmplitude, preset.noise_amplitude)?;
+    set_float_param(&mut params_copy, Params::NoiseFrequency, preset.noise_frequency)?;
+    set_float_param(&mut params_copy, Params::NoiseSpeed, preset.noise_speed)?;
+    set_slider_param(&mut params_copy, Params::NoiseOctaves, preset.noise_octaves)?;
+    set_popup_param(&mut params_copy, Params::NoiseAxisScale, preset.noise_axis_scale)?;
+    set_checkbox_param(&mut params_copy, Params::LinesEnabled, preset.lines_enabled)?;
+    set_float_param(&mut params_copy, Params::LinesMaxDistance, preset.lines_max_distance)?;
+    set_float_param(&mut params_copy, Params::LinesWidth, preset.lines_width)?;
+    set_float_param(&mut params_copy, Params::LinesOpacityFalloff, preset.lines_opacity_falloff)?;
+    set_color_param(&mut params_copy, Params::LinesColor, preset.lines_color)?;
+    set_checkbox_param(&mut params_copy, Params::MeshEnabled, preset.mesh_enabled)?;
+    set_float_param(&mut params_copy, Params::MeshMaxEdge, preset.mesh_max_edge)?;
+    set_float_param(&mut params_copy, Params::MeshOpacity, preset.mesh_opacity)?;
+    set_color_param(&mut params_copy, Params::MeshColor, preset.mesh_color)?;
+    set_checkbox_param(&mut params_copy, Params::BeamsEnabled, preset.beams_enabled)?;
+    set_popup_param(&mut params_copy, Params::BeamsSourceGroup, preset.beams_source_group)?;
+    set_float_param(&mut params_copy, Params::BeamsMaxDistance, preset.beams_max_distance)?;
+    set_float_param(&mut params_copy, Params::BeamsWidth, preset.beams_width)?;
+    set_color_param(&mut params_copy, Params::BeamsColor, preset.beams_color)?;
+    set_float_param(&mut params_copy, Params::PlexusPointSize, preset.plexus_point_size)?;
+    set_color_param(&mut params_copy, Params::PlexusPointColor, preset.plexus_point_color)?;
 
     update_shape_dependent_ui(&params_copy)?;
     Ok(())
@@ -2239,18 +2402,23 @@ fn update_shape_dependent_ui(params: &ae::Parameters<Params>) -> Result<(), ae::
     let is_path_emitter = emitter_type_val == 6;
     let uses_emitter_volume = matches!(emitter_type_val, 2 | 3 | 4);
     let emitter_source_enabled = is_layer_alpha_emitter || is_path_emitter;
+    let any_image_in_use = emitter_source_enabled || is_image_shape;
     let use_source_alpha = params.get(Params::UseSourceAlpha)?.as_checkbox()?.value();
     let size_linked = params.get(Params::EmitterSizeLinked)?.as_checkbox()?.value();
     let mut params_copy = params.cloned();
 
-    // Emitter source layer controls (Layer Alpha or Path emitter)
-    for param_id in [
-        Params::ImageSourceLayer,
-        Params::ImageProxyScale,
-        Params::RefreshImageCache,
-    ] {
-        let mut param = params_copy.get_mut(param_id)?;
+    // Emitter source layer control (Layer Alpha or Path emitter)
+    {
+        let mut param = params_copy.get_mut(Params::ImageSourceLayer)?;
         param.set_ui_flag(ae::ParamUIFlags::DISABLED, !emitter_source_enabled);
+        param.update_param_ui()?;
+    }
+
+    // Refresh Image Cache + Image Proxy — active if either emitter source OR
+    // sprite image is in use (the proxy divisor applies to both).
+    for param_id in [Params::ImageProxyScale, Params::RefreshImageCache] {
+        let mut param = params_copy.get_mut(param_id)?;
+        param.set_ui_flag(ae::ParamUIFlags::DISABLED, !any_image_in_use);
         param.update_param_ui()?;
     }
 

@@ -1187,15 +1187,32 @@ impl AdobePluginGlobal for Plugin {
                     let render_start = Instant::now();
                     match smart_render_particles(render_start, &in_data, &extra) {
                         Ok(()) => Ok(()),
-                        // InterruptCancel MUST be propagated so AE does not
-                        // cache the frame (output buffer was not written).
+                        // Any error path — cancellation OR a real failure —
+                        // must be surfaced to AE as `InterruptCancel`.
+                        //
+                        // Background: AE's SmartFX contract is "if you return
+                        // Ok(()) you promised to have populated the output
+                        // buffer." Whenever we bail before writing output
+                        // (whether because the user cancelled, a checkout
+                        // failed, the rect was too big, etc.) returning
+                        // `Ok(())` causes AE to cache an uninitialized /
+                        // partial buffer as that frame's rendered output,
+                        // which poisons the frame cache. Returning
+                        // `InterruptCancel` tells AE "this frame was not
+                        // produced" so it will not cache the result and will
+                        // simply re-request the frame. Non-cancel errors are
+                        // still logged; `InterruptCancel` is suppressed by
+                        // the framework (no error dialog shown to the user).
                         Err(ae::Error::InterruptCancel) => {
                             debug_info("SmartRender interrupted (cancel)");
                             Err(ae::Error::InterruptCancel)
                         }
                         Err(e) => {
-                            debug_error(format!("SmartRender error: {:?}", e));
-                            Ok(())
+                            debug_error(format!(
+                                "SmartRender error: {:?} — signalling InterruptCancel to avoid cache poisoning",
+                                e
+                            ));
+                            Err(ae::Error::InterruptCancel)
                         }
                     }
                 }

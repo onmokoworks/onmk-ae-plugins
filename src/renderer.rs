@@ -245,10 +245,34 @@ fn draw_particle(p: &Particle, config: &RenderConfig, output: &mut [u8]) {
 
     let feather_extent = radius * config.edge_softness.clamp(0.0, 1.0);
     let draw_radius = radius + feather_extent;
-    let min_x = ((local_x - draw_radius).floor() as isize).max(0) as usize;
-    let max_x = ((local_x + draw_radius).ceil() as isize).min(config.width.saturating_sub(1) as isize) as usize;
-    let min_y = ((local_y - draw_radius).floor() as isize).max(0) as usize;
-    let max_y = ((local_y + draw_radius).ceil() as isize).min(config.height.saturating_sub(1) as isize) as usize;
+
+    // NOTE: clamp the signed (isize) bounds to the viewport BEFORE casting to
+    // usize. Particles that live far to the left of / above the output rect
+    // (easy to produce with a large Emitter Size and small comp) produce
+    // negative `max_x` / `max_y` values; a direct `as usize` cast on a
+    // negative isize wraps to a huge unsigned value, and the subsequent
+    // `for x in min_x..=max_x` loop would run for billions of iterations —
+    // stalling SmartRender, tripping the panic boundary / deadline, and
+    // leaving AE to cache an unwritten output buffer.
+    let w = config.width as isize;
+    let h = config.height as isize;
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let min_xi = (local_x - draw_radius).floor() as isize;
+    let max_xi = (local_x + draw_radius).ceil() as isize;
+    let min_yi = (local_y - draw_radius).floor() as isize;
+    let max_yi = (local_y + draw_radius).ceil() as isize;
+
+    // Entirely outside the viewport — nothing to draw.
+    if max_xi < 0 || max_yi < 0 || min_xi >= w || min_yi >= h {
+        return;
+    }
+
+    let min_x = min_xi.max(0) as usize;
+    let max_x = max_xi.min(w - 1).max(0) as usize;
+    let min_y = min_yi.max(0) as usize;
+    let max_y = max_yi.min(h - 1).max(0) as usize;
 
     if min_x > max_x || min_y > max_y {
         return;

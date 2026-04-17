@@ -1,0 +1,23 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# AE build artifacts
+*.aex
+
+# Debug logs
+particle_debug.txt
+*.log
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# Stray zero-byte scratch files
+/,
+/{
+
+# OS
+Thumbs.db
+.DS_Store

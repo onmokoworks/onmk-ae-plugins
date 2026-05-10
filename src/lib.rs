@@ -1,27 +1,90 @@
 use after_effects as ae;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
+use serde_json::Value;
 #[cfg(windows)]
 use std::fs;
 #[cfg(windows)]
 use std::fs::OpenOptions;
 #[cfg(windows)]
 use std::io::Write;
+use std::panic::{self, AssertUnwindSafe};
 #[cfg(windows)]
 use std::path::PathBuf;
-use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Instant;
+
+// ---- File dialog via PowerShell (reliable from AE plugin context) ----
+#[cfg(windows)]
+mod file_dialog {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    pub fn open_file_dialog(initial_dir: &str, _title: &str) -> Option<PathBuf> {
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             $d = New-Object System.Windows.Forms.OpenFileDialog; \
+             $d.InitialDirectory = '{}'; \
+             $d.Filter = 'Preset (*.json)|*.json|All Files|*.*'; \
+             $d.Title = 'Load Preset'; \
+             if ($d.ShowDialog() -eq 'OK') {{ Write-Output $d.FileName }}",
+            initial_dir.replace('\'', "''")
+        );
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .ok()?;
+        let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path_str.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(path_str))
+        }
+    }
+
+    pub fn save_file_dialog(
+        initial_dir: &str,
+        _title: &str,
+        default_name: &str,
+    ) -> Option<PathBuf> {
+        let script = format!(
+            "Add-Type -AssemblyName System.Windows.Forms; \
+             $d = New-Object System.Windows.Forms.SaveFileDialog; \
+             $d.InitialDirectory = '{}'; \
+             $d.Filter = 'Preset (*.json)|*.json'; \
+             $d.Title = 'Save Preset'; \
+             $d.FileName = '{}'; \
+             $d.DefaultExt = 'json'; \
+             if ($d.ShowDialog() -eq 'OK') {{ Write-Output $d.FileName }}",
+            initial_dir.replace('\'', "''"),
+            default_name.replace('\'', "''")
+        );
+        let output = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .ok()?;
+        let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path_str.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(path_str))
+        }
+    }
+}
 
 mod particle;
 mod plexus;
 mod plexus_render;
 mod renderer;
 
-use particle::{AppearanceConfig, ChildConfig, EmitterConfig, EmitterType, ParticleSystem, PhysicsConfig};
+use particle::{
+    AppearanceConfig, ChildConfig, EmitterConfig, EmitterType, ParticleSystem, PhysicsConfig,
+};
 use plexus::{PlexusConfig, PointGroupConfig, PointSourceType};
-use renderer::{invert_camera_matrix, project_point_3d, BlendMode, CameraProjection, ImageColorMode, ImageFitMode, ImageSamplingConfig, ParticleShape, RenderConfig, SpriteImage};
-
+use renderer::{
+    invert_camera_matrix, project_point_3d, ApplyMode, BlendMode, CameraProjection, ImageColorMode,
+    ImageFitMode, ImageSamplingConfig, ParticleShape, RenderConfig, SpriteImage, TimeSamplingMode,
+};
 
 // ---- Parameter IDs ----
 
@@ -185,6 +248,15 @@ enum Params {
     // ---- Added later (must be at end to preserve AE param order) ----
     SpriteSourceLayer,
     PathSampleDensity,
+    SpriteTimeSampling,
+    SpriteFrameCount,
+    GridResX,
+    GridResY,
+    GridResZ,
+    EmitMode,
+    RotationVar,
+    ApplyMode,
+    OpacityVar,
 }
 
 // ---- Plugin ----
@@ -220,9 +292,9 @@ impl From<PresetColor> for ae::Pixel8 {
 }
 
 /// Current preset format version. Fields not present in older presets are
-/// filled in by `#[serde(default)]`, so forward-compat is automatic as long
-/// as we never rename / repurpose a field.
-const PRESET_VERSION: u32 = 3;
+/// filled in by `#[serde(default)]`, but compatibility migrations still need
+/// a version bump when defaults would change behavior.
+const PRESET_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -231,10 +303,14 @@ struct PresetSnapshot {
     name: String,
     // ---- Emitter ----
     emitter_type: i32,
+    emit_mode: i32,
     position_point: (f32, f32),
     position_z: f64,
     image_proxy_scale: i32,
     path_sample_density: f64,
+    grid_res_x: i32,
+    grid_res_y: i32,
+    grid_res_z: i32,
     emitter_size_linked: bool,
     emitter_size_x: f64,
     emitter_size_y: f64,
@@ -279,6 +355,8 @@ struct PresetSnapshot {
     size_life_end: f64,
     // ---- Rendering ----
     shape: i32,
+    sprite_time_sampling: i32,
+    sprite_frame_count: i32,
     image_color_mode: i32,
     image_fit_mode: i32,
     use_source_alpha: bool,
@@ -292,6 +370,9 @@ struct PresetSnapshot {
     dof_aperture: f64,
     size_multiplier: f64,
     composite_on_orig: bool,
+    apply_mode: i32,
+    rotation_variation: f64,
+    opacity_variation: f64,
     // ---- Child ----
     child_enabled: bool,
     child_count: i32,
@@ -348,16 +429,20 @@ impl Default for PresetSnapshot {
     // rewrites that param to a wrong value on `apply_preset`. A few of these
     // were dangerously wrong in v2 (size_life_* at 35–100 vs. param range
     // 0.0–5.0; size_multiplier at 100.0 vs. range 0.01–10.0), so fixing them
-    // is the main reason the preset format was bumped to v3.
+    // is the main reason the preset format was bumped to v4.
     fn default() -> Self {
         Self {
             version: PRESET_VERSION,
             name: String::new(),
             emitter_type: 1,
+            emit_mode: 1,
             position_point: (50.0, 50.0),
             position_z: 0.0,
-            image_proxy_scale: 3,          // param default: /8
+            image_proxy_scale: 3, // param default: /8
             path_sample_density: 10.0,
+            grid_res_x: 8,
+            grid_res_y: 8,
+            grid_res_z: 1,
             emitter_size_linked: true,
             emitter_size_x: 0.0,
             emitter_size_y: 0.0,
@@ -384,26 +469,38 @@ impl Default for PresetSnapshot {
             air_resistance: 0.3,
             bounce_enabled: false,
             bounce_damping: 0.5,
-            color_mode: 2,                 // Gradient
-            color_start: PresetColor { alpha: 255, red: 255, green: 255, blue: 255 },
-            color_end: PresetColor { alpha: 255, red: 255, green: 255, blue: 255 },
-            opacity_curve_preset: 3,       // Fade Out
+            color_mode: 2, // Gradient
+            color_start: PresetColor {
+                alpha: 255,
+                red: 255,
+                green: 255,
+                blue: 255,
+            },
+            color_end: PresetColor {
+                alpha: 255,
+                red: 255,
+                green: 255,
+                blue: 255,
+            },
+            opacity_curve_preset: 3, // Fade Out
             opacity_start: 100.0,
             opacity_mid_a: 90.0,
             opacity_mid_b: 45.0,
             opacity_end: 0.0,
-            size_curve_preset: 3,          // Shrink
+            size_curve_preset: 3, // Shrink
             size_life_start: 1.0,
             size_life_mid_a: 1.0,
             size_life_mid_b: 0.65,
             size_life_end: 0.35,
             shape: 1,
+            sprite_time_sampling: 1,
+            sprite_frame_count: 1,
             image_color_mode: 1,
             image_fit_mode: 1,
             use_source_alpha: true,
             source_premultiplied: true,
             image_alpha_clip: 0.01,
-            blend_mode: 1,                 // Normal
+            blend_mode: 1, // Normal
             motion_blur: 0.2,
             edge_softness: 0.0,
             dof_enabled: false,
@@ -411,6 +508,9 @@ impl Default for PresetSnapshot {
             dof_aperture: 5.0,
             size_multiplier: 1.15,
             composite_on_orig: true,
+            apply_mode: 2,
+            rotation_variation: 0.0,
+            opacity_variation: 0.0,
             child_enabled: false,
             child_count: 3,
             child_inherit_vel: 0.65,
@@ -420,7 +520,7 @@ impl Default for PresetSnapshot {
             child_size_scale: 0.4,
             seed: 12345,
             // ---- Plexus defaults (match params_setup) ----
-            plugin_mode: 1,                // Particles
+            plugin_mode: 1, // Particles
             point_a_enabled: true,
             point_a_source_type: 1,
             point_a_grid_res_x: 10,
@@ -443,18 +543,38 @@ impl Default for PresetSnapshot {
             lines_max_distance: 120.0,
             lines_width: 1.0,
             lines_opacity_falloff: 0.8,
-            lines_color: PresetColor { alpha: 255, red: 255, green: 255, blue: 255 },
+            lines_color: PresetColor {
+                alpha: 255,
+                red: 255,
+                green: 255,
+                blue: 255,
+            },
             mesh_enabled: false,
             mesh_max_edge: 150.0,
             mesh_opacity: 30.0,
-            mesh_color: PresetColor { alpha: 255, red: 100, green: 150, blue: 255 },
+            mesh_color: PresetColor {
+                alpha: 255,
+                red: 100,
+                green: 150,
+                blue: 255,
+            },
             beams_enabled: false,
             beams_source_group: 1,
             beams_max_distance: 300.0,
             beams_width: 2.0,
-            beams_color: PresetColor { alpha: 255, red: 100, green: 200, blue: 255 },
+            beams_color: PresetColor {
+                alpha: 255,
+                red: 100,
+                green: 200,
+                blue: 255,
+            },
             plexus_point_size: 4.0,
-            plexus_point_color: PresetColor { alpha: 255, red: 255, green: 255, blue: 255 },
+            plexus_point_color: PresetColor {
+                alpha: 255,
+                red: 255,
+                green: 255,
+                blue: 255,
+            },
         }
     }
 }
@@ -479,7 +599,7 @@ struct ImageCacheKey {
     generation: u64,
 }
 
-type SpriteCacheMap = std::collections::HashMap<ImageCacheKey, Arc<SpriteImage>>;
+type SpriteCacheMap = std::collections::HashMap<ImageCacheKey, Arc<Vec<SpriteImage>>>;
 type EmitterPointCacheMap = std::collections::HashMap<ImageCacheKey, Arc<Vec<glam::Vec3>>>;
 
 static IMAGE_CACHE: OnceLock<RwLock<SpriteCacheMap>> = OnceLock::new();
@@ -507,10 +627,10 @@ struct SmartRenderData {
 
 const DEBUG_MODULE: &str = "ONMK_ParticleLab";
 const MAX_RENDER_BYTES: usize = 256 * 1024 * 1024;
-const MAX_OUTPUT_PIXELS: i64 = 8_000_000; // ~2828x2828 max
-const MIN_SMART_PRE_RENDER_MARGIN: i32 = 128;
-const MAX_SMART_PRE_RENDER_MARGIN: i32 = 2048;
-const RENDER_TIME_BUDGET_MS: u128 = 800;
+const MAX_OUTPUT_PIXELS: i64 = 20_000_000; // ~4472x4472 max
+const MIN_SMART_PRE_RENDER_MARGIN: i32 = 256;
+const MAX_SMART_PRE_RENDER_MARGIN: i32 = 4096;
+const RENDER_TIME_BUDGET_MS: u128 = 10_000;
 
 #[cfg(windows)]
 fn debug_log(level: &str, message: impl AsRef<str>) {
@@ -524,7 +644,10 @@ fn debug_log(level: &str, message: impl AsRef<str>) {
         sanitize(message.as_ref()),
     );
 
-    if let Ok(mut pipe) = OpenOptions::new().write(true).open(r"\\.\pipe\AEExternalDebug") {
+    if let Ok(mut pipe) = OpenOptions::new()
+        .write(true)
+        .open(r"\\.\pipe\AEExternalDebug")
+    {
         let _ = pipe.write_all(line.as_bytes());
         let _ = pipe.flush();
     }
@@ -593,6 +716,7 @@ fn should_refresh_ui(param: Params) -> bool {
         param,
         Params::Shape
             | Params::EmitterType
+            | Params::EmitMode
             | Params::UseSourceAlpha
             | Params::EmitterSizeLinked
             | Params::RefreshImageCache
@@ -610,6 +734,8 @@ fn should_invalidate_source_cache(param: Params) -> bool {
         Params::ImageSourceLayer
             | Params::ImageProxyScale
             | Params::RefreshImageCache
+            | Params::SpriteTimeSampling
+            | Params::SpriteFrameCount
     )
 }
 
@@ -620,555 +746,1454 @@ impl AdobePluginGlobal for Plugin {
         _in_data: ae::InData,
         _out_data: ae::OutData,
     ) -> Result<(), ae::Error> {
-        params.add_group(Params::PresetGroupStart, Params::PresetGroupEnd, "Presets", true, |params| {
-            params.add(Params::SavePreset, "Save Preset", ae::ButtonDef::setup(|f| {
-                f.set_label("Save");
-            }))?;
-            params.add(Params::LoadPreset, "Load Preset", ae::ButtonDef::setup(|f| {
-                f.set_label("Load");
-            }))?;
-            params.add(Params::DeletePreset, "Delete Preset", ae::ButtonDef::setup(|f| {
-                f.set_label("Delete");
-            }))?;
-            params.add(Params::OpenPresetFolder, "Open Folder", ae::ButtonDef::setup(|f| {
-                f.set_label("Open Folder");
-            }))?;
-            Ok(())
-        })?;
+        params.add_group(
+            Params::PresetGroupStart,
+            Params::PresetGroupEnd,
+            "Presets",
+            true,
+            |params| {
+                params.add(
+                    Params::SavePreset,
+                    "Save Preset",
+                    ae::ButtonDef::setup(|f| {
+                        f.set_label("Save");
+                    }),
+                )?;
+                params.add(
+                    Params::LoadPreset,
+                    "Load Preset",
+                    ae::ButtonDef::setup(|f| {
+                        f.set_label("Load");
+                    }),
+                )?;
+                params.add(
+                    Params::DeletePreset,
+                    "Delete Preset",
+                    ae::ButtonDef::setup(|f| {
+                        f.set_label("Delete");
+                    }),
+                )?;
+                params.add(
+                    Params::OpenPresetFolder,
+                    "Open Folder",
+                    ae::ButtonDef::setup(|f| {
+                        f.set_label("Open Folder");
+                    }),
+                )?;
+                Ok(())
+            },
+        )?;
 
-        params.add_group(Params::EmitterGroupStart, Params::EmitterGroupEnd, "Emitter", false, |params| {
-            params.add_with_flags(Params::EmitterType, "Emitter Type", ae::PopupDef::setup(|f| {
-                f.set_options(&["Point", "Box", "Sphere", "Grid", "Layer Alpha", "Path"]);
-                f.set_default(1);
-            }), ae::ParamFlag::SUPERVISE, ae::ParamUIFlags::empty())?;
-            params.add(Params::PositionPoint, "Position", ae::PointDef::setup(|f| {
-                f.set_default((50.0, 50.0));
-                f.set_restrict_bounds(false);
-            }))?;
-            params.add(Params::PositionZ, "Position Z", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(-10000.0); f.set_valid_max(10000.0);
-                f.set_slider_min(-2000.0); f.set_slider_max(2000.0);
-                f.set_default(0.0); f.set_precision(1);
-            }))?;
-            params.add(Params::ImageSourceLayer, "Emitter Source Layer", ae::LayerDef::new())?;
-            params.add(Params::RefreshImageCache, "Refresh Image Cache", ae::ButtonDef::setup(|f| {
-                f.set_label("Refresh");
-            }))?;
-            params.add(Params::PathSampleDensity, "Path Density", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(1.0); f.set_valid_max(100.0);
-                f.set_slider_min(1.0); f.set_slider_max(50.0);
-                f.set_default(10.0); f.set_precision(0);
-            }))?;
-            params.add(Params::EmitterSizeLinked, "Uniform Box Size", ae::CheckBoxDef::setup(|f| {
-                f.set_default(true); f.set_label("Enable");
-            }))?;
-            params.add(Params::EmitterSizeX, "Emitter Size X", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(10000.0);
-                f.set_slider_min(0.0); f.set_slider_max(2000.0);
-                f.set_default(0.0); f.set_precision(1);
-            }))?;
-            params.add(Params::EmitterSizeY, "Emitter Size Y", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(10000.0);
-                f.set_slider_min(0.0); f.set_slider_max(2000.0);
-                f.set_default(0.0); f.set_precision(1);
-            }))?;
-            params.add(Params::EmitterSizeZ, "Emitter Size Z", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(10000.0);
-                f.set_slider_min(0.0); f.set_slider_max(2000.0);
-                f.set_default(0.0); f.set_precision(1);
-            }))?;
-            params.add(Params::BirthRate, "Birth Rate", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(10000.0);
-                f.set_slider_min(0.0); f.set_slider_max(1000.0);
-                f.set_default(180.0); f.set_precision(1);
-            }))?;
-            params.add(Params::Lifespan, "Lifespan (sec)", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.01); f.set_valid_max(30.0);
-                f.set_slider_min(0.1); f.set_slider_max(10.0);
-                f.set_default(1.6); f.set_precision(2);
-            }))?;
-            params.add(Params::LifespanVar, "Lifespan Variation", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(1.0);
-                f.set_slider_min(0.0); f.set_slider_max(1.0);
-                f.set_default(0.15); f.set_precision(2);
-            }))?;
-            Ok(())
-        })?;
+        params.add_group(
+            Params::EmitterGroupStart,
+            Params::EmitterGroupEnd,
+            "Emitter",
+            false,
+            |params| {
+                params.add_with_flags(
+                    Params::EmitterType,
+                    "Emitter Type",
+                    ae::PopupDef::setup(|f| {
+                        f.set_options(&["Point", "Box", "Sphere", "Grid", "Layer Alpha", "Path"]);
+                        f.set_default(1);
+                    }),
+                    ae::ParamFlag::SUPERVISE,
+                    ae::ParamUIFlags::empty(),
+                )?;
+                params.add(
+                    Params::EmitMode,
+                    "Emit Mode",
+                    ae::PopupDef::setup(|f| {
+                        f.set_options(&["Continuous", "All at Start"]);
+                        f.set_default(1);
+                    }),
+                )?;
+                params.add(
+                    Params::PositionPoint,
+                    "Position",
+                    ae::PointDef::setup(|f| {
+                        f.set_default((50.0, 50.0));
+                        f.set_restrict_bounds(false);
+                    }),
+                )?;
+                params.add(
+                    Params::PositionZ,
+                    "Position Z",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(-10000.0);
+                        f.set_valid_max(10000.0);
+                        f.set_slider_min(-2000.0);
+                        f.set_slider_max(2000.0);
+                        f.set_default(0.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::ImageSourceLayer,
+                    "Emitter Source Layer",
+                    ae::LayerDef::new(),
+                )?;
+                params.add(
+                    Params::RefreshImageCache,
+                    "Refresh Image Cache",
+                    ae::ButtonDef::setup(|f| {
+                        f.set_label("Refresh");
+                    }),
+                )?;
+                params.add(
+                    Params::PathSampleDensity,
+                    "Path Density",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(1.0);
+                        f.set_valid_max(100.0);
+                        f.set_slider_min(1.0);
+                        f.set_slider_max(50.0);
+                        f.set_default(10.0);
+                        f.set_precision(0);
+                    }),
+                )?;
+                params.add(
+                    Params::EmitterSizeLinked,
+                    "Uniform Box Size",
+                    ae::CheckBoxDef::setup(|f| {
+                        f.set_default(true);
+                        f.set_label("Enable");
+                    }),
+                )?;
+                params.add(
+                    Params::EmitterSizeX,
+                    "Emitter Size X",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(10000.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(2000.0);
+                        f.set_default(0.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::EmitterSizeY,
+                    "Emitter Size Y",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(10000.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(2000.0);
+                        f.set_default(0.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::EmitterSizeZ,
+                    "Emitter Size Z",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(10000.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(2000.0);
+                        f.set_default(0.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::GridResX,
+                    "Grid Res X",
+                    ae::SliderDef::setup(|f| {
+                        f.set_valid_min(1);
+                        f.set_valid_max(50);
+                        f.set_slider_min(1);
+                        f.set_slider_max(50);
+                        f.set_default(8);
+                    }),
+                )?;
+                params.add(
+                    Params::GridResY,
+                    "Grid Res Y",
+                    ae::SliderDef::setup(|f| {
+                        f.set_valid_min(1);
+                        f.set_valid_max(50);
+                        f.set_slider_min(1);
+                        f.set_slider_max(50);
+                        f.set_default(8);
+                    }),
+                )?;
+                params.add(
+                    Params::GridResZ,
+                    "Grid Res Z",
+                    ae::SliderDef::setup(|f| {
+                        f.set_valid_min(1);
+                        f.set_valid_max(10);
+                        f.set_slider_min(1);
+                        f.set_slider_max(10);
+                        f.set_default(1);
+                    }),
+                )?;
+                params.add(
+                    Params::BirthRate,
+                    "Birth Rate",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(10000.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(1000.0);
+                        f.set_default(180.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::Lifespan,
+                    "Lifespan (sec)",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.01);
+                        f.set_valid_max(120.0);
+                        f.set_slider_min(0.1);
+                        f.set_slider_max(30.0);
+                        f.set_default(1.6);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::LifespanVar,
+                    "Lifespan Variation",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(1.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(1.0);
+                        f.set_default(0.15);
+                        f.set_precision(2);
+                    }),
+                )?;
+                Ok(())
+            },
+        )?;
 
-        params.add_group(Params::MotionGroupStart, Params::MotionGroupEnd, "Motion", false, |params| {
-            params.add(Params::Speed, "Speed", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(5000.0);
-                f.set_slider_min(0.0); f.set_slider_max(500.0);
-                f.set_default(240.0); f.set_precision(1);
-            }))?;
-            params.add(Params::SpeedVar, "Speed Variation", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(1.0);
-                f.set_slider_min(0.0); f.set_slider_max(1.0);
-                f.set_default(0.2); f.set_precision(2);
-            }))?;
-            params.add(Params::DirectionX, "Direction X", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(-1.0); f.set_valid_max(1.0);
-                f.set_slider_min(-1.0); f.set_slider_max(1.0);
-                f.set_default(0.0); f.set_precision(2);
-            }))?;
-            params.add(Params::DirectionY, "Direction Y", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(-1.0); f.set_valid_max(1.0);
-                f.set_slider_min(-1.0); f.set_slider_max(1.0);
-                f.set_default(-1.0); f.set_precision(2);
-            }))?;
-            params.add(Params::DirectionZ, "Direction Z", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(-1.0); f.set_valid_max(1.0);
-                f.set_slider_min(-1.0); f.set_slider_max(1.0);
-                f.set_default(0.0); f.set_precision(2);
-            }))?;
-            params.add(Params::Spread, "Spread (deg)", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(180.0);
-                f.set_slider_min(0.0); f.set_slider_max(180.0);
-                f.set_default(18.0); f.set_precision(1);
-            }))?;
-            params.add(Params::InitialSize, "Particle Size", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.1); f.set_valid_max(500.0);
-                f.set_slider_min(0.5); f.set_slider_max(100.0);
-                f.set_default(9.0); f.set_precision(1);
-            }))?;
-            params.add(Params::SizeVar, "Size Variation", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(1.0);
-                f.set_slider_min(0.0); f.set_slider_max(1.0);
-                f.set_default(0.2); f.set_precision(2);
-            }))?;
-            params.add(Params::Rotation, "Initial Rotation", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(360.0);
-                f.set_slider_min(0.0); f.set_slider_max(360.0);
-                f.set_default(0.0); f.set_precision(1);
-            }))?;
-            params.add(Params::RotationSpeed, "Rotation Speed", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(-1000.0); f.set_valid_max(1000.0);
-                f.set_slider_min(-360.0); f.set_slider_max(360.0);
-                f.set_default(0.0); f.set_precision(1);
-            }))?;
-            Ok(())
-        })?;
+        params.add_group(
+            Params::MotionGroupStart,
+            Params::MotionGroupEnd,
+            "Motion",
+            false,
+            |params| {
+                params.add(
+                    Params::Speed,
+                    "Speed",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(5000.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(500.0);
+                        f.set_default(240.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::SpeedVar,
+                    "Speed Variation",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(1.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(1.0);
+                        f.set_default(0.2);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::DirectionX,
+                    "Direction X",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(-1.0);
+                        f.set_valid_max(1.0);
+                        f.set_slider_min(-1.0);
+                        f.set_slider_max(1.0);
+                        f.set_default(0.0);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::DirectionY,
+                    "Direction Y",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(-1.0);
+                        f.set_valid_max(1.0);
+                        f.set_slider_min(-1.0);
+                        f.set_slider_max(1.0);
+                        f.set_default(-1.0);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::DirectionZ,
+                    "Direction Z",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(-1.0);
+                        f.set_valid_max(1.0);
+                        f.set_slider_min(-1.0);
+                        f.set_slider_max(1.0);
+                        f.set_default(0.0);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::Spread,
+                    "Spread (deg)",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(180.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(180.0);
+                        f.set_default(18.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::InitialSize,
+                    "Particle Size",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.1);
+                        f.set_valid_max(500.0);
+                        f.set_slider_min(0.5);
+                        f.set_slider_max(100.0);
+                        f.set_default(9.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::SizeVar,
+                    "Size Variation",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(1.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(1.0);
+                        f.set_default(0.2);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::Rotation,
+                    "Initial Rotation",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(360.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(360.0);
+                        f.set_default(0.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::RotationSpeed,
+                    "Rotation Speed",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(-1000.0);
+                        f.set_valid_max(1000.0);
+                        f.set_slider_min(-360.0);
+                        f.set_slider_max(360.0);
+                        f.set_default(0.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::RotationVar,
+                    "Rotation Variation",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(360.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(180.0);
+                        f.set_default(0.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                Ok(())
+            },
+        )?;
 
-        params.add_group(Params::PhysicsGroupStart, Params::PhysicsGroupEnd, "Physics", false, |params| {
-            params.add_with_flags(
-                Params::GravityStrength,
-                "Gravity",
-                ae::FloatSliderDef::setup(|f| {
-                    f.set_valid_min(-2000.0); f.set_valid_max(2000.0);
-                    f.set_slider_min(-500.0); f.set_slider_max(500.0);
-                    f.set_default(160.0); f.set_precision(1);
-                }),
-                ae::ParamFlag::CANNOT_TIME_VARY,
-                ae::ParamUIFlags::empty(),
-            )?;
-            params.add(Params::WindX, "Wind X", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(-2000.0); f.set_valid_max(2000.0);
-                f.set_slider_min(-500.0); f.set_slider_max(500.0);
-                f.set_default(0.0); f.set_precision(1);
-            }))?;
-            params.add(Params::WindY, "Wind Y", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(-2000.0); f.set_valid_max(2000.0);
-                f.set_slider_min(-500.0); f.set_slider_max(500.0);
-                f.set_default(0.0); f.set_precision(1);
-            }))?;
-            params.add(Params::TurbStrength, "Turbulence", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(1000.0);
-                f.set_slider_min(0.0); f.set_slider_max(200.0);
-                f.set_default(12.0); f.set_precision(1);
-            }))?;
-            params.add(Params::TurbScale, "Turbulence Scale", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.01); f.set_valid_max(100.0);
-                f.set_slider_min(0.1); f.set_slider_max(10.0);
-                f.set_default(0.75); f.set_precision(2);
-            }))?;
-            params.add(Params::TurbSpeed, "Turbulence Speed", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(10.0);
-                f.set_slider_min(0.0); f.set_slider_max(5.0);
-                f.set_default(1.0); f.set_precision(2);
-            }))?;
-            params.add(Params::AirResistance, "Air Resistance", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(20.0);
-                f.set_slider_min(0.0); f.set_slider_max(5.0);
-                f.set_default(0.3); f.set_precision(2);
-            }))?;
-            params.add(Params::BounceEnabled, "Bounce", ae::CheckBoxDef::setup(|f| {
-                f.set_default(false); f.set_label("Enable");
-            }))?;
-            params.add(Params::BounceDamping, "Bounce Damping", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(1.0);
-                f.set_slider_min(0.0); f.set_slider_max(1.0);
-                f.set_default(0.5); f.set_precision(2);
-            }))?;
-            Ok(())
-        })?;
+        params.add_group(
+            Params::PhysicsGroupStart,
+            Params::PhysicsGroupEnd,
+            "Physics",
+            false,
+            |params| {
+                params.add_with_flags(
+                    Params::GravityStrength,
+                    "Gravity",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(-2000.0);
+                        f.set_valid_max(2000.0);
+                        f.set_slider_min(-500.0);
+                        f.set_slider_max(500.0);
+                        f.set_default(160.0);
+                        f.set_precision(1);
+                    }),
+                    ae::ParamFlag::CANNOT_TIME_VARY,
+                    ae::ParamUIFlags::empty(),
+                )?;
+                params.add(
+                    Params::WindX,
+                    "Wind X",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(-2000.0);
+                        f.set_valid_max(2000.0);
+                        f.set_slider_min(-500.0);
+                        f.set_slider_max(500.0);
+                        f.set_default(0.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::WindY,
+                    "Wind Y",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(-2000.0);
+                        f.set_valid_max(2000.0);
+                        f.set_slider_min(-500.0);
+                        f.set_slider_max(500.0);
+                        f.set_default(0.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::TurbStrength,
+                    "Turbulence",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(1000.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(200.0);
+                        f.set_default(12.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::TurbScale,
+                    "Turbulence Scale",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.01);
+                        f.set_valid_max(100.0);
+                        f.set_slider_min(0.1);
+                        f.set_slider_max(10.0);
+                        f.set_default(0.75);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::TurbSpeed,
+                    "Turbulence Speed",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(10.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(5.0);
+                        f.set_default(1.0);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::AirResistance,
+                    "Air Resistance",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(20.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(5.0);
+                        f.set_default(0.3);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::BounceEnabled,
+                    "Bounce",
+                    ae::CheckBoxDef::setup(|f| {
+                        f.set_default(false);
+                        f.set_label("Enable");
+                    }),
+                )?;
+                params.add(
+                    Params::BounceDamping,
+                    "Bounce Damping",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(1.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(1.0);
+                        f.set_default(0.5);
+                        f.set_precision(2);
+                    }),
+                )?;
+                Ok(())
+            },
+        )?;
 
-        params.add_group(Params::AppearanceGroupStart, Params::AppearanceGroupEnd, "Appearance", false, |params| {
-            params.add(Params::ColorMode, "Color Mode", ae::PopupDef::setup(|f| {
-                f.set_options(&["Single", "Gradient"]);
-                f.set_default(2);
-            }))?;
-            params.add(Params::ColorStart, "Color Start", ae::ColorDef::setup(|f| {
-                f.set_default(ae::Pixel8 { alpha: 255, red: 255, green: 255, blue: 255 });
-            }))?;
-            params.add(Params::ColorEnd, "Color End", ae::ColorDef::setup(|f| {
-                f.set_default(ae::Pixel8 { alpha: 255, red: 255, green: 255, blue: 255 });
-            }))?;
-            params.add_with_flags(Params::OpacityCurvePreset, "Opacity Curve", ae::PopupDef::setup(|f| {
-                f.set_options(&["Custom", "Constant", "Fade Out", "Fade In-Out", "Ease Out", "Quick Fade"]);
-                f.set_default(3); // Fade Out
-            }), ae::ParamFlag::SUPERVISE, ae::ParamUIFlags::empty())?;
-            params.add(Params::OpacityStart, "Opacity Start", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(100.0);
-                f.set_slider_min(0.0); f.set_slider_max(100.0);
-                f.set_default(100.0); f.set_precision(1);
-            }))?;
-            params.add(Params::OpacityMidA, "Opacity 33%", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(100.0);
-                f.set_slider_min(0.0); f.set_slider_max(100.0);
-                f.set_default(90.0); f.set_precision(1);
-            }))?;
-            params.add(Params::OpacityMidB, "Opacity 66%", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(100.0);
-                f.set_slider_min(0.0); f.set_slider_max(100.0);
-                f.set_default(45.0); f.set_precision(1);
-            }))?;
-            params.add(Params::OpacityEnd, "Opacity End", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(100.0);
-                f.set_slider_min(0.0); f.set_slider_max(100.0);
-                f.set_default(0.0); f.set_precision(1);
-            }))?;
-            params.add_with_flags(Params::SizeCurvePreset, "Size Curve", ae::PopupDef::setup(|f| {
-                f.set_options(&["Custom", "Constant", "Shrink", "Grow-Shrink", "Grow", "Pop-Shrink"]);
-                f.set_default(3); // Shrink
-            }), ae::ParamFlag::SUPERVISE, ae::ParamUIFlags::empty())?;
-            params.add(Params::SizeLifeStart, "Size 0%", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(5.0);
-                f.set_slider_min(0.0); f.set_slider_max(3.0);
-                f.set_default(1.0); f.set_precision(2);
-            }))?;
-            params.add(Params::SizeLifeMidA, "Size 33%", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(5.0);
-                f.set_slider_min(0.0); f.set_slider_max(3.0);
-                f.set_default(1.0); f.set_precision(2);
-            }))?;
-            params.add(Params::SizeLifeMidB, "Size 66%", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(5.0);
-                f.set_slider_min(0.0); f.set_slider_max(3.0);
-                f.set_default(0.65); f.set_precision(2);
-            }))?;
-            params.add(Params::SizeLifeEnd, "Size 100%", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(5.0);
-                f.set_slider_min(0.0); f.set_slider_max(3.0);
-                f.set_default(0.35); f.set_precision(2);
-            }))?;
-            Ok(())
-        })?;
+        params.add_group(
+            Params::AppearanceGroupStart,
+            Params::AppearanceGroupEnd,
+            "Appearance",
+            false,
+            |params| {
+                params.add(
+                    Params::ColorMode,
+                    "Color Mode",
+                    ae::PopupDef::setup(|f| {
+                        f.set_options(&["Single", "Gradient"]);
+                        f.set_default(2);
+                    }),
+                )?;
+                params.add(
+                    Params::ColorStart,
+                    "Color Start",
+                    ae::ColorDef::setup(|f| {
+                        f.set_default(ae::Pixel8 {
+                            alpha: 255,
+                            red: 255,
+                            green: 255,
+                            blue: 255,
+                        });
+                    }),
+                )?;
+                params.add(
+                    Params::ColorEnd,
+                    "Color End",
+                    ae::ColorDef::setup(|f| {
+                        f.set_default(ae::Pixel8 {
+                            alpha: 255,
+                            red: 255,
+                            green: 255,
+                            blue: 255,
+                        });
+                    }),
+                )?;
+                params.add(
+                    Params::OpacityVar,
+                    "Opacity Variation",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(1.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(1.0);
+                        f.set_default(0.0);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add_with_flags(
+                    Params::OpacityCurvePreset,
+                    "Opacity Curve",
+                    ae::PopupDef::setup(|f| {
+                        f.set_options(&[
+                            "Custom",
+                            "Constant",
+                            "Fade Out",
+                            "Fade In-Out",
+                            "Ease Out",
+                            "Quick Fade",
+                        ]);
+                        f.set_default(3); // Fade Out
+                    }),
+                    ae::ParamFlag::SUPERVISE,
+                    ae::ParamUIFlags::empty(),
+                )?;
+                params.add(
+                    Params::OpacityStart,
+                    "Opacity Start",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(100.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(100.0);
+                        f.set_default(100.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::OpacityMidA,
+                    "Opacity 33%",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(100.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(100.0);
+                        f.set_default(90.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::OpacityMidB,
+                    "Opacity 66%",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(100.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(100.0);
+                        f.set_default(45.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::OpacityEnd,
+                    "Opacity End",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(100.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(100.0);
+                        f.set_default(0.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add_with_flags(
+                    Params::SizeCurvePreset,
+                    "Size Curve",
+                    ae::PopupDef::setup(|f| {
+                        f.set_options(&[
+                            "Custom",
+                            "Constant",
+                            "Shrink",
+                            "Grow-Shrink",
+                            "Grow",
+                            "Pop-Shrink",
+                        ]);
+                        f.set_default(3); // Shrink
+                    }),
+                    ae::ParamFlag::SUPERVISE,
+                    ae::ParamUIFlags::empty(),
+                )?;
+                params.add(
+                    Params::SizeLifeStart,
+                    "Size 0%",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(5.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(3.0);
+                        f.set_default(1.0);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::SizeLifeMidA,
+                    "Size 33%",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(5.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(3.0);
+                        f.set_default(1.0);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::SizeLifeMidB,
+                    "Size 66%",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(5.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(3.0);
+                        f.set_default(0.65);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::SizeLifeEnd,
+                    "Size 100%",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(5.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(3.0);
+                        f.set_default(0.35);
+                        f.set_precision(2);
+                    }),
+                )?;
+                Ok(())
+            },
+        )?;
 
-        params.add_group(Params::RenderingGroupStart, Params::RenderingGroupEnd, "Rendering", false, |params| {
-            params.add_with_flags(Params::Shape, "Shape", ae::PopupDef::setup(|f| {
-                f.set_options(&["Circle", "Square", "Triangle", "Star", "Line", "Image"]);
-                f.set_default(1);
-            }), ae::ParamFlag::SUPERVISE, ae::ParamUIFlags::empty())?;
-            params.add(Params::SpriteSourceLayer, "Sprite Source", ae::LayerDef::new())?;
-            params.add(Params::ImageProxyScale, "Image Proxy", ae::PopupDef::setup(|f| {
-                f.set_options(&["Full", "/2", "/4", "/8"]);
-                f.set_default(3);
-            }))?;
-            params.add(Params::EdgeSoftness, "Edge Softness", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(1.0);
-                f.set_slider_min(0.0); f.set_slider_max(1.0);
-                f.set_default(0.0); f.set_precision(2);
-            }))?;
-            params.add(Params::ImageColorMode, "Image Color", ae::PopupDef::setup(|f| {
-                f.set_options(&["Tint", "Source"]);
-                f.set_default(1);
-            }))?;
-            params.add(Params::ImageFitMode, "Image Fit", ae::PopupDef::setup(|f| {
-                f.set_options(&["Contain", "Stretch"]);
-                f.set_default(1);
-            }))?;
-            params.add(Params::UseSourceAlpha, "Use Source Alpha", ae::CheckBoxDef::setup(|f| {
-                f.set_default(true); f.set_label("Enable");
-            }))?;
-            params.add(Params::SourcePremultiplied, "Source Premultiplied", ae::CheckBoxDef::setup(|f| {
-                f.set_default(true); f.set_label("Enable");
-            }))?;
-            params.add(Params::ImageAlphaClip, "Alpha Clip", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(1.0);
-                f.set_slider_min(0.0); f.set_slider_max(1.0);
-                f.set_default(0.01); f.set_precision(2);
-            }))?;
-            params.add(Params::BlendModeParam, "Blend Mode", ae::PopupDef::setup(|f| {
-                f.set_options(&["Normal", "Add", "Screen"]);
-                f.set_default(1);
-            }))?;
-            params.add(Params::MotionBlur, "Motion Blur", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(1.0);
-                f.set_slider_min(0.0); f.set_slider_max(1.0);
-                f.set_default(0.2); f.set_precision(2);
-            }))?;
-            params.add(Params::DOFEnabled, "Depth of Field", ae::CheckBoxDef::setup(|f| {
-                f.set_default(false); f.set_label("Enable");
-            }))?;
-            params.add(Params::DOFFocalDist, "DOF Focal Distance", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(10000.0);
-                f.set_slider_min(0.0); f.set_slider_max(1000.0);
-                f.set_default(0.0); f.set_precision(1);
-            }))?;
-            params.add(Params::DOFAperture, "DOF Aperture", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(100.0);
-                f.set_slider_min(0.0); f.set_slider_max(50.0);
-                f.set_default(5.0); f.set_precision(1);
-            }))?;
-            params.add(Params::SizeMultiplier, "Size Multiplier", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.01); f.set_valid_max(10.0);
-                f.set_slider_min(0.1); f.set_slider_max(5.0);
-                f.set_default(1.15); f.set_precision(2);
-            }))?;
-            params.add(Params::CompositeOnOrig, "Composite on Original", ae::CheckBoxDef::setup(|f| {
-                f.set_default(true); f.set_label("Enable");
-            }))?;
-            Ok(())
-        })?;
+        params.add_group(
+            Params::RenderingGroupStart,
+            Params::RenderingGroupEnd,
+            "Rendering",
+            false,
+            |params| {
+                params.add_with_flags(
+                    Params::Shape,
+                    "Shape",
+                    ae::PopupDef::setup(|f| {
+                        f.set_options(&["Circle", "Square", "Triangle", "Star", "Line", "Image"]);
+                        f.set_default(1);
+                    }),
+                    ae::ParamFlag::SUPERVISE,
+                    ae::ParamUIFlags::empty(),
+                )?;
+                params.add(
+                    Params::SpriteSourceLayer,
+                    "Sprite Source",
+                    ae::LayerDef::new(),
+                )?;
+                params.add(
+                    Params::SpriteTimeSampling,
+                    "Time Sampling",
+                    ae::PopupDef::setup(|f| {
+                        f.set_options(&[
+                            "Current Time",
+                            "Birth Time",
+                            "Random - Still",
+                            "Random - Play",
+                            "Cycle",
+                        ]);
+                        f.set_default(1);
+                    }),
+                )?;
+                params.add(
+                    Params::SpriteFrameCount,
+                    "Frame Count",
+                    ae::SliderDef::setup(|f| {
+                        f.set_valid_min(1);
+                        f.set_valid_max(100);
+                        f.set_slider_min(1);
+                        f.set_slider_max(30);
+                        f.set_default(1);
+                    }),
+                )?;
+                params.add(
+                    Params::ImageProxyScale,
+                    "Image Proxy",
+                    ae::PopupDef::setup(|f| {
+                        f.set_options(&["Full", "/2", "/4", "/8"]);
+                        f.set_default(3);
+                    }),
+                )?;
+                params.add(
+                    Params::EdgeSoftness,
+                    "Edge Softness",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(1.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(1.0);
+                        f.set_default(0.0);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::ImageColorMode,
+                    "Image Color",
+                    ae::PopupDef::setup(|f| {
+                        f.set_options(&["Tint", "Source"]);
+                        f.set_default(1);
+                    }),
+                )?;
+                params.add(
+                    Params::ImageFitMode,
+                    "Image Fit",
+                    ae::PopupDef::setup(|f| {
+                        f.set_options(&["Contain", "Stretch"]);
+                        f.set_default(1);
+                    }),
+                )?;
+                params.add(
+                    Params::UseSourceAlpha,
+                    "Use Source Alpha",
+                    ae::CheckBoxDef::setup(|f| {
+                        f.set_default(true);
+                        f.set_label("Enable");
+                    }),
+                )?;
+                params.add(
+                    Params::SourcePremultiplied,
+                    "Source Premultiplied",
+                    ae::CheckBoxDef::setup(|f| {
+                        f.set_default(true);
+                        f.set_label("Enable");
+                    }),
+                )?;
+                params.add(
+                    Params::ImageAlphaClip,
+                    "Alpha Clip",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(1.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(1.0);
+                        f.set_default(0.01);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::BlendModeParam,
+                    "Blend Mode",
+                    ae::PopupDef::setup(|f| {
+                        f.set_options(&["Normal", "Add", "Screen"]);
+                        f.set_default(1);
+                    }),
+                )?;
+                params.add(
+                    Params::MotionBlur,
+                    "Motion Blur",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(1.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(1.0);
+                        f.set_default(0.2);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::DOFEnabled,
+                    "Depth of Field",
+                    ae::CheckBoxDef::setup(|f| {
+                        f.set_default(false);
+                        f.set_label("Enable");
+                    }),
+                )?;
+                params.add(
+                    Params::DOFFocalDist,
+                    "DOF Focal Distance",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(10000.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(1000.0);
+                        f.set_default(0.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::DOFAperture,
+                    "DOF Aperture",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(100.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(50.0);
+                        f.set_default(5.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::SizeMultiplier,
+                    "Size Multiplier",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.01);
+                        f.set_valid_max(10.0);
+                        f.set_slider_min(0.1);
+                        f.set_slider_max(5.0);
+                        f.set_default(1.15);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::CompositeOnOrig,
+                    "Composite on Original",
+                    ae::CheckBoxDef::setup(|f| {
+                        f.set_default(true);
+                        f.set_label("Enable");
+                    }),
+                )?;
+                params.add(
+                    Params::ApplyMode,
+                    "Apply Mode",
+                    ae::PopupDef::setup(|f| {
+                        f.set_options(&["On Transparent", "Normal", "Add", "Screen"]);
+                        f.set_default(2);
+                    }),
+                )?;
+                Ok(())
+            },
+        )?;
 
-        params.add_group(Params::ChildGroupStart, Params::ChildGroupEnd, "Child Particles", true, |params| {
-            params.add(Params::ChildEnabled, "Child Particles", ae::CheckBoxDef::setup(|f| {
-                f.set_default(false); f.set_label("Enable");
-            }))?;
-            params.add(Params::ChildCount, "Child Count", ae::SliderDef::setup(|f| {
-                f.set_valid_min(0); f.set_valid_max(20);
-                f.set_slider_min(0); f.set_slider_max(10);
-                f.set_default(3);
-            }))?;
-            params.add(Params::ChildInheritVel, "Child Inherit Velocity", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(1.0);
-                f.set_slider_min(0.0); f.set_slider_max(1.0);
-                f.set_default(0.65); f.set_precision(2);
-            }))?;
-            params.add(Params::ChildLifespan, "Child Lifespan", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.01); f.set_valid_max(10.0);
-                f.set_slider_min(0.1); f.set_slider_max(5.0);
-                f.set_default(0.5); f.set_precision(2);
-            }))?;
-            params.add(Params::ChildSpeed, "Child Speed", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(10000.0);
-                f.set_slider_min(0.0); f.set_slider_max(2000.0);
-                f.set_default(80.0); f.set_precision(1);
-            }))?;
-            params.add(Params::ChildSpread, "Child Spread (deg)", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.0); f.set_valid_max(180.0);
-                f.set_slider_min(0.0); f.set_slider_max(180.0);
-                f.set_default(110.0); f.set_precision(1);
-            }))?;
-            params.add(Params::ChildSizeScale, "Child Size Scale", ae::FloatSliderDef::setup(|f| {
-                f.set_valid_min(0.01); f.set_valid_max(5.0);
-                f.set_slider_min(0.1); f.set_slider_max(2.0);
-                f.set_default(0.4); f.set_precision(2);
-            }))?;
-            Ok(())
-        })?;
+        params.add_group(
+            Params::ChildGroupStart,
+            Params::ChildGroupEnd,
+            "Child Particles",
+            true,
+            |params| {
+                params.add(
+                    Params::ChildEnabled,
+                    "Child Particles",
+                    ae::CheckBoxDef::setup(|f| {
+                        f.set_default(false);
+                        f.set_label("Enable");
+                    }),
+                )?;
+                params.add(
+                    Params::ChildCount,
+                    "Child Count",
+                    ae::SliderDef::setup(|f| {
+                        f.set_valid_min(0);
+                        f.set_valid_max(20);
+                        f.set_slider_min(0);
+                        f.set_slider_max(10);
+                        f.set_default(3);
+                    }),
+                )?;
+                params.add(
+                    Params::ChildInheritVel,
+                    "Child Inherit Velocity",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(1.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(1.0);
+                        f.set_default(0.65);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::ChildLifespan,
+                    "Child Lifespan",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.01);
+                        f.set_valid_max(10.0);
+                        f.set_slider_min(0.1);
+                        f.set_slider_max(5.0);
+                        f.set_default(0.5);
+                        f.set_precision(2);
+                    }),
+                )?;
+                params.add(
+                    Params::ChildSpeed,
+                    "Child Speed",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(10000.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(2000.0);
+                        f.set_default(80.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::ChildSpread,
+                    "Child Spread (deg)",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(180.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(180.0);
+                        f.set_default(110.0);
+                        f.set_precision(1);
+                    }),
+                )?;
+                params.add(
+                    Params::ChildSizeScale,
+                    "Child Size Scale",
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.01);
+                        f.set_valid_max(5.0);
+                        f.set_slider_min(0.1);
+                        f.set_slider_max(2.0);
+                        f.set_default(0.4);
+                        f.set_precision(2);
+                    }),
+                )?;
+                Ok(())
+            },
+        )?;
 
-        params.add_group(Params::SystemGroupStart, Params::SystemGroupEnd, "System", true, |params| {
-            params.add(Params::Seed, "Random Seed", ae::SliderDef::setup(|f| {
-                f.set_valid_min(0); f.set_valid_max(99999);
-                f.set_slider_min(0); f.set_slider_max(99999);
-                f.set_default(12345);
-            }))?;
-            Ok(())
-        })?;
+        params.add_group(
+            Params::SystemGroupStart,
+            Params::SystemGroupEnd,
+            "System",
+            true,
+            |params| {
+                params.add(
+                    Params::Seed,
+                    "Random Seed",
+                    ae::SliderDef::setup(|f| {
+                        f.set_valid_min(0);
+                        f.set_valid_max(99999);
+                        f.set_slider_min(0);
+                        f.set_slider_max(99999);
+                        f.set_default(12345);
+                    }),
+                )?;
+                Ok(())
+            },
+        )?;
 
         // ---- Plexus ----
-        params.add_with_flags(Params::PluginMode, "Mode", ae::PopupDef::setup(|f| {
-            f.set_options(&["Particles", "Plexus", "Combined"]);
-            f.set_default(1);
-        }), ae::ParamFlag::SUPERVISE, ae::ParamUIFlags::empty())?;
+        params.add_with_flags(
+            Params::PluginMode,
+            "Mode",
+            ae::PopupDef::setup(|f| {
+                f.set_options(&["Particles", "Plexus", "Combined"]);
+                f.set_default(1);
+            }),
+            ae::ParamFlag::SUPERVISE,
+            ae::ParamUIFlags::empty(),
+        )?;
 
-        params.add_group(Params::PlexusGroupStart, Params::PlexusGroupEnd, "Plexus", true, |params| {
-            // Point Group A
-            params.add_group(Params::PointGroupAStart, Params::PointGroupAEnd, "Point Group A", false, |params| {
-                params.add(Params::PointAEnabled, "Enable", ae::CheckBoxDef::setup(|f| {
-                    f.set_default(true); f.set_label("Enable");
-                }))?;
-                params.add_with_flags(Params::PointASourceType, "Source Type", ae::PopupDef::setup(|f| {
-                    f.set_options(&["Grid", "Layer", "OBJ File", "AE Lights", "Particles"]);
-                    f.set_default(1);
-                }), ae::ParamFlag::SUPERVISE, ae::ParamUIFlags::empty())?;
-                params.add(Params::PointASourceLayer, "Source Layer", ae::LayerDef::new())?;
-                params.add(Params::PointAGridResX, "Grid Res X", ae::SliderDef::setup(|f| {
-                    f.set_valid_min(2); f.set_valid_max(200);
-                    f.set_slider_min(2); f.set_slider_max(100);
-                    f.set_default(10);
-                }))?;
-                params.add(Params::PointAGridResY, "Grid Res Y", ae::SliderDef::setup(|f| {
-                    f.set_valid_min(2); f.set_valid_max(200);
-                    f.set_slider_min(2); f.set_slider_max(100);
-                    f.set_default(10);
-                }))?;
-                params.add(Params::PointAGridResZ, "Grid Res Z", ae::SliderDef::setup(|f| {
-                    f.set_valid_min(1); f.set_valid_max(100);
-                    f.set_slider_min(1); f.set_slider_max(50);
-                    f.set_default(1);
-                }))?;
-                params.add(Params::PointAGridSpacing, "Grid Spacing", ae::FloatSliderDef::setup(|f| {
-                    f.set_valid_min(1.0); f.set_valid_max(500.0);
-                    f.set_slider_min(5.0); f.set_slider_max(200.0);
-                    f.set_default(50.0); f.set_precision(1);
-                }))?;
-                params.add(Params::PointAMaxPoints, "Max Points", ae::SliderDef::setup(|f| {
-                    f.set_valid_min(10); f.set_valid_max(10000);
-                    f.set_slider_min(100); f.set_slider_max(10000);
-                    f.set_default(5000);
-                }))?;
+        params.add_group(
+            Params::PlexusGroupStart,
+            Params::PlexusGroupEnd,
+            "Plexus",
+            true,
+            |params| {
+                // Point Group A
+                params.add_group(
+                    Params::PointGroupAStart,
+                    Params::PointGroupAEnd,
+                    "Point Group A",
+                    false,
+                    |params| {
+                        params.add(
+                            Params::PointAEnabled,
+                            "Enable",
+                            ae::CheckBoxDef::setup(|f| {
+                                f.set_default(true);
+                                f.set_label("Enable");
+                            }),
+                        )?;
+                        params.add_with_flags(
+                            Params::PointASourceType,
+                            "Source Type",
+                            ae::PopupDef::setup(|f| {
+                                f.set_options(&[
+                                    "Grid",
+                                    "Layer",
+                                    "OBJ File",
+                                    "AE Lights",
+                                    "Particles",
+                                ]);
+                                f.set_default(1);
+                            }),
+                            ae::ParamFlag::SUPERVISE,
+                            ae::ParamUIFlags::empty(),
+                        )?;
+                        params.add(
+                            Params::PointASourceLayer,
+                            "Source Layer",
+                            ae::LayerDef::new(),
+                        )?;
+                        params.add(
+                            Params::PointAGridResX,
+                            "Grid Res X",
+                            ae::SliderDef::setup(|f| {
+                                f.set_valid_min(2);
+                                f.set_valid_max(200);
+                                f.set_slider_min(2);
+                                f.set_slider_max(100);
+                                f.set_default(10);
+                            }),
+                        )?;
+                        params.add(
+                            Params::PointAGridResY,
+                            "Grid Res Y",
+                            ae::SliderDef::setup(|f| {
+                                f.set_valid_min(2);
+                                f.set_valid_max(200);
+                                f.set_slider_min(2);
+                                f.set_slider_max(100);
+                                f.set_default(10);
+                            }),
+                        )?;
+                        params.add(
+                            Params::PointAGridResZ,
+                            "Grid Res Z",
+                            ae::SliderDef::setup(|f| {
+                                f.set_valid_min(1);
+                                f.set_valid_max(100);
+                                f.set_slider_min(1);
+                                f.set_slider_max(50);
+                                f.set_default(1);
+                            }),
+                        )?;
+                        params.add(
+                            Params::PointAGridSpacing,
+                            "Grid Spacing",
+                            ae::FloatSliderDef::setup(|f| {
+                                f.set_valid_min(1.0);
+                                f.set_valid_max(500.0);
+                                f.set_slider_min(5.0);
+                                f.set_slider_max(200.0);
+                                f.set_default(50.0);
+                                f.set_precision(1);
+                            }),
+                        )?;
+                        params.add(
+                            Params::PointAMaxPoints,
+                            "Max Points",
+                            ae::SliderDef::setup(|f| {
+                                f.set_valid_min(10);
+                                f.set_valid_max(10000);
+                                f.set_slider_min(100);
+                                f.set_slider_max(10000);
+                                f.set_default(5000);
+                            }),
+                        )?;
+                        Ok(())
+                    },
+                )?;
+
+                // Point Group B
+                params.add_group(
+                    Params::PointGroupBStart,
+                    Params::PointGroupBEnd,
+                    "Point Group B",
+                    true,
+                    |params| {
+                        params.add(
+                            Params::PointBEnabled,
+                            "Enable",
+                            ae::CheckBoxDef::setup(|f| {
+                                f.set_default(false);
+                                f.set_label("Enable");
+                            }),
+                        )?;
+                        params.add_with_flags(
+                            Params::PointBSourceType,
+                            "Source Type",
+                            ae::PopupDef::setup(|f| {
+                                f.set_options(&["Grid", "Layer", "OBJ File", "AE Lights"]);
+                                f.set_default(1);
+                            }),
+                            ae::ParamFlag::SUPERVISE,
+                            ae::ParamUIFlags::empty(),
+                        )?;
+                        params.add(
+                            Params::PointBSourceLayer,
+                            "Source Layer",
+                            ae::LayerDef::new(),
+                        )?;
+                        params.add(
+                            Params::PointBGridResX,
+                            "Grid Res X",
+                            ae::SliderDef::setup(|f| {
+                                f.set_valid_min(2);
+                                f.set_valid_max(200);
+                                f.set_slider_min(2);
+                                f.set_slider_max(100);
+                                f.set_default(10);
+                            }),
+                        )?;
+                        params.add(
+                            Params::PointBGridResY,
+                            "Grid Res Y",
+                            ae::SliderDef::setup(|f| {
+                                f.set_valid_min(2);
+                                f.set_valid_max(200);
+                                f.set_slider_min(2);
+                                f.set_slider_max(100);
+                                f.set_default(10);
+                            }),
+                        )?;
+                        params.add(
+                            Params::PointBGridSpacing,
+                            "Grid Spacing",
+                            ae::FloatSliderDef::setup(|f| {
+                                f.set_valid_min(1.0);
+                                f.set_valid_max(500.0);
+                                f.set_slider_min(5.0);
+                                f.set_slider_max(200.0);
+                                f.set_default(50.0);
+                                f.set_precision(1);
+                            }),
+                        )?;
+                        Ok(())
+                    },
+                )?;
+
+                // Noise
+                params.add_group(
+                    Params::NoiseGroupStart,
+                    Params::NoiseGroupEnd,
+                    "Noise Displacement",
+                    true,
+                    |params| {
+                        params.add(
+                            Params::NoiseEnabled,
+                            "Enable",
+                            ae::CheckBoxDef::setup(|f| {
+                                f.set_default(false);
+                                f.set_label("Enable");
+                            }),
+                        )?;
+                        params.add(
+                            Params::NoiseAmplitude,
+                            "Amplitude",
+                            ae::FloatSliderDef::setup(|f| {
+                                f.set_valid_min(0.0);
+                                f.set_valid_max(1000.0);
+                                f.set_slider_min(0.0);
+                                f.set_slider_max(300.0);
+                                f.set_default(50.0);
+                                f.set_precision(1);
+                            }),
+                        )?;
+                        params.add(
+                            Params::NoiseFrequency,
+                            "Frequency",
+                            ae::FloatSliderDef::setup(|f| {
+                                f.set_valid_min(0.001);
+                                f.set_valid_max(10.0);
+                                f.set_slider_min(0.01);
+                                f.set_slider_max(2.0);
+                                f.set_default(0.01);
+                                f.set_precision(3);
+                            }),
+                        )?;
+                        params.add(
+                            Params::NoiseSpeed,
+                            "Speed",
+                            ae::FloatSliderDef::setup(|f| {
+                                f.set_valid_min(0.0);
+                                f.set_valid_max(10.0);
+                                f.set_slider_min(0.0);
+                                f.set_slider_max(5.0);
+                                f.set_default(1.0);
+                                f.set_precision(2);
+                            }),
+                        )?;
+                        params.add(
+                            Params::NoiseOctaves,
+                            "Octaves",
+                            ae::SliderDef::setup(|f| {
+                                f.set_valid_min(1);
+                                f.set_valid_max(6);
+                                f.set_slider_min(1);
+                                f.set_slider_max(6);
+                                f.set_default(2);
+                            }),
+                        )?;
+                        params.add(
+                            Params::NoiseAxisScale,
+                            "Mode",
+                            ae::PopupDef::setup(|f| {
+                                f.set_options(&["Uniform", "Per-Axis"]);
+                                f.set_default(1);
+                            }),
+                        )?;
+                        Ok(())
+                    },
+                )?;
+
+                // Lines
+                params.add_group(
+                    Params::LinesGroupStart,
+                    Params::LinesGroupEnd,
+                    "Lines",
+                    true,
+                    |params| {
+                        params.add(
+                            Params::LinesEnabled,
+                            "Enable",
+                            ae::CheckBoxDef::setup(|f| {
+                                f.set_default(true);
+                                f.set_label("Enable");
+                            }),
+                        )?;
+                        params.add(
+                            Params::LinesMaxDistance,
+                            "Max Distance",
+                            ae::FloatSliderDef::setup(|f| {
+                                f.set_valid_min(1.0);
+                                f.set_valid_max(2000.0);
+                                f.set_slider_min(10.0);
+                                f.set_slider_max(500.0);
+                                f.set_default(120.0);
+                                f.set_precision(1);
+                            }),
+                        )?;
+                        params.add(
+                            Params::LinesWidth,
+                            "Line Width",
+                            ae::FloatSliderDef::setup(|f| {
+                                f.set_valid_min(0.5);
+                                f.set_valid_max(20.0);
+                                f.set_slider_min(0.5);
+                                f.set_slider_max(10.0);
+                                f.set_default(1.0);
+                                f.set_precision(1);
+                            }),
+                        )?;
+                        params.add(
+                            Params::LinesOpacityFalloff,
+                            "Opacity Falloff",
+                            ae::FloatSliderDef::setup(|f| {
+                                f.set_valid_min(0.0);
+                                f.set_valid_max(1.0);
+                                f.set_slider_min(0.0);
+                                f.set_slider_max(1.0);
+                                f.set_default(0.8);
+                                f.set_precision(2);
+                            }),
+                        )?;
+                        params.add(
+                            Params::LinesColor,
+                            "Line Color",
+                            ae::ColorDef::setup(|f| {
+                                f.set_default(ae::Pixel8 {
+                                    alpha: 255,
+                                    red: 255,
+                                    green: 255,
+                                    blue: 255,
+                                });
+                            }),
+                        )?;
+                        Ok(())
+                    },
+                )?;
+
+                // Mesh
+                params.add_group(
+                    Params::MeshGroupStart,
+                    Params::MeshGroupEnd,
+                    "Mesh",
+                    true,
+                    |params| {
+                        params.add(
+                            Params::MeshEnabled,
+                            "Enable",
+                            ae::CheckBoxDef::setup(|f| {
+                                f.set_default(false);
+                                f.set_label("Enable");
+                            }),
+                        )?;
+                        params.add(
+                            Params::MeshMaxEdge,
+                            "Max Edge Length",
+                            ae::FloatSliderDef::setup(|f| {
+                                f.set_valid_min(1.0);
+                                f.set_valid_max(2000.0);
+                                f.set_slider_min(10.0);
+                                f.set_slider_max(500.0);
+                                f.set_default(150.0);
+                                f.set_precision(1);
+                            }),
+                        )?;
+                        params.add(
+                            Params::MeshOpacity,
+                            "Mesh Opacity",
+                            ae::FloatSliderDef::setup(|f| {
+                                f.set_valid_min(0.0);
+                                f.set_valid_max(100.0);
+                                f.set_slider_min(0.0);
+                                f.set_slider_max(100.0);
+                                f.set_default(30.0);
+                                f.set_precision(1);
+                            }),
+                        )?;
+                        params.add(
+                            Params::MeshColor,
+                            "Mesh Color",
+                            ae::ColorDef::setup(|f| {
+                                f.set_default(ae::Pixel8 {
+                                    alpha: 255,
+                                    red: 100,
+                                    green: 150,
+                                    blue: 255,
+                                });
+                            }),
+                        )?;
+                        Ok(())
+                    },
+                )?;
+
+                // Beams
+                params.add_group(
+                    Params::BeamsGroupStart,
+                    Params::BeamsGroupEnd,
+                    "Beams",
+                    true,
+                    |params| {
+                        params.add(
+                            Params::BeamsEnabled,
+                            "Enable",
+                            ae::CheckBoxDef::setup(|f| {
+                                f.set_default(false);
+                                f.set_label("Enable");
+                            }),
+                        )?;
+                        params.add(
+                            Params::BeamsSourceGroup,
+                            "Direction",
+                            ae::PopupDef::setup(|f| {
+                                f.set_options(&["A -> B", "B -> A", "A -> A", "B -> B"]);
+                                f.set_default(1);
+                            }),
+                        )?;
+                        params.add(
+                            Params::BeamsMaxDistance,
+                            "Max Distance",
+                            ae::FloatSliderDef::setup(|f| {
+                                f.set_valid_min(1.0);
+                                f.set_valid_max(5000.0);
+                                f.set_slider_min(10.0);
+                                f.set_slider_max(1000.0);
+                                f.set_default(300.0);
+                                f.set_precision(1);
+                            }),
+                        )?;
+                        params.add(
+                            Params::BeamsWidth,
+                            "Beam Width",
+                            ae::FloatSliderDef::setup(|f| {
+                                f.set_valid_min(0.5);
+                                f.set_valid_max(30.0);
+                                f.set_slider_min(0.5);
+                                f.set_slider_max(15.0);
+                                f.set_default(2.0);
+                                f.set_precision(1);
+                            }),
+                        )?;
+                        params.add(
+                            Params::BeamsColor,
+                            "Beam Color",
+                            ae::ColorDef::setup(|f| {
+                                f.set_default(ae::Pixel8 {
+                                    alpha: 255,
+                                    red: 100,
+                                    green: 200,
+                                    blue: 255,
+                                });
+                            }),
+                        )?;
+                        Ok(())
+                    },
+                )?;
+
+                // Plexus Rendering
+                params.add_group(
+                    Params::PlexusRenderGroupStart,
+                    Params::PlexusRenderGroupEnd,
+                    "Point Rendering",
+                    false,
+                    |params| {
+                        params.add(
+                            Params::PlexusPointSize,
+                            "Point Size",
+                            ae::FloatSliderDef::setup(|f| {
+                                f.set_valid_min(0.5);
+                                f.set_valid_max(50.0);
+                                f.set_slider_min(1.0);
+                                f.set_slider_max(20.0);
+                                f.set_default(4.0);
+                                f.set_precision(1);
+                            }),
+                        )?;
+                        params.add(
+                            Params::PlexusPointColor,
+                            "Point Color",
+                            ae::ColorDef::setup(|f| {
+                                f.set_default(ae::Pixel8 {
+                                    alpha: 255,
+                                    red: 255,
+                                    green: 255,
+                                    blue: 255,
+                                });
+                            }),
+                        )?;
+                        Ok(())
+                    },
+                )?;
+
                 Ok(())
-            })?;
-
-            // Point Group B
-            params.add_group(Params::PointGroupBStart, Params::PointGroupBEnd, "Point Group B", true, |params| {
-                params.add(Params::PointBEnabled, "Enable", ae::CheckBoxDef::setup(|f| {
-                    f.set_default(false); f.set_label("Enable");
-                }))?;
-                params.add_with_flags(Params::PointBSourceType, "Source Type", ae::PopupDef::setup(|f| {
-                    f.set_options(&["Grid", "Layer", "OBJ File", "AE Lights"]);
-                    f.set_default(1);
-                }), ae::ParamFlag::SUPERVISE, ae::ParamUIFlags::empty())?;
-                params.add(Params::PointBSourceLayer, "Source Layer", ae::LayerDef::new())?;
-                params.add(Params::PointBGridResX, "Grid Res X", ae::SliderDef::setup(|f| {
-                    f.set_valid_min(2); f.set_valid_max(200);
-                    f.set_slider_min(2); f.set_slider_max(100);
-                    f.set_default(10);
-                }))?;
-                params.add(Params::PointBGridResY, "Grid Res Y", ae::SliderDef::setup(|f| {
-                    f.set_valid_min(2); f.set_valid_max(200);
-                    f.set_slider_min(2); f.set_slider_max(100);
-                    f.set_default(10);
-                }))?;
-                params.add(Params::PointBGridSpacing, "Grid Spacing", ae::FloatSliderDef::setup(|f| {
-                    f.set_valid_min(1.0); f.set_valid_max(500.0);
-                    f.set_slider_min(5.0); f.set_slider_max(200.0);
-                    f.set_default(50.0); f.set_precision(1);
-                }))?;
-                Ok(())
-            })?;
-
-            // Noise
-            params.add_group(Params::NoiseGroupStart, Params::NoiseGroupEnd, "Noise Displacement", true, |params| {
-                params.add(Params::NoiseEnabled, "Enable", ae::CheckBoxDef::setup(|f| {
-                    f.set_default(false); f.set_label("Enable");
-                }))?;
-                params.add(Params::NoiseAmplitude, "Amplitude", ae::FloatSliderDef::setup(|f| {
-                    f.set_valid_min(0.0); f.set_valid_max(1000.0);
-                    f.set_slider_min(0.0); f.set_slider_max(300.0);
-                    f.set_default(50.0); f.set_precision(1);
-                }))?;
-                params.add(Params::NoiseFrequency, "Frequency", ae::FloatSliderDef::setup(|f| {
-                    f.set_valid_min(0.001); f.set_valid_max(10.0);
-                    f.set_slider_min(0.01); f.set_slider_max(2.0);
-                    f.set_default(0.01); f.set_precision(3);
-                }))?;
-                params.add(Params::NoiseSpeed, "Speed", ae::FloatSliderDef::setup(|f| {
-                    f.set_valid_min(0.0); f.set_valid_max(10.0);
-                    f.set_slider_min(0.0); f.set_slider_max(5.0);
-                    f.set_default(1.0); f.set_precision(2);
-                }))?;
-                params.add(Params::NoiseOctaves, "Octaves", ae::SliderDef::setup(|f| {
-                    f.set_valid_min(1); f.set_valid_max(6);
-                    f.set_slider_min(1); f.set_slider_max(6);
-                    f.set_default(2);
-                }))?;
-                params.add(Params::NoiseAxisScale, "Mode", ae::PopupDef::setup(|f| {
-                    f.set_options(&["Uniform", "Per-Axis"]);
-                    f.set_default(1);
-                }))?;
-                Ok(())
-            })?;
-
-            // Lines
-            params.add_group(Params::LinesGroupStart, Params::LinesGroupEnd, "Lines", true, |params| {
-                params.add(Params::LinesEnabled, "Enable", ae::CheckBoxDef::setup(|f| {
-                    f.set_default(true); f.set_label("Enable");
-                }))?;
-                params.add(Params::LinesMaxDistance, "Max Distance", ae::FloatSliderDef::setup(|f| {
-                    f.set_valid_min(1.0); f.set_valid_max(2000.0);
-                    f.set_slider_min(10.0); f.set_slider_max(500.0);
-                    f.set_default(120.0); f.set_precision(1);
-                }))?;
-                params.add(Params::LinesWidth, "Line Width", ae::FloatSliderDef::setup(|f| {
-                    f.set_valid_min(0.5); f.set_valid_max(20.0);
-                    f.set_slider_min(0.5); f.set_slider_max(10.0);
-                    f.set_default(1.0); f.set_precision(1);
-                }))?;
-                params.add(Params::LinesOpacityFalloff, "Opacity Falloff", ae::FloatSliderDef::setup(|f| {
-                    f.set_valid_min(0.0); f.set_valid_max(1.0);
-                    f.set_slider_min(0.0); f.set_slider_max(1.0);
-                    f.set_default(0.8); f.set_precision(2);
-                }))?;
-                params.add(Params::LinesColor, "Line Color", ae::ColorDef::setup(|f| {
-                    f.set_default(ae::Pixel8 { alpha: 255, red: 255, green: 255, blue: 255 });
-                }))?;
-                Ok(())
-            })?;
-
-            // Mesh
-            params.add_group(Params::MeshGroupStart, Params::MeshGroupEnd, "Mesh", true, |params| {
-                params.add(Params::MeshEnabled, "Enable", ae::CheckBoxDef::setup(|f| {
-                    f.set_default(false); f.set_label("Enable");
-                }))?;
-                params.add(Params::MeshMaxEdge, "Max Edge Length", ae::FloatSliderDef::setup(|f| {
-                    f.set_valid_min(1.0); f.set_valid_max(2000.0);
-                    f.set_slider_min(10.0); f.set_slider_max(500.0);
-                    f.set_default(150.0); f.set_precision(1);
-                }))?;
-                params.add(Params::MeshOpacity, "Mesh Opacity", ae::FloatSliderDef::setup(|f| {
-                    f.set_valid_min(0.0); f.set_valid_max(100.0);
-                    f.set_slider_min(0.0); f.set_slider_max(100.0);
-                    f.set_default(30.0); f.set_precision(1);
-                }))?;
-                params.add(Params::MeshColor, "Mesh Color", ae::ColorDef::setup(|f| {
-                    f.set_default(ae::Pixel8 { alpha: 255, red: 100, green: 150, blue: 255 });
-                }))?;
-                Ok(())
-            })?;
-
-            // Beams
-            params.add_group(Params::BeamsGroupStart, Params::BeamsGroupEnd, "Beams", true, |params| {
-                params.add(Params::BeamsEnabled, "Enable", ae::CheckBoxDef::setup(|f| {
-                    f.set_default(false); f.set_label("Enable");
-                }))?;
-                params.add(Params::BeamsSourceGroup, "Direction", ae::PopupDef::setup(|f| {
-                    f.set_options(&["A -> B", "B -> A", "A -> A", "B -> B"]);
-                    f.set_default(1);
-                }))?;
-                params.add(Params::BeamsMaxDistance, "Max Distance", ae::FloatSliderDef::setup(|f| {
-                    f.set_valid_min(1.0); f.set_valid_max(5000.0);
-                    f.set_slider_min(10.0); f.set_slider_max(1000.0);
-                    f.set_default(300.0); f.set_precision(1);
-                }))?;
-                params.add(Params::BeamsWidth, "Beam Width", ae::FloatSliderDef::setup(|f| {
-                    f.set_valid_min(0.5); f.set_valid_max(30.0);
-                    f.set_slider_min(0.5); f.set_slider_max(15.0);
-                    f.set_default(2.0); f.set_precision(1);
-                }))?;
-                params.add(Params::BeamsColor, "Beam Color", ae::ColorDef::setup(|f| {
-                    f.set_default(ae::Pixel8 { alpha: 255, red: 100, green: 200, blue: 255 });
-                }))?;
-                Ok(())
-            })?;
-
-            // Plexus Rendering
-            params.add_group(Params::PlexusRenderGroupStart, Params::PlexusRenderGroupEnd, "Point Rendering", false, |params| {
-                params.add(Params::PlexusPointSize, "Point Size", ae::FloatSliderDef::setup(|f| {
-                    f.set_valid_min(0.5); f.set_valid_max(50.0);
-                    f.set_slider_min(1.0); f.set_slider_max(20.0);
-                    f.set_default(4.0); f.set_precision(1);
-                }))?;
-                params.add(Params::PlexusPointColor, "Point Color", ae::ColorDef::setup(|f| {
-                    f.set_default(ae::Pixel8 { alpha: 255, red: 255, green: 255, blue: 255 });
-                }))?;
-                Ok(())
-            })?;
-
-            Ok(())
-        })?;
+            },
+        )?;
 
         Ok(())
     }
@@ -1208,39 +2233,56 @@ impl AdobePluginGlobal for Plugin {
                     Ok(())
                 }
 
-                ae::Command::Render { in_layer, mut out_layer } => {
-                    render_particles(params, &in_data, &in_layer, &mut out_layer)
-                }
+                ae::Command::Render {
+                    in_layer,
+                    mut out_layer,
+                } => render_particles(params, &in_data, &in_layer, &mut out_layer),
 
                 ae::Command::SmartPreRender { mut extra } => {
                     let req = extra.output_request();
                     let cb = extra.callbacks();
                     let in_result = cb.checkout_layer(
-                        0, 0, &req,
-                        in_data.current_time(), in_data.time_step(), in_data.time_scale(),
+                        0,
+                        0,
+                        &req,
+                        in_data.current_time(),
+                        in_data.time_step(),
+                        in_data.time_scale(),
                     )?;
 
                     let in_rect: ae::Rect = in_result.result_rect.into();
+                    let in_max: ae::Rect = in_result.max_result_rect.into();
                     let margin = estimate_render_margin(params)?;
                     let expanded_input = ae::Rect {
-                        left:   in_rect.left.saturating_sub(margin),
-                        top:    in_rect.top.saturating_sub(margin),
-                        right:  in_rect.right.saturating_add(margin),
+                        left: in_rect.left.saturating_sub(margin),
+                        top: in_rect.top.saturating_sub(margin),
+                        right: in_rect.right.saturating_add(margin),
                         bottom: in_rect.bottom.saturating_add(margin),
+                    };
+                    let expanded_max = ae::Rect {
+                        left: in_max.left.saturating_sub(margin),
+                        top: in_max.top.saturating_sub(margin),
+                        right: in_max.right.saturating_add(margin),
+                        bottom: in_max.bottom.saturating_add(margin),
                     };
                     let emitter_rect = estimated_emitter_bounds(params, margin)?;
                     let expanded = clamp_rect_to_pixel_budget(
                         union_rect(expanded_input, emitter_rect),
                         MAX_OUTPUT_PIXELS,
                     );
+                    let max_expanded = clamp_rect_to_pixel_budget(
+                        union_rect(expanded_max, emitter_rect),
+                        MAX_OUTPUT_PIXELS,
+                    );
                     extra.set_result_rect(expanded);
-                    extra.set_max_result_rect(expanded);
+                    extra.set_max_result_rect(max_expanded);
                     extra.set_returns_extra_pixels(true);
 
                     // Collect ALL data on the PreRender thread (safe for AE API calls).
                     // SmartRender will NOT call any AE param/camera APIs.
                     let mode = get_plugin_mode(params)?;
-                    let (mut emitter, physics, appearance, child, mut render_cfg, seed) = extract_configs(params)?;
+                    let (mut emitter, physics, appearance, child, mut render_cfg, seed) =
+                        extract_configs(params)?;
                     populate_layer_alpha_emitter(params, &in_data, &mut emitter)?;
                     populate_path_emitter(params, &in_data, &mut emitter)?;
                     populate_image_sprite(params, &in_data, &mut render_cfg)?;
@@ -1259,10 +2301,21 @@ impl AdobePluginGlobal for Plugin {
                     let expected_origin_x = expanded.left;
                     let expected_origin_y = expanded.top;
                     extra.set_pre_render_data(SmartRenderData {
-                        mode, emitter, physics, appearance, child, render_cfg, seed,
-                        camera_projection, t, dt, plexus_cfg,
-                        expected_output_w, expected_output_h,
-                        expected_origin_x, expected_origin_y,
+                        mode,
+                        emitter,
+                        physics,
+                        appearance,
+                        child,
+                        render_cfg,
+                        seed,
+                        camera_projection,
+                        t,
+                        dt,
+                        plexus_cfg,
+                        expected_output_w,
+                        expected_output_h,
+                        expected_origin_x,
+                        expected_origin_y,
                     });
 
                     debug_info(format!(
@@ -1316,11 +2369,20 @@ impl AdobePluginGlobal for Plugin {
                     let changed = params.type_at(param_index);
                     if matches!(
                         changed,
-                        Params::SavePreset | Params::LoadPreset | Params::DeletePreset | Params::OpenPresetFolder
+                        Params::SavePreset
+                            | Params::LoadPreset
+                            | Params::DeletePreset
+                            | Params::OpenPresetFolder
                     ) {
                         handle_preset_command(changed, params, &mut out_data)?;
                     }
-                    if matches!(changed, Params::EmitterSizeX | Params::EmitterSizeY | Params::EmitterSizeZ | Params::EmitterSizeLinked) {
+                    if matches!(
+                        changed,
+                        Params::EmitterSizeX
+                            | Params::EmitterSizeY
+                            | Params::EmitterSizeZ
+                            | Params::EmitterSizeLinked
+                    ) {
                         sync_box_size_axes(params, changed)?;
                     }
                     if changed == Params::OpacityCurvePreset {
@@ -1350,16 +2412,18 @@ impl AdobePluginGlobal for Plugin {
                     Ok(())
                 }
 
-                ae::Command::Event { .. } => {
-                    Ok(())
-                }
+                ae::Command::Event { .. } => Ok(()),
 
                 _ => Ok(()),
             }
         })) {
             Ok(result) => result,
             Err(payload) => {
-                debug_error(format!("{} panicked: {}", cmd_name, panic_payload_message(payload)));
+                debug_error(format!(
+                    "{} panicked: {}",
+                    cmd_name,
+                    panic_payload_message(payload)
+                ));
                 Err(ae::Error::Generic)
             }
         };
@@ -1378,54 +2442,15 @@ impl AdobePluginGlobal for Plugin {
 #[cfg(windows)]
 fn preset_root_dir() -> Result<PathBuf, ae::Error> {
     let userprofile = std::env::var("USERPROFILE").map_err(|_| ae::Error::Generic)?;
-    Ok(PathBuf::from(userprofile).join("Documents").join("ParticleLab").join("presets"))
+    Ok(PathBuf::from(userprofile)
+        .join("Documents")
+        .join("ParticleLab")
+        .join("presets"))
 }
 
 #[cfg(not(windows))]
 fn preset_root_dir() -> Result<std::path::PathBuf, ae::Error> {
     Err(ae::Error::Generic)
-}
-
-fn latest_preset_file() -> Result<Option<PathBuf>, ae::Error> {
-    let dir = preset_root_dir()?;
-    if !dir.is_dir() {
-        return Ok(None);
-    }
-    let mut latest: Option<(PathBuf, std::time::SystemTime)> = None;
-    let entries = fs::read_dir(&dir).map_err(|_| ae::Error::Generic)?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().map_or(false, |e| e == "json") {
-            if let Ok(meta) = path.metadata() {
-                if let Ok(modified) = meta.modified() {
-                    if latest.as_ref().map_or(true, |(_, t)| modified > *t) {
-                        latest = Some((path, modified));
-                    }
-                }
-            }
-        }
-    }
-    Ok(latest.map(|(p, _)| p))
-}
-
-fn generate_preset_path() -> Result<PathBuf, ae::Error> {
-    let dir = preset_root_dir()?;
-    fs::create_dir_all(&dir).map_err(|_| ae::Error::Generic)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| ae::Error::Generic)?;
-    let secs = now.as_secs();
-    // Format as YYYYMMDD_HHMMSS using UTC
-    let s = secs;
-    let days = s / 86400;
-    let time_of_day = s % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-    // Simple date calculation from epoch days
-    let (year, month, day) = epoch_days_to_date(days as i64);
-    let name = format!("preset_{:04}{:02}{:02}_{:02}{:02}{:02}.json", year, month, day, hours, minutes, seconds);
-    Ok(dir.join(name))
 }
 
 fn epoch_days_to_date(days: i64) -> (i64, u32, u32) {
@@ -1441,32 +2466,6 @@ fn epoch_days_to_date(days: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
-}
-
-fn read_latest_preset() -> Result<Option<PresetSnapshot>, ae::Error> {
-    if let Some(path) = latest_preset_file()? {
-        let contents = fs::read_to_string(&path).map_err(|_| ae::Error::Generic)?;
-        let snapshot = serde_json::from_str::<PresetSnapshot>(&contents).map_err(|_| ae::Error::Generic)?;
-        Ok(Some(snapshot))
-    } else {
-        Ok(None)
-    }
-}
-
-fn write_preset(snapshot: &PresetSnapshot) -> Result<PathBuf, ae::Error> {
-    let path = generate_preset_path()?;
-    let json = serde_json::to_string_pretty(snapshot).map_err(|_| ae::Error::Generic)?;
-    fs::write(&path, json).map_err(|_| ae::Error::Generic)?;
-    Ok(path)
-}
-
-fn delete_latest_preset() -> Result<Option<PathBuf>, ae::Error> {
-    if let Some(path) = latest_preset_file()? {
-        fs::remove_file(&path).map_err(|_| ae::Error::Generic)?;
-        Ok(Some(path))
-    } else {
-        Ok(None)
-    }
 }
 
 #[cfg(windows)]
@@ -1492,31 +2491,75 @@ fn handle_preset_command(
 ) -> Result<(), ae::Error> {
     match changed {
         Params::SavePreset => {
-            let snapshot = capture_preset(params)?;
-            let path = write_preset(&snapshot)?;
-            out_data.set_return_msg(&format!(
-                "ParticleLab preset saved: {}",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            ));
+            let dir = preset_root_dir()?;
+            fs::create_dir_all(&dir).map_err(|_| ae::Error::Generic)?;
+            let dir_str = dir.to_string_lossy().to_string();
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let days = now / 86400;
+            let tod = now % 86400;
+            let (y, m, d) = epoch_days_to_date(days as i64);
+            let default_name = format!(
+                "preset_{:04}{:02}{:02}_{:02}{:02}{:02}.json",
+                y,
+                m,
+                d,
+                tod / 3600,
+                (tod % 3600) / 60,
+                tod % 60
+            );
+
+            if let Some(path) =
+                file_dialog::save_file_dialog(&dir_str, "Save Preset", &default_name)
+            {
+                let mut snapshot = capture_preset(params)?;
+                snapshot.name = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                let json =
+                    serde_json::to_string_pretty(&snapshot).map_err(|_| ae::Error::Generic)?;
+                fs::write(&path, json).map_err(|_| ae::Error::Generic)?;
+                out_data.set_return_msg(&format!(
+                    "Preset saved: {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
         }
         Params::LoadPreset => {
-            if let Some(snapshot) = read_latest_preset()? {
+            let dir = preset_root_dir()?;
+            fs::create_dir_all(&dir).map_err(|_| ae::Error::Generic)?;
+            let dir_str = dir.to_string_lossy().to_string();
+
+            if let Some(path) = file_dialog::open_file_dialog(&dir_str, "Load Preset") {
+                let contents = fs::read_to_string(&path).map_err(|_| ae::Error::Generic)?;
+                let snapshot = load_preset_snapshot(&contents)?;
                 apply_preset(params, &snapshot)?;
                 invalidate_image_cache();
-                let label = if snapshot.name.is_empty() { "latest".to_string() } else { snapshot.name.clone() };
-                out_data.set_return_msg(&format!("ParticleLab preset loaded: {}", label));
-            } else {
-                out_data.set_return_msg("No preset files found in Documents/ParticleLab/presets/");
+                let label = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                out_data.set_return_msg(&format!("Preset loaded: {}", label));
             }
         }
         Params::DeletePreset => {
-            if let Some(path) = delete_latest_preset()? {
-                out_data.set_return_msg(&format!(
-                    "Deleted: {}",
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                ));
-            } else {
-                out_data.set_return_msg("No preset files to delete.");
+            let dir = preset_root_dir()?;
+            fs::create_dir_all(&dir).map_err(|_| ae::Error::Generic)?;
+            let dir_str = dir.to_string_lossy().to_string();
+
+            if let Some(path) = file_dialog::open_file_dialog(&dir_str, "Delete Preset") {
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                fs::remove_file(&path).map_err(|_| ae::Error::Generic)?;
+                out_data.set_return_msg(&format!("Deleted: {}", name));
             }
         }
         Params::OpenPresetFolder => {
@@ -1538,17 +2581,30 @@ fn capture_preset(params: &ae::Parameters<Params>) -> Result<PresetSnapshot, ae:
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;
-    let name = format!("preset_{:04}{:02}{:02}_{:02}{:02}{:02}", year, month, day, hours, minutes, seconds);
+    let name = format!(
+        "preset_{:04}{:02}{:02}_{:02}{:02}{:02}",
+        year, month, day, hours, minutes, seconds
+    );
 
     Ok(PresetSnapshot {
         version: PRESET_VERSION,
         name,
         emitter_type: params.get(Params::EmitterType)?.as_popup()?.value(),
+        emit_mode: params.get(Params::EmitMode)?.as_popup()?.value(),
         position_point: params.get(Params::PositionPoint)?.as_point()?.value(),
         position_z: params.get(Params::PositionZ)?.as_float_slider()?.value(),
         image_proxy_scale: params.get(Params::ImageProxyScale)?.as_popup()?.value(),
-        path_sample_density: params.get(Params::PathSampleDensity)?.as_float_slider()?.value(),
-        emitter_size_linked: params.get(Params::EmitterSizeLinked)?.as_checkbox()?.value(),
+        path_sample_density: params
+            .get(Params::PathSampleDensity)?
+            .as_float_slider()?
+            .value(),
+        grid_res_x: params.get(Params::GridResX)?.as_slider()?.value(),
+        grid_res_y: params.get(Params::GridResY)?.as_slider()?.value(),
+        grid_res_z: params.get(Params::GridResZ)?.as_slider()?.value(),
+        emitter_size_linked: params
+            .get(Params::EmitterSizeLinked)?
+            .as_checkbox()?
+            .value(),
         emitter_size_x: params.get(Params::EmitterSizeX)?.as_float_slider()?.value(),
         emitter_size_y: params.get(Params::EmitterSizeY)?.as_float_slider()?.value(),
         emitter_size_z: params.get(Params::EmitterSizeZ)?.as_float_slider()?.value(),
@@ -1564,16 +2620,28 @@ fn capture_preset(params: &ae::Parameters<Params>) -> Result<PresetSnapshot, ae:
         initial_size: params.get(Params::InitialSize)?.as_float_slider()?.value(),
         size_var: params.get(Params::SizeVar)?.as_float_slider()?.value(),
         rotation: params.get(Params::Rotation)?.as_float_slider()?.value(),
-        rotation_speed: params.get(Params::RotationSpeed)?.as_float_slider()?.value(),
-        gravity_strength: params.get(Params::GravityStrength)?.as_float_slider()?.value(),
+        rotation_speed: params
+            .get(Params::RotationSpeed)?
+            .as_float_slider()?
+            .value(),
+        gravity_strength: params
+            .get(Params::GravityStrength)?
+            .as_float_slider()?
+            .value(),
         wind_x: params.get(Params::WindX)?.as_float_slider()?.value(),
         wind_y: params.get(Params::WindY)?.as_float_slider()?.value(),
         turb_strength: params.get(Params::TurbStrength)?.as_float_slider()?.value(),
         turb_scale: params.get(Params::TurbScale)?.as_float_slider()?.value(),
         turb_speed: params.get(Params::TurbSpeed)?.as_float_slider()?.value(),
-        air_resistance: params.get(Params::AirResistance)?.as_float_slider()?.value(),
+        air_resistance: params
+            .get(Params::AirResistance)?
+            .as_float_slider()?
+            .value(),
         bounce_enabled: params.get(Params::BounceEnabled)?.as_checkbox()?.value(),
-        bounce_damping: params.get(Params::BounceDamping)?.as_float_slider()?.value(),
+        bounce_damping: params
+            .get(Params::BounceDamping)?
+            .as_float_slider()?
+            .value(),
         color_mode: params.get(Params::ColorMode)?.as_popup()?.value(),
         color_start: params.get(Params::ColorStart)?.as_color()?.value().into(),
         color_end: params.get(Params::ColorEnd)?.as_color()?.value().into(),
@@ -1583,31 +2651,57 @@ fn capture_preset(params: &ae::Parameters<Params>) -> Result<PresetSnapshot, ae:
         opacity_mid_b: params.get(Params::OpacityMidB)?.as_float_slider()?.value(),
         opacity_end: params.get(Params::OpacityEnd)?.as_float_slider()?.value(),
         size_curve_preset: params.get(Params::SizeCurvePreset)?.as_popup()?.value(),
-        size_life_start: params.get(Params::SizeLifeStart)?.as_float_slider()?.value(),
+        size_life_start: params
+            .get(Params::SizeLifeStart)?
+            .as_float_slider()?
+            .value(),
         size_life_mid_a: params.get(Params::SizeLifeMidA)?.as_float_slider()?.value(),
         size_life_mid_b: params.get(Params::SizeLifeMidB)?.as_float_slider()?.value(),
         size_life_end: params.get(Params::SizeLifeEnd)?.as_float_slider()?.value(),
         shape: params.get(Params::Shape)?.as_popup()?.value(),
+        sprite_time_sampling: params.get(Params::SpriteTimeSampling)?.as_popup()?.value(),
+        sprite_frame_count: params.get(Params::SpriteFrameCount)?.as_slider()?.value(),
         image_color_mode: params.get(Params::ImageColorMode)?.as_popup()?.value(),
         image_fit_mode: params.get(Params::ImageFitMode)?.as_popup()?.value(),
         use_source_alpha: params.get(Params::UseSourceAlpha)?.as_checkbox()?.value(),
-        source_premultiplied: params.get(Params::SourcePremultiplied)?.as_checkbox()?.value(),
-        image_alpha_clip: params.get(Params::ImageAlphaClip)?.as_float_slider()?.value(),
+        source_premultiplied: params
+            .get(Params::SourcePremultiplied)?
+            .as_checkbox()?
+            .value(),
+        image_alpha_clip: params
+            .get(Params::ImageAlphaClip)?
+            .as_float_slider()?
+            .value(),
         blend_mode: params.get(Params::BlendModeParam)?.as_popup()?.value(),
         motion_blur: params.get(Params::MotionBlur)?.as_float_slider()?.value(),
         edge_softness: params.get(Params::EdgeSoftness)?.as_float_slider()?.value(),
         dof_enabled: params.get(Params::DOFEnabled)?.as_checkbox()?.value(),
         dof_focal_dist: params.get(Params::DOFFocalDist)?.as_float_slider()?.value(),
         dof_aperture: params.get(Params::DOFAperture)?.as_float_slider()?.value(),
-        size_multiplier: params.get(Params::SizeMultiplier)?.as_float_slider()?.value(),
+        size_multiplier: params
+            .get(Params::SizeMultiplier)?
+            .as_float_slider()?
+            .value(),
         composite_on_orig: params.get(Params::CompositeOnOrig)?.as_checkbox()?.value(),
+        apply_mode: params.get(Params::ApplyMode)?.as_popup()?.value(),
+        rotation_variation: params.get(Params::RotationVar)?.as_float_slider()?.value(),
+        opacity_variation: params.get(Params::OpacityVar)?.as_float_slider()?.value(),
         child_enabled: params.get(Params::ChildEnabled)?.as_checkbox()?.value(),
         child_count: params.get(Params::ChildCount)?.as_slider()?.value(),
-        child_inherit_vel: params.get(Params::ChildInheritVel)?.as_float_slider()?.value(),
-        child_lifespan: params.get(Params::ChildLifespan)?.as_float_slider()?.value(),
+        child_inherit_vel: params
+            .get(Params::ChildInheritVel)?
+            .as_float_slider()?
+            .value(),
+        child_lifespan: params
+            .get(Params::ChildLifespan)?
+            .as_float_slider()?
+            .value(),
         child_speed: params.get(Params::ChildSpeed)?.as_float_slider()?.value(),
         child_spread: params.get(Params::ChildSpread)?.as_float_slider()?.value(),
-        child_size_scale: params.get(Params::ChildSizeScale)?.as_float_slider()?.value(),
+        child_size_scale: params
+            .get(Params::ChildSizeScale)?
+            .as_float_slider()?
+            .value(),
         seed: params.get(Params::Seed)?.as_slider()?.value(),
         // ---- Plexus ----
         plugin_mode: params.get(Params::PluginMode)?.as_popup()?.value(),
@@ -1616,23 +2710,41 @@ fn capture_preset(params: &ae::Parameters<Params>) -> Result<PresetSnapshot, ae:
         point_a_grid_res_x: params.get(Params::PointAGridResX)?.as_slider()?.value(),
         point_a_grid_res_y: params.get(Params::PointAGridResY)?.as_slider()?.value(),
         point_a_grid_res_z: params.get(Params::PointAGridResZ)?.as_slider()?.value(),
-        point_a_grid_spacing: params.get(Params::PointAGridSpacing)?.as_float_slider()?.value(),
+        point_a_grid_spacing: params
+            .get(Params::PointAGridSpacing)?
+            .as_float_slider()?
+            .value(),
         point_a_max_points: params.get(Params::PointAMaxPoints)?.as_slider()?.value(),
         point_b_enabled: params.get(Params::PointBEnabled)?.as_checkbox()?.value(),
         point_b_source_type: params.get(Params::PointBSourceType)?.as_popup()?.value(),
         point_b_grid_res_x: params.get(Params::PointBGridResX)?.as_slider()?.value(),
         point_b_grid_res_y: params.get(Params::PointBGridResY)?.as_slider()?.value(),
-        point_b_grid_spacing: params.get(Params::PointBGridSpacing)?.as_float_slider()?.value(),
+        point_b_grid_spacing: params
+            .get(Params::PointBGridSpacing)?
+            .as_float_slider()?
+            .value(),
         noise_enabled: params.get(Params::NoiseEnabled)?.as_checkbox()?.value(),
-        noise_amplitude: params.get(Params::NoiseAmplitude)?.as_float_slider()?.value(),
-        noise_frequency: params.get(Params::NoiseFrequency)?.as_float_slider()?.value(),
+        noise_amplitude: params
+            .get(Params::NoiseAmplitude)?
+            .as_float_slider()?
+            .value(),
+        noise_frequency: params
+            .get(Params::NoiseFrequency)?
+            .as_float_slider()?
+            .value(),
         noise_speed: params.get(Params::NoiseSpeed)?.as_float_slider()?.value(),
         noise_octaves: params.get(Params::NoiseOctaves)?.as_slider()?.value(),
         noise_axis_scale: params.get(Params::NoiseAxisScale)?.as_popup()?.value(),
         lines_enabled: params.get(Params::LinesEnabled)?.as_checkbox()?.value(),
-        lines_max_distance: params.get(Params::LinesMaxDistance)?.as_float_slider()?.value(),
+        lines_max_distance: params
+            .get(Params::LinesMaxDistance)?
+            .as_float_slider()?
+            .value(),
         lines_width: params.get(Params::LinesWidth)?.as_float_slider()?.value(),
-        lines_opacity_falloff: params.get(Params::LinesOpacityFalloff)?.as_float_slider()?.value(),
+        lines_opacity_falloff: params
+            .get(Params::LinesOpacityFalloff)?
+            .as_float_slider()?
+            .value(),
         lines_color: params.get(Params::LinesColor)?.as_color()?.value().into(),
         mesh_enabled: params.get(Params::MeshEnabled)?.as_checkbox()?.value(),
         mesh_max_edge: params.get(Params::MeshMaxEdge)?.as_float_slider()?.value(),
@@ -1640,50 +2752,84 @@ fn capture_preset(params: &ae::Parameters<Params>) -> Result<PresetSnapshot, ae:
         mesh_color: params.get(Params::MeshColor)?.as_color()?.value().into(),
         beams_enabled: params.get(Params::BeamsEnabled)?.as_checkbox()?.value(),
         beams_source_group: params.get(Params::BeamsSourceGroup)?.as_popup()?.value(),
-        beams_max_distance: params.get(Params::BeamsMaxDistance)?.as_float_slider()?.value(),
+        beams_max_distance: params
+            .get(Params::BeamsMaxDistance)?
+            .as_float_slider()?
+            .value(),
         beams_width: params.get(Params::BeamsWidth)?.as_float_slider()?.value(),
         beams_color: params.get(Params::BeamsColor)?.as_color()?.value().into(),
-        plexus_point_size: params.get(Params::PlexusPointSize)?.as_float_slider()?.value(),
-        plexus_point_color: params.get(Params::PlexusPointColor)?.as_color()?.value().into(),
+        plexus_point_size: params
+            .get(Params::PlexusPointSize)?
+            .as_float_slider()?
+            .value(),
+        plexus_point_color: params
+            .get(Params::PlexusPointColor)?
+            .as_color()?
+            .value()
+            .into(),
     })
 }
 
-fn set_popup_param(params: &mut ae::Parameters<Params>, id: Params, value: i32) -> Result<(), ae::Error> {
+fn set_popup_param(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    value: i32,
+) -> Result<(), ae::Error> {
     let mut param = params.get_mut(id)?;
     param.as_popup_mut()?.set_value(value);
     param.set_change_flag(ae::ChangeFlag::CHANGED_VALUE, true);
     Ok(())
 }
 
-fn set_float_param(params: &mut ae::Parameters<Params>, id: Params, value: f64) -> Result<(), ae::Error> {
+fn set_float_param(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    value: f64,
+) -> Result<(), ae::Error> {
     let mut param = params.get_mut(id)?;
     param.as_float_slider_mut()?.set_value(value);
     param.set_change_flag(ae::ChangeFlag::CHANGED_VALUE, true);
     Ok(())
 }
 
-fn set_slider_param(params: &mut ae::Parameters<Params>, id: Params, value: i32) -> Result<(), ae::Error> {
+fn set_slider_param(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    value: i32,
+) -> Result<(), ae::Error> {
     let mut param = params.get_mut(id)?;
     param.as_slider_mut()?.set_value(value);
     param.set_change_flag(ae::ChangeFlag::CHANGED_VALUE, true);
     Ok(())
 }
 
-fn set_checkbox_param(params: &mut ae::Parameters<Params>, id: Params, value: bool) -> Result<(), ae::Error> {
+fn set_checkbox_param(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    value: bool,
+) -> Result<(), ae::Error> {
     let mut param = params.get_mut(id)?;
     param.as_checkbox_mut()?.set_value(value);
     param.set_change_flag(ae::ChangeFlag::CHANGED_VALUE, true);
     Ok(())
 }
 
-fn set_color_param(params: &mut ae::Parameters<Params>, id: Params, value: PresetColor) -> Result<(), ae::Error> {
+fn set_color_param(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    value: PresetColor,
+) -> Result<(), ae::Error> {
     let mut param = params.get_mut(id)?;
     param.as_color_mut()?.set_value(value.into());
     param.set_change_flag(ae::ChangeFlag::CHANGED_VALUE, true);
     Ok(())
 }
 
-fn set_point_param(params: &mut ae::Parameters<Params>, id: Params, value: (f32, f32)) -> Result<(), ae::Error> {
+fn set_point_param(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    value: (f32, f32),
+) -> Result<(), ae::Error> {
     let mut param = params.get_mut(id)?;
     param.as_point_mut()?.set_value(value);
     param.set_change_flag(ae::ChangeFlag::CHANGED_VALUE, true);
@@ -1694,13 +2840,38 @@ fn apply_preset(params: &ae::Parameters<Params>, preset: &PresetSnapshot) -> Res
     let mut params_copy = params.cloned();
 
     set_popup_param(&mut params_copy, Params::EmitterType, preset.emitter_type)?;
-    set_point_param(&mut params_copy, Params::PositionPoint, preset.position_point)?;
+    set_popup_param(&mut params_copy, Params::EmitMode, preset.emit_mode)?;
+    set_point_param(
+        &mut params_copy,
+        Params::PositionPoint,
+        preset.position_point,
+    )?;
     set_float_param(&mut params_copy, Params::PositionZ, preset.position_z)?;
-    set_popup_param(&mut params_copy, Params::ImageProxyScale, preset.image_proxy_scale)?;
-    set_checkbox_param(&mut params_copy, Params::EmitterSizeLinked, preset.emitter_size_linked)?;
-    set_float_param(&mut params_copy, Params::EmitterSizeX, preset.emitter_size_x)?;
-    set_float_param(&mut params_copy, Params::EmitterSizeY, preset.emitter_size_y)?;
-    set_float_param(&mut params_copy, Params::EmitterSizeZ, preset.emitter_size_z)?;
+    set_popup_param(
+        &mut params_copy,
+        Params::ImageProxyScale,
+        preset.image_proxy_scale,
+    )?;
+    set_checkbox_param(
+        &mut params_copy,
+        Params::EmitterSizeLinked,
+        preset.emitter_size_linked,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::EmitterSizeX,
+        preset.emitter_size_x,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::EmitterSizeY,
+        preset.emitter_size_y,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::EmitterSizeZ,
+        preset.emitter_size_z,
+    )?;
     set_float_param(&mut params_copy, Params::BirthRate, preset.birth_rate)?;
     set_float_param(&mut params_copy, Params::Lifespan, preset.lifespan)?;
     set_float_param(&mut params_copy, Params::LifespanVar, preset.lifespan_var)?;
@@ -1713,95 +2884,303 @@ fn apply_preset(params: &ae::Parameters<Params>, preset: &PresetSnapshot) -> Res
     set_float_param(&mut params_copy, Params::InitialSize, preset.initial_size)?;
     set_float_param(&mut params_copy, Params::SizeVar, preset.size_var)?;
     set_float_param(&mut params_copy, Params::Rotation, preset.rotation)?;
-    set_float_param(&mut params_copy, Params::RotationSpeed, preset.rotation_speed)?;
-    set_float_param(&mut params_copy, Params::GravityStrength, preset.gravity_strength)?;
+    set_float_param(
+        &mut params_copy,
+        Params::RotationSpeed,
+        preset.rotation_speed,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::GravityStrength,
+        preset.gravity_strength,
+    )?;
     set_float_param(&mut params_copy, Params::WindX, preset.wind_x)?;
     set_float_param(&mut params_copy, Params::WindY, preset.wind_y)?;
     set_float_param(&mut params_copy, Params::TurbStrength, preset.turb_strength)?;
     set_float_param(&mut params_copy, Params::TurbScale, preset.turb_scale)?;
     set_float_param(&mut params_copy, Params::TurbSpeed, preset.turb_speed)?;
-    set_float_param(&mut params_copy, Params::AirResistance, preset.air_resistance)?;
-    set_checkbox_param(&mut params_copy, Params::BounceEnabled, preset.bounce_enabled)?;
-    set_float_param(&mut params_copy, Params::BounceDamping, preset.bounce_damping)?;
+    set_float_param(
+        &mut params_copy,
+        Params::AirResistance,
+        preset.air_resistance,
+    )?;
+    set_checkbox_param(
+        &mut params_copy,
+        Params::BounceEnabled,
+        preset.bounce_enabled,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::BounceDamping,
+        preset.bounce_damping,
+    )?;
     set_popup_param(&mut params_copy, Params::ColorMode, preset.color_mode)?;
     set_color_param(&mut params_copy, Params::ColorStart, preset.color_start)?;
     set_color_param(&mut params_copy, Params::ColorEnd, preset.color_end)?;
-    set_popup_param(&mut params_copy, Params::OpacityCurvePreset, preset.opacity_curve_preset)?;
+    set_popup_param(
+        &mut params_copy,
+        Params::OpacityCurvePreset,
+        preset.opacity_curve_preset,
+    )?;
     set_float_param(&mut params_copy, Params::OpacityStart, preset.opacity_start)?;
     set_float_param(&mut params_copy, Params::OpacityMidA, preset.opacity_mid_a)?;
     set_float_param(&mut params_copy, Params::OpacityMidB, preset.opacity_mid_b)?;
     set_float_param(&mut params_copy, Params::OpacityEnd, preset.opacity_end)?;
-    set_popup_param(&mut params_copy, Params::SizeCurvePreset, preset.size_curve_preset)?;
-    set_float_param(&mut params_copy, Params::SizeLifeStart, preset.size_life_start)?;
-    set_float_param(&mut params_copy, Params::SizeLifeMidA, preset.size_life_mid_a)?;
-    set_float_param(&mut params_copy, Params::SizeLifeMidB, preset.size_life_mid_b)?;
+    set_popup_param(
+        &mut params_copy,
+        Params::SizeCurvePreset,
+        preset.size_curve_preset,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::SizeLifeStart,
+        preset.size_life_start,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::SizeLifeMidA,
+        preset.size_life_mid_a,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::SizeLifeMidB,
+        preset.size_life_mid_b,
+    )?;
     set_float_param(&mut params_copy, Params::SizeLifeEnd, preset.size_life_end)?;
     set_popup_param(&mut params_copy, Params::Shape, preset.shape)?;
-    set_popup_param(&mut params_copy, Params::ImageColorMode, preset.image_color_mode)?;
-    set_popup_param(&mut params_copy, Params::ImageFitMode, preset.image_fit_mode)?;
-    set_checkbox_param(&mut params_copy, Params::UseSourceAlpha, preset.use_source_alpha)?;
-    set_checkbox_param(&mut params_copy, Params::SourcePremultiplied, preset.source_premultiplied)?;
-    set_float_param(&mut params_copy, Params::ImageAlphaClip, preset.image_alpha_clip)?;
+    set_popup_param(
+        &mut params_copy,
+        Params::SpriteTimeSampling,
+        preset.sprite_time_sampling,
+    )?;
+    set_slider_param(
+        &mut params_copy,
+        Params::SpriteFrameCount,
+        preset.sprite_frame_count,
+    )?;
+    set_popup_param(
+        &mut params_copy,
+        Params::ImageColorMode,
+        preset.image_color_mode,
+    )?;
+    set_popup_param(
+        &mut params_copy,
+        Params::ImageFitMode,
+        preset.image_fit_mode,
+    )?;
+    set_checkbox_param(
+        &mut params_copy,
+        Params::UseSourceAlpha,
+        preset.use_source_alpha,
+    )?;
+    set_checkbox_param(
+        &mut params_copy,
+        Params::SourcePremultiplied,
+        preset.source_premultiplied,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::ImageAlphaClip,
+        preset.image_alpha_clip,
+    )?;
     set_popup_param(&mut params_copy, Params::BlendModeParam, preset.blend_mode)?;
     set_float_param(&mut params_copy, Params::MotionBlur, preset.motion_blur)?;
     set_float_param(&mut params_copy, Params::EdgeSoftness, preset.edge_softness)?;
     set_checkbox_param(&mut params_copy, Params::DOFEnabled, preset.dof_enabled)?;
-    set_float_param(&mut params_copy, Params::DOFFocalDist, preset.dof_focal_dist)?;
+    set_float_param(
+        &mut params_copy,
+        Params::DOFFocalDist,
+        preset.dof_focal_dist,
+    )?;
     set_float_param(&mut params_copy, Params::DOFAperture, preset.dof_aperture)?;
-    set_float_param(&mut params_copy, Params::SizeMultiplier, preset.size_multiplier)?;
-    set_checkbox_param(&mut params_copy, Params::CompositeOnOrig, preset.composite_on_orig)?;
+    set_float_param(
+        &mut params_copy,
+        Params::SizeMultiplier,
+        preset.size_multiplier,
+    )?;
+    set_checkbox_param(
+        &mut params_copy,
+        Params::CompositeOnOrig,
+        preset.composite_on_orig,
+    )?;
+    set_popup_param(&mut params_copy, Params::ApplyMode, preset.apply_mode)?;
+    set_float_param(
+        &mut params_copy,
+        Params::RotationVar,
+        preset.rotation_variation,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::OpacityVar,
+        preset.opacity_variation,
+    )?;
     set_checkbox_param(&mut params_copy, Params::ChildEnabled, preset.child_enabled)?;
     set_slider_param(&mut params_copy, Params::ChildCount, preset.child_count)?;
-    set_float_param(&mut params_copy, Params::ChildInheritVel, preset.child_inherit_vel)?;
-    set_float_param(&mut params_copy, Params::ChildLifespan, preset.child_lifespan)?;
+    set_float_param(
+        &mut params_copy,
+        Params::ChildInheritVel,
+        preset.child_inherit_vel,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::ChildLifespan,
+        preset.child_lifespan,
+    )?;
     set_float_param(&mut params_copy, Params::ChildSpeed, preset.child_speed)?;
     set_float_param(&mut params_copy, Params::ChildSpread, preset.child_spread)?;
-    set_float_param(&mut params_copy, Params::ChildSizeScale, preset.child_size_scale)?;
+    set_float_param(
+        &mut params_copy,
+        Params::ChildSizeScale,
+        preset.child_size_scale,
+    )?;
     set_slider_param(&mut params_copy, Params::Seed, preset.seed)?;
-    set_float_param(&mut params_copy, Params::PathSampleDensity, preset.path_sample_density)?;
+    set_float_param(
+        &mut params_copy,
+        Params::PathSampleDensity,
+        preset.path_sample_density,
+    )?;
+    set_slider_param(&mut params_copy, Params::GridResX, preset.grid_res_x)?;
+    set_slider_param(&mut params_copy, Params::GridResY, preset.grid_res_y)?;
+    set_slider_param(&mut params_copy, Params::GridResZ, preset.grid_res_z)?;
 
     // ---- Plexus ----
     set_popup_param(&mut params_copy, Params::PluginMode, preset.plugin_mode)?;
-    set_checkbox_param(&mut params_copy, Params::PointAEnabled, preset.point_a_enabled)?;
-    set_popup_param(&mut params_copy, Params::PointASourceType, preset.point_a_source_type)?;
-    set_slider_param(&mut params_copy, Params::PointAGridResX, preset.point_a_grid_res_x)?;
-    set_slider_param(&mut params_copy, Params::PointAGridResY, preset.point_a_grid_res_y)?;
-    set_slider_param(&mut params_copy, Params::PointAGridResZ, preset.point_a_grid_res_z)?;
-    set_float_param(&mut params_copy, Params::PointAGridSpacing, preset.point_a_grid_spacing)?;
-    set_slider_param(&mut params_copy, Params::PointAMaxPoints, preset.point_a_max_points)?;
-    set_checkbox_param(&mut params_copy, Params::PointBEnabled, preset.point_b_enabled)?;
-    set_popup_param(&mut params_copy, Params::PointBSourceType, preset.point_b_source_type)?;
-    set_slider_param(&mut params_copy, Params::PointBGridResX, preset.point_b_grid_res_x)?;
-    set_slider_param(&mut params_copy, Params::PointBGridResY, preset.point_b_grid_res_y)?;
-    set_float_param(&mut params_copy, Params::PointBGridSpacing, preset.point_b_grid_spacing)?;
+    set_checkbox_param(
+        &mut params_copy,
+        Params::PointAEnabled,
+        preset.point_a_enabled,
+    )?;
+    set_popup_param(
+        &mut params_copy,
+        Params::PointASourceType,
+        preset.point_a_source_type,
+    )?;
+    set_slider_param(
+        &mut params_copy,
+        Params::PointAGridResX,
+        preset.point_a_grid_res_x,
+    )?;
+    set_slider_param(
+        &mut params_copy,
+        Params::PointAGridResY,
+        preset.point_a_grid_res_y,
+    )?;
+    set_slider_param(
+        &mut params_copy,
+        Params::PointAGridResZ,
+        preset.point_a_grid_res_z,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::PointAGridSpacing,
+        preset.point_a_grid_spacing,
+    )?;
+    set_slider_param(
+        &mut params_copy,
+        Params::PointAMaxPoints,
+        preset.point_a_max_points,
+    )?;
+    set_checkbox_param(
+        &mut params_copy,
+        Params::PointBEnabled,
+        preset.point_b_enabled,
+    )?;
+    set_popup_param(
+        &mut params_copy,
+        Params::PointBSourceType,
+        preset.point_b_source_type,
+    )?;
+    set_slider_param(
+        &mut params_copy,
+        Params::PointBGridResX,
+        preset.point_b_grid_res_x,
+    )?;
+    set_slider_param(
+        &mut params_copy,
+        Params::PointBGridResY,
+        preset.point_b_grid_res_y,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::PointBGridSpacing,
+        preset.point_b_grid_spacing,
+    )?;
     set_checkbox_param(&mut params_copy, Params::NoiseEnabled, preset.noise_enabled)?;
-    set_float_param(&mut params_copy, Params::NoiseAmplitude, preset.noise_amplitude)?;
-    set_float_param(&mut params_copy, Params::NoiseFrequency, preset.noise_frequency)?;
+    set_float_param(
+        &mut params_copy,
+        Params::NoiseAmplitude,
+        preset.noise_amplitude,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::NoiseFrequency,
+        preset.noise_frequency,
+    )?;
     set_float_param(&mut params_copy, Params::NoiseSpeed, preset.noise_speed)?;
     set_slider_param(&mut params_copy, Params::NoiseOctaves, preset.noise_octaves)?;
-    set_popup_param(&mut params_copy, Params::NoiseAxisScale, preset.noise_axis_scale)?;
+    set_popup_param(
+        &mut params_copy,
+        Params::NoiseAxisScale,
+        preset.noise_axis_scale,
+    )?;
     set_checkbox_param(&mut params_copy, Params::LinesEnabled, preset.lines_enabled)?;
-    set_float_param(&mut params_copy, Params::LinesMaxDistance, preset.lines_max_distance)?;
+    set_float_param(
+        &mut params_copy,
+        Params::LinesMaxDistance,
+        preset.lines_max_distance,
+    )?;
     set_float_param(&mut params_copy, Params::LinesWidth, preset.lines_width)?;
-    set_float_param(&mut params_copy, Params::LinesOpacityFalloff, preset.lines_opacity_falloff)?;
+    set_float_param(
+        &mut params_copy,
+        Params::LinesOpacityFalloff,
+        preset.lines_opacity_falloff,
+    )?;
     set_color_param(&mut params_copy, Params::LinesColor, preset.lines_color)?;
     set_checkbox_param(&mut params_copy, Params::MeshEnabled, preset.mesh_enabled)?;
     set_float_param(&mut params_copy, Params::MeshMaxEdge, preset.mesh_max_edge)?;
     set_float_param(&mut params_copy, Params::MeshOpacity, preset.mesh_opacity)?;
     set_color_param(&mut params_copy, Params::MeshColor, preset.mesh_color)?;
     set_checkbox_param(&mut params_copy, Params::BeamsEnabled, preset.beams_enabled)?;
-    set_popup_param(&mut params_copy, Params::BeamsSourceGroup, preset.beams_source_group)?;
-    set_float_param(&mut params_copy, Params::BeamsMaxDistance, preset.beams_max_distance)?;
+    set_popup_param(
+        &mut params_copy,
+        Params::BeamsSourceGroup,
+        preset.beams_source_group,
+    )?;
+    set_float_param(
+        &mut params_copy,
+        Params::BeamsMaxDistance,
+        preset.beams_max_distance,
+    )?;
     set_float_param(&mut params_copy, Params::BeamsWidth, preset.beams_width)?;
     set_color_param(&mut params_copy, Params::BeamsColor, preset.beams_color)?;
-    set_float_param(&mut params_copy, Params::PlexusPointSize, preset.plexus_point_size)?;
-    set_color_param(&mut params_copy, Params::PlexusPointColor, preset.plexus_point_color)?;
+    set_float_param(
+        &mut params_copy,
+        Params::PlexusPointSize,
+        preset.plexus_point_size,
+    )?;
+    set_color_param(
+        &mut params_copy,
+        Params::PlexusPointColor,
+        preset.plexus_point_color,
+    )?;
 
     update_shape_dependent_ui(&params_copy)?;
     Ok(())
 }
 
-fn extract_configs(params: &ae::Parameters<Params>) -> Result<(EmitterConfig, PhysicsConfig, AppearanceConfig, ChildConfig, RenderConfig, u64), ae::Error> {
+fn extract_configs(
+    params: &ae::Parameters<Params>,
+) -> Result<
+    (
+        EmitterConfig,
+        PhysicsConfig,
+        AppearanceConfig,
+        ChildConfig,
+        RenderConfig,
+        u64,
+    ),
+    ae::Error,
+> {
     let emitter_type_val = params.get(Params::EmitterType)?.as_popup()?.value();
     let emitter_type = match emitter_type_val {
         1 => EmitterType::Point,
@@ -1815,7 +3194,10 @@ fn extract_configs(params: &ae::Parameters<Params>) -> Result<(EmitterConfig, Ph
 
     let (pos_x, pos_y) = params.get(Params::PositionPoint)?.as_point()?.value();
     let pos_z = params.get(Params::PositionZ)?.as_float_slider()?.value() as f32;
-    let size_linked = params.get(Params::EmitterSizeLinked)?.as_checkbox()?.value();
+    let size_linked = params
+        .get(Params::EmitterSizeLinked)?
+        .as_checkbox()?
+        .value();
     let emitter_size_x = params.get(Params::EmitterSizeX)?.as_float_slider()?.value() as f32;
     let emitter_size_y = if size_linked {
         emitter_size_x
@@ -1832,6 +3214,13 @@ fn extract_configs(params: &ae::Parameters<Params>) -> Result<(EmitterConfig, Ph
     let dir_y = params.get(Params::DirectionY)?.as_float_slider()?.value() as f32;
     let dir_z = params.get(Params::DirectionZ)?.as_float_slider()?.value() as f32;
 
+    let sprite_time_sampling_val = params.get(Params::SpriteTimeSampling)?.as_popup()?.value();
+    let sprite_frame_count = params
+        .get(Params::SpriteFrameCount)?
+        .as_slider()?
+        .value()
+        .max(1) as u16;
+
     let emitter = EmitterConfig {
         emitter_type,
         position: glam::Vec3::new(pos_x, pos_y, pos_z),
@@ -1847,23 +3236,47 @@ fn extract_configs(params: &ae::Parameters<Params>) -> Result<(EmitterConfig, Ph
         initial_size: params.get(Params::InitialSize)?.as_float_slider()?.value() as f32,
         size_variation: params.get(Params::SizeVar)?.as_float_slider()?.value() as f32,
         initial_rotation: params.get(Params::Rotation)?.as_float_slider()?.value() as f32,
-        rotation_speed: params.get(Params::RotationSpeed)?.as_float_slider()?.value() as f32,
+        rotation_variation: params.get(Params::RotationVar)?.as_float_slider()?.value() as f32,
+        rotation_speed: params
+            .get(Params::RotationSpeed)?
+            .as_float_slider()?
+            .value() as f32,
+        sprite_frame_count,
+        sprite_time_sampling: (sprite_time_sampling_val - 1).max(0) as u8,
+        opacity_variation: params.get(Params::OpacityVar)?.as_float_slider()?.value() as f32,
+        grid_res_x: params.get(Params::GridResX)?.as_slider()?.value().max(1) as u32,
+        grid_res_y: params.get(Params::GridResY)?.as_slider()?.value().max(1) as u32,
+        grid_res_z: params.get(Params::GridResZ)?.as_slider()?.value().max(1) as u32,
+        emit_all_at_start: params.get(Params::EmitMode)?.as_popup()?.value() == 2,
     };
 
     let physics = PhysicsConfig {
-        gravity: glam::Vec3::new(0.0, params.get(Params::GravityStrength)?.as_float_slider()?.value() as f32, 0.0),
+        gravity: glam::Vec3::new(
+            0.0,
+            params
+                .get(Params::GravityStrength)?
+                .as_float_slider()?
+                .value() as f32,
+            0.0,
+        ),
         wind: glam::Vec3::new(
             params.get(Params::WindX)?.as_float_slider()?.value() as f32,
             params.get(Params::WindY)?.as_float_slider()?.value() as f32,
             0.0,
         ),
-        air_resistance: params.get(Params::AirResistance)?.as_float_slider()?.value() as f32,
+        air_resistance: params
+            .get(Params::AirResistance)?
+            .as_float_slider()?
+            .value() as f32,
         turbulence_strength: params.get(Params::TurbStrength)?.as_float_slider()?.value() as f32,
         turbulence_scale: params.get(Params::TurbScale)?.as_float_slider()?.value() as f32,
         turbulence_speed: params.get(Params::TurbSpeed)?.as_float_slider()?.value() as f32,
         bounce_floor_y: 10000.0, // effectively off unless positioned
         bounce_enabled: params.get(Params::BounceEnabled)?.as_checkbox()?.value(),
-        bounce_damping: params.get(Params::BounceDamping)?.as_float_slider()?.value() as f32,
+        bounce_damping: params
+            .get(Params::BounceDamping)?
+            .as_float_slider()?
+            .value() as f32,
     };
 
     let color_start_pix = params.get(Params::ColorStart)?.as_color()?.value();
@@ -1877,7 +3290,10 @@ fn extract_configs(params: &ae::Parameters<Params>) -> Result<(EmitterConfig, Ph
     let opacity_mid_a = params.get(Params::OpacityMidA)?.as_float_slider()?.value() as f32 / 100.0;
     let opacity_mid_b = params.get(Params::OpacityMidB)?.as_float_slider()?.value() as f32 / 100.0;
     let opacity_end = params.get(Params::OpacityEnd)?.as_float_slider()?.value() as f32 / 100.0;
-    let size_life_start = params.get(Params::SizeLifeStart)?.as_float_slider()?.value() as f32;
+    let size_life_start = params
+        .get(Params::SizeLifeStart)?
+        .as_float_slider()?
+        .value() as f32;
     let size_life_mid_a = params.get(Params::SizeLifeMidA)?.as_float_slider()?.value() as f32;
     let size_life_mid_b = params.get(Params::SizeLifeMidB)?.as_float_slider()?.value() as f32;
     let size_life_end = params.get(Params::SizeLifeEnd)?.as_float_slider()?.value() as f32;
@@ -1895,18 +3311,36 @@ fn extract_configs(params: &ae::Parameters<Params>) -> Result<(EmitterConfig, Ph
             color_end_pix.blue as f32 / 255.0,
             opacity_end,
         ],
-        size_over_life: [size_life_start, size_life_mid_a, size_life_mid_b, size_life_end],
+        size_over_life: [
+            size_life_start,
+            size_life_mid_a,
+            size_life_mid_b,
+            size_life_end,
+        ],
         opacity_over_life: [opacity_start, opacity_mid_a, opacity_mid_b, opacity_end],
     };
 
     let child = ChildConfig {
         enabled: params.get(Params::ChildEnabled)?.as_checkbox()?.value(),
         count: params.get(Params::ChildCount)?.as_slider()?.value() as u32,
-        inherit_velocity: params.get(Params::ChildInheritVel)?.as_float_slider()?.value() as f32,
-        lifespan: params.get(Params::ChildLifespan)?.as_float_slider()?.value() as f32,
+        inherit_velocity: params
+            .get(Params::ChildInheritVel)?
+            .as_float_slider()?
+            .value() as f32,
+        lifespan: params
+            .get(Params::ChildLifespan)?
+            .as_float_slider()?
+            .value() as f32,
         initial_speed: params.get(Params::ChildSpeed)?.as_float_slider()?.value() as f32,
-        spread: params.get(Params::ChildSpread)?.as_float_slider()?.value().to_radians() as f32,
-        size_scale: params.get(Params::ChildSizeScale)?.as_float_slider()?.value() as f32,
+        spread: params
+            .get(Params::ChildSpread)?
+            .as_float_slider()?
+            .value()
+            .to_radians() as f32,
+        size_scale: params
+            .get(Params::ChildSizeScale)?
+            .as_float_slider()?
+            .value() as f32,
     };
 
     let shape_val = params.get(Params::Shape)?.as_popup()?.value();
@@ -1929,7 +3363,7 @@ fn extract_configs(params: &ae::Parameters<Params>) -> Result<(EmitterConfig, Ph
     };
 
     let render = RenderConfig {
-        width: 0,  // filled at render time
+        width: 0, // filled at render time
         height: 0,
         row_stride: 0, // filled at render time
         origin_x: 0.0,
@@ -1943,8 +3377,24 @@ fn extract_configs(params: &ae::Parameters<Params>) -> Result<(EmitterConfig, Ph
         dof_focal_distance: params.get(Params::DOFFocalDist)?.as_float_slider()?.value() as f32,
         dof_aperture: params.get(Params::DOFAperture)?.as_float_slider()?.value() as f32,
         composite_on_original: params.get(Params::CompositeOnOrig)?.as_checkbox()?.value(),
-        size_multiplier: params.get(Params::SizeMultiplier)?.as_float_slider()?.value() as f32,
-        sprite_image: None,
+        apply_mode: match params.get(Params::ApplyMode)?.as_popup()?.value() {
+            2 => ApplyMode::Normal,
+            3 => ApplyMode::Add,
+            4 => ApplyMode::Screen,
+            _ => ApplyMode::OnTransparent,
+        },
+        size_multiplier: params
+            .get(Params::SizeMultiplier)?
+            .as_float_slider()?
+            .value() as f32,
+        sprite_images: Vec::new(),
+        time_sampling: match sprite_time_sampling_val {
+            2 => TimeSamplingMode::BirthTime,
+            3 => TimeSamplingMode::RandomStill,
+            4 => TimeSamplingMode::RandomPlay,
+            5 => TimeSamplingMode::Cycle,
+            _ => TimeSamplingMode::CurrentTime,
+        },
         image_color_mode: match params.get(Params::ImageColorMode)?.as_popup()?.value() {
             2 => ImageColorMode::Source,
             _ => ImageColorMode::Tint,
@@ -1955,8 +3405,14 @@ fn extract_configs(params: &ae::Parameters<Params>) -> Result<(EmitterConfig, Ph
         },
         image_sampling: ImageSamplingConfig {
             use_source_alpha: params.get(Params::UseSourceAlpha)?.as_checkbox()?.value(),
-            source_premultiplied: params.get(Params::SourcePremultiplied)?.as_checkbox()?.value(),
-            alpha_clip: params.get(Params::ImageAlphaClip)?.as_float_slider()?.value() as f32,
+            source_premultiplied: params
+                .get(Params::SourcePremultiplied)?
+                .as_checkbox()?
+                .value(),
+            alpha_clip: params
+                .get(Params::ImageAlphaClip)?
+                .as_float_slider()?
+                .value() as f32,
         },
         camera_projection: None,
     };
@@ -1985,7 +3441,10 @@ fn extract_plexus_configs(params: &ae::Parameters<Params>) -> Result<PlexusConfi
         grid_res_x: params.get(Params::PointAGridResX)?.as_slider()?.value() as u32,
         grid_res_y: params.get(Params::PointAGridResY)?.as_slider()?.value() as u32,
         grid_res_z: params.get(Params::PointAGridResZ)?.as_slider()?.value() as u32,
-        grid_spacing: params.get(Params::PointAGridSpacing)?.as_float_slider()?.value() as f32,
+        grid_spacing: params
+            .get(Params::PointAGridSpacing)?
+            .as_float_slider()?
+            .value() as f32,
         max_points: params.get(Params::PointAMaxPoints)?.as_slider()?.value() as usize,
         source_points: None,
     };
@@ -2003,7 +3462,10 @@ fn extract_plexus_configs(params: &ae::Parameters<Params>) -> Result<PlexusConfi
         grid_res_x: params.get(Params::PointBGridResX)?.as_slider()?.value() as u32,
         grid_res_y: params.get(Params::PointBGridResY)?.as_slider()?.value() as u32,
         grid_res_z: 1,
-        grid_spacing: params.get(Params::PointBGridSpacing)?.as_float_slider()?.value() as f32,
+        grid_spacing: params
+            .get(Params::PointBGridSpacing)?
+            .as_float_slider()?
+            .value() as f32,
         max_points: 5000,
         source_points: None,
     };
@@ -2013,7 +3475,10 @@ fn extract_plexus_configs(params: &ae::Parameters<Params>) -> Result<PlexusConfi
     Ok(PlexusConfig {
         point_a,
         point_b,
-        point_size: params.get(Params::PlexusPointSize)?.as_float_slider()?.value() as f32,
+        point_size: params
+            .get(Params::PlexusPointSize)?
+            .as_float_slider()?
+            .value() as f32,
         point_color: [
             point_color_pix.red as f32 / 255.0,
             point_color_pix.green as f32 / 255.0,
@@ -2028,13 +3493,21 @@ fn extract_plexus_configs(params: &ae::Parameters<Params>) -> Result<PlexusConfi
 fn current_time_sec(in_data: &ae::InData) -> f32 {
     let time = in_data.current_time() as f32;
     let scale = in_data.time_scale() as f32;
-    if scale > 0.0 { time / scale } else { 0.0 }
+    if scale > 0.0 {
+        time / scale
+    } else {
+        0.0
+    }
 }
 
 fn time_step_sec(in_data: &ae::InData) -> f32 {
     let step = in_data.time_step() as f32;
     let scale = in_data.time_scale() as f32;
-    if scale > 0.0 { step / scale } else { 1.0 / 30.0 }
+    if scale > 0.0 {
+        step / scale
+    } else {
+        1.0 / 30.0
+    }
 }
 
 fn checked_rgba_len(width: usize, height: usize) -> Result<usize, ae::Error> {
@@ -2052,28 +3525,45 @@ fn checked_rgba_len(width: usize, height: usize) -> Result<usize, ae::Error> {
     Ok(len)
 }
 
-
 fn estimate_render_margin(params: &ae::Parameters<Params>) -> Result<i32, ae::Error> {
     let lifespan = params.get(Params::Lifespan)?.as_float_slider()?.value() as f32;
     let lifespan_var = params.get(Params::LifespanVar)?.as_float_slider()?.value() as f32;
     let speed = params.get(Params::Speed)?.as_float_slider()?.value() as f32;
     let speed_var = params.get(Params::SpeedVar)?.as_float_slider()?.value() as f32;
-    let gravity = params.get(Params::GravityStrength)?.as_float_slider()?.value().abs() as f32;
+    let gravity = params
+        .get(Params::GravityStrength)?
+        .as_float_slider()?
+        .value()
+        .abs() as f32;
     let wind_x = params.get(Params::WindX)?.as_float_slider()?.value().abs() as f32;
     let wind_y = params.get(Params::WindY)?.as_float_slider()?.value().abs() as f32;
-    let turb = params.get(Params::TurbStrength)?.as_float_slider()?.value().abs() as f32;
+    let turb = params
+        .get(Params::TurbStrength)?
+        .as_float_slider()?
+        .value()
+        .abs() as f32;
     let size = params.get(Params::InitialSize)?.as_float_slider()?.value() as f32;
     let size_var = params.get(Params::SizeVar)?.as_float_slider()?.value() as f32;
-    let size_multiplier = params.get(Params::SizeMultiplier)?.as_float_slider()?.value() as f32;
+    let size_multiplier = params
+        .get(Params::SizeMultiplier)?
+        .as_float_slider()?
+        .value() as f32;
     let motion_blur = params.get(Params::MotionBlur)?.as_float_slider()?.value() as f32;
     let child_enabled = params.get(Params::ChildEnabled)?.as_checkbox()?.value();
     let child_lifespan = if child_enabled {
-        params.get(Params::ChildLifespan)?.as_float_slider()?.value() as f32
+        params
+            .get(Params::ChildLifespan)?
+            .as_float_slider()?
+            .value() as f32
     } else {
         0.0
     };
 
-    let air_res = params.get(Params::AirResistance)?.as_float_slider()?.value().abs() as f32;
+    let air_res = params
+        .get(Params::AirResistance)?
+        .as_float_slider()?
+        .value()
+        .abs() as f32;
 
     let max_life = (lifespan * (1.0 + lifespan_var.clamp(0.0, 1.0)))
         .max(child_lifespan)
@@ -2081,25 +3571,33 @@ fn estimate_render_margin(params: &ae::Parameters<Params>) -> Result<i32, ae::Er
     let peak_speed = speed.max(0.0) * (1.0 + speed_var.clamp(0.0, 1.0));
     let accel = gravity.max(wind_x.max(wind_y)) + turb;
     // Air resistance reduces effective travel distance
-    let drag_factor = if air_res > 0.01 { (1.0 / air_res).min(max_life) } else { max_life };
+    let drag_factor = if air_res > 0.01 {
+        (1.0 / air_res).min(max_life)
+    } else {
+        max_life
+    };
     let travel = peak_speed * drag_factor + 0.5 * accel * max_life * max_life;
     let radius = size.max(0.0)
         * (1.0 + size_var.clamp(0.0, 1.0))
         * size_multiplier.max(0.01)
         * (1.0 + motion_blur.clamp(0.0, 1.0) * 0.5);
 
-    Ok((travel + radius + 64.0)
-        .ceil()
-        .clamp(
-            MIN_SMART_PRE_RENDER_MARGIN as f32,
-            MAX_SMART_PRE_RENDER_MARGIN as f32,
-        ) as i32)
+    Ok((travel + radius + 64.0).ceil().clamp(
+        MIN_SMART_PRE_RENDER_MARGIN as f32,
+        MAX_SMART_PRE_RENDER_MARGIN as f32,
+    ) as i32)
 }
 
-fn estimated_emitter_bounds(params: &ae::Parameters<Params>, margin: i32) -> Result<ae::Rect, ae::Error> {
+fn estimated_emitter_bounds(
+    params: &ae::Parameters<Params>,
+    margin: i32,
+) -> Result<ae::Rect, ae::Error> {
     let (pos_x, pos_y) = params.get(Params::PositionPoint)?.as_point()?.value();
     let emitter_type = params.get(Params::EmitterType)?.as_popup()?.value();
-    let size_linked = params.get(Params::EmitterSizeLinked)?.as_checkbox()?.value();
+    let size_linked = params
+        .get(Params::EmitterSizeLinked)?
+        .as_checkbox()?
+        .value();
     let size_x = params.get(Params::EmitterSizeX)?.as_float_slider()?.value() as f32;
     let size_y = if size_linked {
         size_x
@@ -2156,7 +3654,6 @@ fn clamp_rect_to_pixel_budget(rect: ae::Rect, budget: i64) -> ae::Rect {
     }
 }
 
-
 // ---- Helpers: flat buffer I/O (same as MedianPro) ----
 
 fn layer_to_flat(layer: &ae::Layer) -> (Vec<u8>, usize, usize) {
@@ -2193,8 +3690,10 @@ fn layer_to_flat(layer: &ae::Layer) -> (Vec<u8>, usize, usize) {
                     if si + 15 < buf.len() && di + 3 < flat.len() {
                         for ch in 0..4usize {
                             let v = f32::from_ne_bytes([
-                                buf[si + ch * 4], buf[si + ch * 4 + 1],
-                                buf[si + ch * 4 + 2], buf[si + ch * 4 + 3],
+                                buf[si + ch * 4],
+                                buf[si + ch * 4 + 1],
+                                buf[si + ch * 4 + 2],
+                                buf[si + ch * 4 + 3],
                             ]);
                             flat[di + ch] = (v * 255.0).clamp(0.0, 255.0) as u8;
                         }
@@ -2208,7 +3707,8 @@ fn layer_to_flat(layer: &ae::Layer) -> (Vec<u8>, usize, usize) {
                 let dst_off = y * w * 4;
                 let row_len = w * 4;
                 if src_off + row_len <= buf.len() && dst_off + row_len <= flat.len() {
-                    flat[dst_off..dst_off + row_len].copy_from_slice(&buf[src_off..src_off + row_len]);
+                    flat[dst_off..dst_off + row_len]
+                        .copy_from_slice(&buf[src_off..src_off + row_len]);
                 }
             }
         }
@@ -2270,45 +3770,115 @@ fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
                 let dst_off = y * stride;
                 let row_len = w * 4;
                 if src_off + row_len <= flat.len() && dst_off + row_len <= buf.len() {
-                    buf[dst_off..dst_off + row_len].copy_from_slice(&flat[src_off..src_off + row_len]);
+                    buf[dst_off..dst_off + row_len]
+                        .copy_from_slice(&flat[src_off..src_off + row_len]);
                 }
             }
         }
     }
 }
 
-fn blit_flat_into(
-    src: &[u8],
-    src_w: usize,
-    src_h: usize,
-    src_origin_x: i32,
-    src_origin_y: i32,
-    dst: &mut [u8],
-    dst_w: usize,
-    dst_h: usize,
-    dst_origin_x: i32,
-    dst_origin_y: i32,
+fn apply_final_composite(
+    original: &[u8],
+    input_w: usize,
+    input_h: usize,
+    input_origin_x: i32,
+    input_origin_y: i32,
+    output: &mut Vec<u8>,
+    out_w: usize,
+    out_h: usize,
+    out_origin_x: i32,
+    out_origin_y: i32,
+    mode: ApplyMode,
 ) {
-    // Compute overlap region in global coords, then copy row by row
-    let g_left = src_origin_x.max(dst_origin_x);
-    let g_top = src_origin_y.max(dst_origin_y);
-    let g_right = (src_origin_x + src_w as i32).min(dst_origin_x + dst_w as i32);
-    let g_bottom = (src_origin_y + src_h as i32).min(dst_origin_y + dst_h as i32);
-    if g_left >= g_right || g_top >= g_bottom {
+    if original.is_empty() || matches!(mode, ApplyMode::OnTransparent) {
         return;
     }
-    let copy_w = (g_right - g_left) as usize;
-    for gy in g_top..g_bottom {
-        let sy = (gy - src_origin_y) as usize;
-        let dy = (gy - dst_origin_y) as usize;
-        let sx = (g_left - src_origin_x) as usize;
-        let dx = (g_left - dst_origin_x) as usize;
-        let src_off = (sy * src_w + sx) * 4;
-        let dst_off = (dy * dst_w + dx) * 4;
-        let row_bytes = copy_w * 4;
-        if src_off + row_bytes <= src.len() && dst_off + row_bytes <= dst.len() {
-            dst[dst_off..dst_off + row_bytes].copy_from_slice(&src[src_off..src_off + row_bytes]);
+
+    let mut composited = vec![0u8; output.len()];
+    renderer::composite_apply(
+        original,
+        input_w,
+        input_h,
+        input_origin_x,
+        input_origin_y,
+        output,
+        out_w,
+        out_h,
+        out_origin_x,
+        out_origin_y,
+        &mut composited,
+        out_w,
+        out_h,
+        out_origin_x,
+        out_origin_y,
+        mode,
+    );
+    *output = composited;
+}
+
+fn load_preset_snapshot(contents: &str) -> Result<PresetSnapshot, ae::Error> {
+    let mut value: Value = serde_json::from_str(contents).map_err(|_| ae::Error::Generic)?;
+    if let Some(obj) = value.as_object_mut() {
+        if !obj.contains_key("apply_mode") {
+            let composite_on_orig = obj
+                .get("composite_on_orig")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            obj.insert(
+                "apply_mode".to_string(),
+                Value::from(if composite_on_orig { 2 } else { 1 }),
+            );
         }
+        if !obj.contains_key("version") {
+            obj.insert("version".to_string(), Value::from(PRESET_VERSION));
+        }
+    }
+    serde_json::from_value(value).map_err(|_| ae::Error::Generic)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_preset_snapshot_migrates_apply_mode_from_composite_flag() {
+        let snapshot = load_preset_snapshot(r#"{"composite_on_orig":false}"#).unwrap();
+        assert_eq!(snapshot.version, PRESET_VERSION);
+        assert_eq!(snapshot.apply_mode, 1);
+
+        let snapshot = load_preset_snapshot(r#"{"composite_on_orig":true}"#).unwrap();
+        assert_eq!(snapshot.apply_mode, 2);
+    }
+
+    #[test]
+    fn composite_apply_normal_preserves_argb_order() {
+        let original = [128u8, 64, 0, 0];
+        let particles = [128u8, 0, 64, 0];
+        let mut output = [0u8; 4];
+        renderer::composite_apply(
+            &original,
+            1,
+            1,
+            0,
+            0,
+            &particles,
+            1,
+            1,
+            0,
+            0,
+            &mut output,
+            1,
+            1,
+            0,
+            0,
+            ApplyMode::Normal,
+        );
+
+        assert_eq!(output[0], 192);
+        assert_eq!(output[1], 32);
+        assert_eq!(output[2], 64);
+        assert_eq!(output[3], 0);
     }
 }
 
@@ -2404,7 +3974,10 @@ fn update_shape_dependent_ui(params: &ae::Parameters<Params>) -> Result<(), ae::
     let emitter_source_enabled = is_layer_alpha_emitter || is_path_emitter;
     let any_image_in_use = emitter_source_enabled || is_image_shape;
     let use_source_alpha = params.get(Params::UseSourceAlpha)?.as_checkbox()?.value();
-    let size_linked = params.get(Params::EmitterSizeLinked)?.as_checkbox()?.value();
+    let size_linked = params
+        .get(Params::EmitterSizeLinked)?
+        .as_checkbox()?
+        .value();
     let mut params_copy = params.cloned();
 
     // Emitter source layer control (Layer Alpha or Path emitter)
@@ -2429,9 +4002,21 @@ fn update_shape_dependent_ui(params: &ae::Parameters<Params>) -> Result<(), ae::
         param.update_param_ui()?;
     }
 
-    // Sprite source layer (Image shape only)
-    {
-        let mut param = params_copy.get_mut(Params::SpriteSourceLayer)?;
+    // Grid resolution (Grid emitter only)
+    let is_grid_emitter = emitter_type_val == 4;
+    for param_id in [Params::GridResX, Params::GridResY, Params::GridResZ] {
+        let mut param = params_copy.get_mut(param_id)?;
+        param.set_ui_flag(ae::ParamUIFlags::DISABLED, !is_grid_emitter);
+        param.update_param_ui()?;
+    }
+
+    // Sprite source layer + time sampling + frame count (Image shape only)
+    for param_id in [
+        Params::SpriteSourceLayer,
+        Params::SpriteTimeSampling,
+        Params::SpriteFrameCount,
+    ] {
+        let mut param = params_copy.get_mut(param_id)?;
         param.set_ui_flag(ae::ParamUIFlags::DISABLED, !is_image_shape);
         param.update_param_ui()?;
     }
@@ -2446,12 +4031,21 @@ fn update_shape_dependent_ui(params: &ae::Parameters<Params>) -> Result<(), ae::
         param.update_param_ui()?;
     }
 
-    for param_id in [
-        Params::SourcePremultiplied,
-        Params::ImageAlphaClip,
-    ] {
+    for param_id in [Params::SourcePremultiplied, Params::ImageAlphaClip] {
         let mut param = params_copy.get_mut(param_id)?;
-        param.set_ui_flag(ae::ParamUIFlags::DISABLED, !is_image_shape || !use_source_alpha);
+        param.set_ui_flag(
+            ae::ParamUIFlags::DISABLED,
+            !is_image_shape || !use_source_alpha,
+        );
+        param.update_param_ui()?;
+    }
+
+    // BirthRate: disabled when "All at Start" + Grid (Grid uses GridRes for count)
+    // For "All at Start" + non-Grid, BirthRate is reused as total particle count
+    let emit_all = params.get(Params::EmitMode)?.as_popup()?.value() == 2;
+    {
+        let mut param = params_copy.get_mut(Params::BirthRate)?;
+        param.set_ui_flag(ae::ParamUIFlags::DISABLED, emit_all && is_grid_emitter);
         param.update_param_ui()?;
     }
 
@@ -2472,14 +4066,24 @@ fn update_shape_dependent_ui(params: &ae::Parameters<Params>) -> Result<(), ae::
 
     // Disable individual curve sliders when a non-Custom preset is selected
     let opacity_custom = params.get(Params::OpacityCurvePreset)?.as_popup()?.value() == 1;
-    for param_id in [Params::OpacityStart, Params::OpacityMidA, Params::OpacityMidB, Params::OpacityEnd] {
+    for param_id in [
+        Params::OpacityStart,
+        Params::OpacityMidA,
+        Params::OpacityMidB,
+        Params::OpacityEnd,
+    ] {
         let mut param = params_copy.get_mut(param_id)?;
         param.set_ui_flag(ae::ParamUIFlags::DISABLED, !opacity_custom);
         param.update_param_ui()?;
     }
 
     let size_custom = params.get(Params::SizeCurvePreset)?.as_popup()?.value() == 1;
-    for param_id in [Params::SizeLifeStart, Params::SizeLifeMidA, Params::SizeLifeMidB, Params::SizeLifeEnd] {
+    for param_id in [
+        Params::SizeLifeStart,
+        Params::SizeLifeMidA,
+        Params::SizeLifeMidB,
+        Params::SizeLifeEnd,
+    ] {
         let mut param = params_copy.get_mut(param_id)?;
         param.set_ui_flag(ae::ParamUIFlags::DISABLED, !size_custom);
         param.update_param_ui()?;
@@ -2490,7 +4094,10 @@ fn update_shape_dependent_ui(params: &ae::Parameters<Params>) -> Result<(), ae::
 
 fn sync_box_size_axes(params: &ae::Parameters<Params>, changed: Params) -> Result<(), ae::Error> {
     let emitter_type = params.get(Params::EmitterType)?.as_popup()?.value();
-    let size_linked = params.get(Params::EmitterSizeLinked)?.as_checkbox()?.value();
+    let size_linked = params
+        .get(Params::EmitterSizeLinked)?
+        .as_checkbox()?
+        .value();
     if emitter_type != 2 || !size_linked {
         return Ok(());
     }
@@ -2504,7 +4111,11 @@ fn sync_box_size_axes(params: &ae::Parameters<Params>, changed: Params) -> Resul
     };
 
     let mut params_copy = params.cloned();
-    for param_id in [Params::EmitterSizeX, Params::EmitterSizeY, Params::EmitterSizeZ] {
+    for param_id in [
+        Params::EmitterSizeX,
+        Params::EmitterSizeY,
+        Params::EmitterSizeZ,
+    ] {
         let mut param = params_copy.get_mut(param_id)?;
         param.as_float_slider_mut()?.set_value(source_value);
         param.set_change_flag(ae::ChangeFlag::CHANGED_VALUE, true);
@@ -2518,14 +4129,19 @@ fn apply_opacity_preset(params: &ae::Parameters<Params>) -> Result<(), ae::Error
     let preset = params.get(Params::OpacityCurvePreset)?.as_popup()?.value();
     // 1=Custom (no change), 2=Constant, 3=Fade Out, 4=Fade In-Out, 5=Ease Out, 6=Quick Fade
     let values: [f64; 4] = match preset {
-        2 => [100.0, 100.0, 100.0, 100.0],     // Constant
-        3 => [100.0, 80.0, 40.0, 0.0],          // Fade Out (linear-ish)
-        4 => [0.0, 100.0, 100.0, 0.0],          // Fade In-Out
-        5 => [100.0, 95.0, 70.0, 0.0],          // Ease Out (slow start, fast end)
-        6 => [100.0, 30.0, 5.0, 0.0],           // Quick Fade
-        _ => return Ok(()),                       // Custom: don't change
+        2 => [100.0, 100.0, 100.0, 100.0], // Constant
+        3 => [100.0, 80.0, 40.0, 0.0],     // Fade Out (linear-ish)
+        4 => [0.0, 100.0, 100.0, 0.0],     // Fade In-Out
+        5 => [100.0, 95.0, 70.0, 0.0],     // Ease Out (slow start, fast end)
+        6 => [100.0, 30.0, 5.0, 0.0],      // Quick Fade
+        _ => return Ok(()),                // Custom: don't change
     };
-    let param_ids = [Params::OpacityStart, Params::OpacityMidA, Params::OpacityMidB, Params::OpacityEnd];
+    let param_ids = [
+        Params::OpacityStart,
+        Params::OpacityMidA,
+        Params::OpacityMidB,
+        Params::OpacityEnd,
+    ];
     let mut params_copy = params.cloned();
     for (i, &pid) in param_ids.iter().enumerate() {
         let mut param = params_copy.get_mut(pid)?;
@@ -2540,14 +4156,19 @@ fn apply_size_preset(params: &ae::Parameters<Params>) -> Result<(), ae::Error> {
     let preset = params.get(Params::SizeCurvePreset)?.as_popup()?.value();
     // 1=Custom, 2=Constant, 3=Shrink, 4=Grow-Shrink, 5=Grow, 6=Pop-Shrink
     let values: [f64; 4] = match preset {
-        2 => [1.0, 1.0, 1.0, 1.0],             // Constant
-        3 => [1.0, 0.8, 0.4, 0.0],              // Shrink
-        4 => [0.0, 1.0, 1.0, 0.0],              // Grow-Shrink
-        5 => [0.0, 0.4, 0.8, 1.0],              // Grow
-        6 => [1.2, 0.9, 0.4, 0.0],              // Pop-Shrink (starts big)
-        _ => return Ok(()),                       // Custom: don't change
+        2 => [1.0, 1.0, 1.0, 1.0], // Constant
+        3 => [1.0, 0.8, 0.4, 0.0], // Shrink
+        4 => [0.0, 1.0, 1.0, 0.0], // Grow-Shrink
+        5 => [0.0, 0.4, 0.8, 1.0], // Grow
+        6 => [1.2, 0.9, 0.4, 0.0], // Pop-Shrink (starts big)
+        _ => return Ok(()),        // Custom: don't change
     };
-    let param_ids = [Params::SizeLifeStart, Params::SizeLifeMidA, Params::SizeLifeMidB, Params::SizeLifeEnd];
+    let param_ids = [
+        Params::SizeLifeStart,
+        Params::SizeLifeMidA,
+        Params::SizeLifeMidB,
+        Params::SizeLifeEnd,
+    ];
     let mut params_copy = params.cloned();
     for (i, &pid) in param_ids.iter().enumerate() {
         let mut param = params_copy.get_mut(pid)?;
@@ -2647,7 +4268,10 @@ fn populate_path_emitter(
         return Ok(());
     }
 
-    let density = params.get(Params::PathSampleDensity)?.as_float_slider()?.value() as f32;
+    let density = params
+        .get(Params::PathSampleDensity)?
+        .as_float_slider()?
+        .value() as f32;
     let samples_per_seg = (density as usize).max(1);
 
     let path_query = match ae::pf::suites::PathQuery::new() {
@@ -2745,7 +4369,13 @@ fn populate_path_emitter(
     Ok(())
 }
 
-fn cubic_bezier(p0: glam::Vec2, p1: glam::Vec2, p2: glam::Vec2, p3: glam::Vec2, t: f32) -> glam::Vec2 {
+fn cubic_bezier(
+    p0: glam::Vec2,
+    p1: glam::Vec2,
+    p2: glam::Vec2,
+    p3: glam::Vec2,
+    t: f32,
+) -> glam::Vec2 {
     let u = 1.0 - t;
     let uu = u * u;
     let tt = t * t;
@@ -2761,60 +4391,179 @@ fn populate_image_sprite(
         return Ok(());
     }
 
-    let checked_out = params.checkout(Params::SpriteSourceLayer)?;
-    let Some(source_layer) = checked_out.as_layer()?.value() else {
+    let frame_count = params
+        .get(Params::SpriteFrameCount)?
+        .as_slider()?
+        .value()
+        .max(1) as u16;
+    let is_multi_frame =
+        frame_count > 1 && render_cfg.time_sampling != TimeSamplingMode::CurrentTime;
+
+    if !is_multi_frame {
+        let checked_out = params.checkout(Params::SpriteSourceLayer)?;
+        let Some(source_layer) = checked_out.as_layer()?.value() else {
+            return Ok(());
+        };
+        let sprite = build_sprite_image(&source_layer, proxy_divisor(params)?);
+        render_cfg.sprite_images = vec![sprite];
+        return Ok(());
+    }
+
+    // Multi-frame: checkout source layer at different times
+    let pdiv = proxy_divisor(params)?;
+    let time_step = in_data.time_step();
+    let time_scale = in_data.time_scale();
+
+    // Build cache key for multi-frame set (use time=0 sentinel)
+    let checked_out_first = params.checkout(Params::SpriteSourceLayer)?;
+    let Some(first_layer) = checked_out_first.as_layer()?.value() else {
         return Ok(());
     };
-
-    let key = source_cache_key(in_data, proxy_divisor(params)?, &source_layer);
+    let mut key = source_cache_key(in_data, pdiv, &first_layer);
+    key.time = 0;
+    key.source_signature ^= (frame_count as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
 
     if let Ok(cache) = image_cache().read() {
-        if let Some(sprite) = cache.get(&key) {
-            render_cfg.sprite_image = Some((**sprite).clone());
+        if let Some(sprites) = cache.get(&key) {
+            render_cfg.sprite_images = (**sprites).clone();
             return Ok(());
         }
     }
+    drop(checked_out_first);
 
-    let sprite = Arc::new(build_sprite_image(&source_layer, key.proxy_divisor));
-    if let Ok(mut cache) = image_cache().write() {
-        cache.insert(key, sprite.clone());
+    let mut sprites = Vec::with_capacity(frame_count as usize);
+    for i in 0..frame_count {
+        let frame_time = (i as i32) * time_step;
+        match params.checkout_at(
+            Params::SpriteSourceLayer,
+            Some(frame_time),
+            Some(time_step),
+            Some(time_scale),
+        ) {
+            Ok(checked) => {
+                if let Ok(layer_ref) = checked.as_layer() {
+                    if let Some(layer) = layer_ref.value() {
+                        sprites.push(build_sprite_image(&layer, pdiv));
+                        continue;
+                    }
+                }
+                sprites.push(finish_sprite(1, 1, vec![255, 255, 255, 255]));
+            }
+            Err(_) => {
+                sprites.push(finish_sprite(1, 1, vec![255, 255, 255, 255]));
+            }
+        }
     }
-    render_cfg.sprite_image = Some((*sprite).clone());
+
+    let sprites = Arc::new(sprites);
+    if let Ok(mut cache) = image_cache().write() {
+        cache.insert(key, sprites.clone());
+    }
+    render_cfg.sprite_images = (*sprites).clone();
     Ok(())
+}
+
+fn generate_mip_chain(base_w: usize, base_h: usize, base_pixels: &[u8]) -> Vec<renderer::MipLevel> {
+    let mut mips = Vec::new();
+    let mut src_w = base_w;
+    let mut src_h = base_h;
+    let mut src = base_pixels.to_vec();
+    while src_w > 2 || src_h > 2 {
+        let nw = (src_w / 2).max(1);
+        let nh = (src_h / 2).max(1);
+        let mut dst = vec![0u8; nw * nh * 4];
+        for oy in 0..nh {
+            for ox in 0..nw {
+                let x0 = ox * 2;
+                let y0 = oy * 2;
+                let x1 = (x0 + 2).min(src_w);
+                let y1 = (y0 + 2).min(src_h);
+                let mut sum = [0u32; 4];
+                let mut count = 0u32;
+                for sy in y0..y1 {
+                    for sx in x0..x1 {
+                        let i = (sy * src_w + sx) * 4;
+                        sum[0] += src[i] as u32;
+                        sum[1] += src[i + 1] as u32;
+                        sum[2] += src[i + 2] as u32;
+                        sum[3] += src[i + 3] as u32;
+                        count += 1;
+                    }
+                }
+                let di = (oy * nw + ox) * 4;
+                dst[di] = (sum[0] / count) as u8;
+                dst[di + 1] = (sum[1] / count) as u8;
+                dst[di + 2] = (sum[2] / count) as u8;
+                dst[di + 3] = (sum[3] / count) as u8;
+            }
+        }
+        mips.push(renderer::MipLevel {
+            width: nw,
+            height: nh,
+            pixels: dst.clone(),
+        });
+        src = dst;
+        src_w = nw;
+        src_h = nh;
+    }
+    mips
+}
+
+fn finish_sprite(width: usize, height: usize, pixels: Vec<u8>) -> SpriteImage {
+    let mips = generate_mip_chain(width, height, &pixels);
+    SpriteImage {
+        width,
+        height,
+        pixels: Arc::new(pixels),
+        mips: Arc::new(mips),
+    }
 }
 
 fn build_sprite_image(layer: &ae::Layer, proxy_divisor: u8) -> SpriteImage {
     let (flat, width, height) = layer_to_flat(layer);
     if width == 0 || height == 0 || flat.is_empty() {
-        return SpriteImage {
-            width: 1,
-            height: 1,
-            pixels: Arc::new(vec![255, 255, 255, 255]),
-        };
+        return finish_sprite(1, 1, vec![255, 255, 255, 255]);
     }
 
     let step = proxy_divisor.max(1) as usize;
+    if step <= 1 {
+        return finish_sprite(width, height, flat);
+    }
+
     let out_w = width.div_ceil(step).max(1);
     let out_h = height.div_ceil(step).max(1);
     let mut pixels = vec![0u8; out_w * out_h * 4];
 
     for oy in 0..out_h {
         for ox in 0..out_w {
-            let sample_x = (ox * step + step / 2).min(width - 1);
-            let sample_y = (oy * step + step / 2).min(height - 1);
-            let src_idx = (sample_y * width + sample_x) * 4;
+            let x0 = ox * step;
+            let y0 = oy * step;
+            let x1 = (x0 + step).min(width);
+            let y1 = (y0 + step).min(height);
+            let count = ((x1 - x0) * (y1 - y0)) as u32;
+            let mut sum = [0u32; 4];
+            for sy in y0..y1 {
+                for sx in x0..x1 {
+                    let idx = (sy * width + sx) * 4;
+                    if idx + 3 < flat.len() {
+                        sum[0] += flat[idx] as u32;
+                        sum[1] += flat[idx + 1] as u32;
+                        sum[2] += flat[idx + 2] as u32;
+                        sum[3] += flat[idx + 3] as u32;
+                    }
+                }
+            }
             let dst_idx = (oy * out_w + ox) * 4;
-            if src_idx + 3 < flat.len() && dst_idx + 3 < pixels.len() {
-                pixels[dst_idx..dst_idx + 4].copy_from_slice(&flat[src_idx..src_idx + 4]);
+            if dst_idx + 3 < pixels.len() {
+                pixels[dst_idx] = (sum[0] / count) as u8;
+                pixels[dst_idx + 1] = (sum[1] / count) as u8;
+                pixels[dst_idx + 2] = (sum[2] / count) as u8;
+                pixels[dst_idx + 3] = (sum[3] / count) as u8;
             }
         }
     }
 
-    SpriteImage {
-        width: out_w,
-        height: out_h,
-        pixels: Arc::new(pixels),
-    }
+    finish_sprite(out_w, out_h, pixels)
 }
 
 // ---- Camera matrix helper ----
@@ -2833,15 +4582,16 @@ fn camera_diag_should_emit() -> bool {
 }
 
 fn fmt_mat16(flat: &[f64; 16]) -> String {
-    flat.iter().map(|v| format!("{:.3}", v)).collect::<Vec<_>>().join(",")
+    flat.iter()
+        .map(|v| format!("{:.3}", v))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn fmt_mat44(m: &[[f64; 4]; 4]) -> String {
     let flat: [f64; 16] = [
-        m[0][0], m[0][1], m[0][2], m[0][3],
-        m[1][0], m[1][1], m[1][2], m[1][3],
-        m[2][0], m[2][1], m[2][2], m[2][3],
-        m[3][0], m[3][1], m[3][2], m[3][3],
+        m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1], m[1][2], m[1][3], m[2][0], m[2][1],
+        m[2][2], m[2][3], m[3][0], m[3][1], m[3][2], m[3][3],
     ];
     fmt_mat16(&flat)
 }
@@ -2857,18 +4607,20 @@ fn log_camera_diag(raw_flat: &[f64; 16], projection: &CameraProjection) {
     let cw = projection.image_plane_width;
     let ch = projection.image_plane_height;
     let test_points: [(&str, glam::Vec3); 5] = [
-        ("topleft_z0",   glam::Vec3::new(0.0,      0.0,      0.0)),
-        ("center_z0",    glam::Vec3::new(cw * 0.5, ch * 0.5, 0.0)),
+        ("topleft_z0", glam::Vec3::new(0.0, 0.0, 0.0)),
+        ("center_z0", glam::Vec3::new(cw * 0.5, ch * 0.5, 0.0)),
         ("center_zp500", glam::Vec3::new(cw * 0.5, ch * 0.5, 500.0)),
         ("center_zn500", glam::Vec3::new(cw * 0.5, ch * 0.5, -500.0)),
-        ("right_z0",     glam::Vec3::new(cw,       ch * 0.5, 0.0)),
+        ("right_z0", glam::Vec3::new(cw, ch * 0.5, 0.0)),
     ];
-    let proj_str = test_points.iter().map(|(name, p)| {
-        match project_point_3d(*p, projection) {
+    let proj_str = test_points
+        .iter()
+        .map(|(name, p)| match project_point_3d(*p, projection) {
             Some((sx, sy, d)) => format!("{}=({:.1},{:.1},d{:.1})", name, sx, sy, d),
             None => format!("{}=cull", name),
-        }
-    }).collect::<Vec<_>>().join(" ");
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
 
     debug_info(format!(
         "[CAMERA-DIAG] dist={:.2} img={}x{} invert={} | raw=[{}] | trans=[{}] | inv=[{}] | proj: {}",
@@ -2883,10 +4635,11 @@ fn log_camera_diag(raw_flat: &[f64; 16], projection: &CameraProjection) {
 }
 
 fn try_get_camera_projection(in_data: &ae::InData) -> Option<CameraProjection> {
-    let time = ae::Time { value: in_data.current_time(), scale: in_data.time_scale() };
-    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        in_data.effect().camera_matrix(time)
-    }));
+    let time = ae::Time {
+        value: in_data.current_time(),
+        scale: in_data.time_scale(),
+    };
+    let result = panic::catch_unwind(AssertUnwindSafe(|| in_data.effect().camera_matrix(time)));
     let (matrix, image_plane_dist, image_w, image_h) = match result {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
@@ -2924,8 +4677,8 @@ fn try_get_camera_projection(in_data: &ae::InData) -> Option<CameraProjection> {
     // AE uses row-vector convention (v * M): translation in bottom row.
     // Transpose to column-vector convention (M * v): translation in rightmost column.
     let transposed = [
-        [flat[0], flat[4], flat[8],  flat[12]],
-        [flat[1], flat[5], flat[9],  flat[13]],
+        [flat[0], flat[4], flat[8], flat[12]],
+        [flat[1], flat[5], flat[9], flat[13]],
         [flat[2], flat[6], flat[10], flat[14]],
         [flat[3], flat[7], flat[11], flat[15]],
     ];
@@ -2971,16 +4724,20 @@ fn render_particles(
     render_cfg.frame_dt = dt.max(1.0 / 240.0);
     render_cfg.camera_projection = try_get_camera_projection(in_data);
 
+    let final_apply_mode = if render_cfg.apply_mode != ApplyMode::OnTransparent {
+        Some(render_cfg.apply_mode)
+    } else if render_cfg.composite_on_original {
+        Some(ApplyMode::Normal)
+    } else {
+        None
+    };
+    let (original, in_w, in_h) = if final_apply_mode.is_some() {
+        layer_to_flat(in_layer)
+    } else {
+        (Vec::new(), 0, 0)
+    };
     let output_len = checked_rgba_len(out_w, out_h)?;
     let mut output = vec![0u8; output_len];
-    if render_cfg.composite_on_original {
-        let (original, in_w, in_h) = layer_to_flat(in_layer);
-        let in_origin = in_layer.origin();
-        blit_flat_into(
-            &original, in_w, in_h, in_origin.h, in_origin.v,
-            &mut output, out_w, out_h, out_origin.h, out_origin.v,
-        );
-    }
 
     let mut particle_count = 0;
     if mode == 1 || mode == 3 {
@@ -3015,6 +4772,23 @@ fn render_particles(
         }
     }
 
+    if let Some(mode) = final_apply_mode {
+        let in_origin = in_layer.origin();
+        apply_final_composite(
+            &original,
+            in_w,
+            in_h,
+            in_origin.h,
+            in_origin.v,
+            &mut output,
+            out_w,
+            out_h,
+            out_origin.h,
+            out_origin.v,
+            mode,
+        );
+    }
+
     flat_to_layer(&output, out_layer, out_w, out_h);
 
     debug_info(format!(
@@ -3047,7 +4821,8 @@ fn smart_render_particles(
     extra: &ae::pf::SmartRenderExtra,
 ) -> Result<(), ae::Error> {
     // Retrieve data collected in SmartPreRender — no AE API calls on render thread.
-    let data = extra.pre_render_data::<SmartRenderData>()
+    let data = extra
+        .pre_render_data::<SmartRenderData>()
         .ok_or(ae::Error::Generic)?;
     let mode = data.mode;
     let emitter = data.emitter.clone();
@@ -3065,26 +4840,34 @@ fn smart_render_particles(
 
     // === Phase 1: Read input pixels into local memory ===
     // Keep input checked out so AE's "input before output" requirement is met for Phase 3.
-    let input_world = cb.checkout_layer_pixels(0)?
-        .ok_or(ae::Error::Generic)?;
+    let input_world = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
     let input_origin = input_world.origin();
-    let (original, input_w, input_h) = if render_cfg.composite_on_original {
+    let final_apply_mode = if render_cfg.apply_mode != ApplyMode::OnTransparent {
+        Some(render_cfg.apply_mode)
+    } else if render_cfg.composite_on_original {
+        Some(ApplyMode::Normal)
+    } else {
+        None
+    };
+    let need_original = final_apply_mode.is_some();
+    let (original, input_w, input_h) = if need_original {
         layer_to_flat(&input_world)
     } else {
         (Vec::new(), 0, 0)
     };
-    // NOTE: input stays checked out — required for checkout_output in Phase 3.
 
-    // Use expected dimensions from SmartPreRender (no checkout_output needed yet)
     let output_w = data.expected_output_w;
     let output_h = data.expected_output_h;
 
     debug_info(format!(
-        "SmartRender V9 START output={}x{} elapsed={}ms",
-        output_w, output_h, render_start.elapsed().as_millis()
+        "SmartRender V10 START output={}x{} apply={:?} elapsed={}ms",
+        output_w,
+        output_h,
+        render_cfg.apply_mode,
+        render_start.elapsed().as_millis()
     ));
 
-    render_cfg.row_stride = 0; // flat: stride == width*4
+    render_cfg.row_stride = 0;
     render_cfg.width = output_w;
     render_cfg.height = output_h;
     render_cfg.origin_x = data.expected_origin_x as f32;
@@ -3094,20 +4877,7 @@ fn smart_render_particles(
     let output_len = checked_rgba_len(output_w, output_h)?;
     let origin_x = data.expected_origin_x;
     let origin_y = data.expected_origin_y;
-    debug_info(format!(
-        "SmartRender V9 alloc {}MB ({}x{}) elapsed={}ms",
-        output_len / (1024*1024), output_w, output_h,
-        render_start.elapsed().as_millis()
-    ));
     let mut output = vec![0u8; output_len];
-    if !original.is_empty() {
-        blit_flat_into(
-            &original, input_w, input_h, input_origin.h, input_origin.v,
-            &mut output, output_w, output_h, origin_x, origin_y,
-        );
-    }
-    drop(original); // Free input copy immediately
-    debug_info(format!("SmartRender V9 STEP:blit elapsed={}ms", render_start.elapsed().as_millis()));
 
     // Particles
     let mut particle_count = 0;
@@ -3117,11 +4887,21 @@ fn smart_render_particles(
         system.simulate_to_time(t, dt);
         let particles = system.get_particles();
         particle_count = particles.len();
-        debug_info(format!("SmartRender V9 STEP:sim particles={} elapsed={}ms", particle_count, render_start.elapsed().as_millis()));
+        debug_info(format!(
+            "SmartRender V9 STEP:sim particles={} elapsed={}ms",
+            particle_count,
+            render_start.elapsed().as_millis()
+        ));
         check_render_abort(in_data)?;
-        let deadline = Instant::checked_add(&render_start, std::time::Duration::from_millis(RENDER_TIME_BUDGET_MS as u64));
+        let deadline = Instant::checked_add(
+            &render_start,
+            std::time::Duration::from_millis(RENDER_TIME_BUDGET_MS as u64),
+        );
         renderer::render_particles_8bit(particles, &render_cfg, &mut output, deadline);
-        debug_info(format!("SmartRender V9 STEP:draw elapsed={}ms", render_start.elapsed().as_millis()));
+        debug_info(format!(
+            "SmartRender V9 STEP:draw elapsed={}ms",
+            render_start.elapsed().as_millis()
+        ));
     }
 
     // Plexus
@@ -3148,28 +4928,51 @@ fn smart_render_particles(
                 plexus_render::render_plexus_points_8bit(group, &plexus_render_cfg, &mut output);
             }
         }
-        debug_info(format!("SmartRender V9 STEP:plexus elapsed={}ms", render_start.elapsed().as_millis()));
+        debug_info(format!(
+            "SmartRender V9 STEP:plexus elapsed={}ms",
+            render_start.elapsed().as_millis()
+        ));
     }
 
-    // Final abort check before writing. If AE has asked us to stop, propagate
-    // `Error::InterruptCancel` — NEVER return `Ok(())` without writing the
-    // output buffer, or AE will cache an uninitialized frame.
+    if let Some(mode) = final_apply_mode {
+        apply_final_composite(
+            &original,
+            input_w,
+            input_h,
+            input_origin.h,
+            input_origin.v,
+            &mut output,
+            output_w,
+            output_h,
+            origin_x,
+            origin_y,
+            mode,
+        );
+    }
+    drop(original);
+
     check_render_abort(in_data)?;
 
-    debug_info(format!("SmartRender V9 STEP:pre_write elapsed={}ms", render_start.elapsed().as_millis()));
+    debug_info(format!(
+        "SmartRender V10 STEP:pre_write elapsed={}ms",
+        render_start.elapsed().as_millis()
+    ));
 
     // === Phase 3: Checkout output and write result — hold AE buffer as briefly as possible ===
-    let mut output_world = cb.checkout_output()?
-        .ok_or(ae::Error::Generic)?;
+    let mut output_world = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
     let bit_depth = output_world.bit_depth();
     flat_to_layer(&output, &mut output_world, output_w, output_h);
     // output_world and _input_world2 drop here
 
     debug_info(format!(
         "SmartRender V9 {}bpc time={:.3}s output={}x{} particles={} mode={} cam={}",
-        bit_depth, t, output_w, output_h, particle_count, mode,
+        bit_depth,
+        t,
+        output_w,
+        output_h,
+        particle_count,
+        mode,
         render_cfg.camera_projection.is_some()
     ));
     Ok(())
 }
-

@@ -24,10 +24,18 @@ pub enum BlendMode {
 }
 
 #[derive(Clone, Debug)]
+pub struct MipLevel {
+    pub width: usize,
+    pub height: usize,
+    pub pixels: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
 pub struct SpriteImage {
     pub width: usize,
     pub height: usize,
     pub pixels: Arc<Vec<u8>>,
+    pub mips: Arc<Vec<MipLevel>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -40,6 +48,23 @@ pub enum ImageColorMode {
 pub enum ImageFitMode {
     Contain,
     Stretch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TimeSamplingMode {
+    CurrentTime,
+    BirthTime,
+    RandomStill,
+    RandomPlay,
+    Cycle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ApplyMode {
+    OnTransparent,
+    Normal,
+    Add,
+    Screen,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -65,8 +90,10 @@ pub struct RenderConfig {
     pub dof_focal_distance: f32,
     pub dof_aperture: f32,
     pub composite_on_original: bool,
+    pub apply_mode: ApplyMode,
     pub size_multiplier: f32,
-    pub sprite_image: Option<SpriteImage>,
+    pub sprite_images: Vec<SpriteImage>,
+    pub time_sampling: TimeSamplingMode,
     pub image_color_mode: ImageColorMode,
     pub image_fit_mode: ImageFitMode,
     pub image_sampling: ImageSamplingConfig,
@@ -75,7 +102,11 @@ pub struct RenderConfig {
 
 impl RenderConfig {
     pub fn row_bytes(&self) -> usize {
-        if self.row_stride > 0 { self.row_stride } else { self.width * 4 }
+        if self.row_stride > 0 {
+            self.row_stride
+        } else {
+            self.width * 4
+        }
     }
 }
 
@@ -88,7 +119,10 @@ pub struct CameraProjection {
     pub image_plane_height: f32,
 }
 
-pub(crate) fn project_point_3d(pos: glam::Vec3, projection: &CameraProjection) -> Option<(f32, f32, f32)> {
+pub(crate) fn project_point_3d(
+    pos: glam::Vec3,
+    projection: &CameraProjection,
+) -> Option<(f32, f32, f32)> {
     let matrix = if projection.invert_matrix {
         invert_camera_matrix(projection.matrix)?
     } else {
@@ -115,7 +149,10 @@ pub(crate) fn project_point_3d(pos: glam::Vec3, projection: &CameraProjection) -
     let dist = projection.image_plane_dist.max(1e-4);
     let screen_x = (eye_x * dist / depth) as f32 + projection.image_plane_width * 0.5;
     let screen_y = (eye_y * dist / depth) as f32 + projection.image_plane_height * 0.5;
-    let limit = (projection.image_plane_width.max(projection.image_plane_height)) * 4.0;
+    let limit = (projection
+        .image_plane_width
+        .max(projection.image_plane_height))
+        * 4.0;
     if screen_x.abs() > limit || screen_y.abs() > limit {
         return None;
     }
@@ -152,9 +189,14 @@ fn transform_particle_3d(p: &Particle, projection: &CameraProjection) -> Option<
     let screen_y = (eye_y * proj_scale) as f32 + projection.image_plane_height * 0.5;
 
     // Safety: reject extreme screen positions to prevent huge draw rects
-    let limit = (projection.image_plane_width.max(projection.image_plane_height)) * 4.0;
-    if !screen_x.is_finite() || !screen_y.is_finite()
-        || screen_x.abs() > limit || screen_y.abs() > limit
+    let limit = (projection
+        .image_plane_width
+        .max(projection.image_plane_height))
+        * 4.0;
+    if !screen_x.is_finite()
+        || !screen_y.is_finite()
+        || screen_x.abs() > limit
+        || screen_y.abs() > limit
     {
         return None;
     }
@@ -167,7 +209,6 @@ pub fn render_particles_8bit(
     output: &mut [u8],
     deadline: Option<Instant>,
 ) {
-
     // Sort particles back-to-front by z-depth for correct alpha compositing
     let mut sorted_indices: Vec<usize> = (0..particles.len()).collect();
     sorted_indices.sort_unstable_by(|&a, &b| {
@@ -195,7 +236,9 @@ pub fn render_particles_8bit(
 }
 
 fn draw_particle(p: &Particle, config: &RenderConfig, output: &mut [u8]) {
-    let (local_x, local_y, perspective_scale) = if let Some(ref projection) = config.camera_projection {
+    let (local_x, local_y, perspective_scale) = if let Some(ref projection) =
+        config.camera_projection
+    {
         match transform_particle_3d(p, projection) {
             Some((sx, sy, depth)) => {
                 let lx = sx - config.origin_x;
@@ -222,7 +265,9 @@ fn draw_particle(p: &Particle, config: &RenderConfig, output: &mut [u8]) {
     } else {
         1.0
     };
-    let radius = (p.size * config.size_multiplier * blur_scale * dof_scale * perspective_scale * 0.5).max(0.5);
+    let radius =
+        (p.size * config.size_multiplier * blur_scale * dof_scale * perspective_scale * 0.5)
+            .max(0.5);
     let blur_offset = p.velocity * config.frame_dt * motion_blur_amount;
     let blur_len = blur_offset.length() * perspective_scale;
     let blur_samples = if blur_len > 0.5 {
@@ -391,6 +436,30 @@ fn shape_coverage(
     base.clamp(0.0, 1.0) * p.color[3].clamp(0.0, 1.0)
 }
 
+fn select_sprite<'a>(p: &Particle, config: &'a RenderConfig) -> Option<&'a SpriteImage> {
+    if config.sprite_images.is_empty() {
+        return None;
+    }
+    let n = config.sprite_images.len();
+    if n == 1 {
+        return Some(&config.sprite_images[0]);
+    }
+    let idx = match config.time_sampling {
+        TimeSamplingMode::CurrentTime => 0,
+        TimeSamplingMode::BirthTime | TimeSamplingMode::RandomStill => p.sprite_frame as usize % n,
+        TimeSamplingMode::RandomPlay => {
+            let start = p.sprite_frame as usize;
+            let age_frames = (p.age * 30.0).floor() as usize;
+            (start + age_frames) % n
+        }
+        TimeSamplingMode::Cycle => {
+            let t = (p.age / p.lifespan.max(0.001)).clamp(0.0, 0.999);
+            (t * n as f32).floor() as usize
+        }
+    };
+    Some(&config.sprite_images[idx.min(n - 1)])
+}
+
 fn draw_image_particle(
     p: &Particle,
     config: &RenderConfig,
@@ -400,7 +469,7 @@ fn draw_image_particle(
     radius: f32,
     sample_weight: f32,
 ) {
-    let Some(sprite) = &config.sprite_image else {
+    let Some(sprite) = select_sprite(p, config) else {
         return;
     };
     if sprite.width == 0 || sprite.height == 0 || sprite.pixels.is_empty() {
@@ -412,20 +481,47 @@ fn draw_image_particle(
         ImageFitMode::Contain => dest_w * (sprite.height as f32 / sprite.width as f32),
         ImageFitMode::Stretch => dest_w,
     };
-    let min_x = (local_x - dest_w * 0.5).floor() as isize;
-    let min_y = (local_y - dest_h * 0.5).floor() as isize;
-    let max_x = (local_x + dest_w * 0.5).ceil() as isize;
-    let max_y = (local_y + dest_h * 0.5).ceil() as isize;
 
-    let clamped_w = (max_x.min(config.width as isize) - min_x.max(0)).max(0) as usize;
-    let clamped_h = (max_y.min(config.height as isize) - min_y.max(0)).max(0) as usize;
-    if clamped_w * clamped_h > MAX_PARTICLE_PIXEL_BUDGET {
+    // Select mip level based on texel-to-pixel ratio
+    let texel_ratio = (sprite.width as f32 / dest_w).max(sprite.height as f32 / dest_h);
+    let mip_idx = if texel_ratio > 1.5 {
+        ((texel_ratio.log2().floor() as usize).max(1) - 1).min(sprite.mips.len().saturating_sub(1))
+    } else {
+        usize::MAX
+    };
+    let (sw, sh, pix): (usize, usize, &[u8]) = if mip_idx < sprite.mips.len() {
+        let m = &sprite.mips[mip_idx];
+        (m.width, m.height, &m.pixels)
+    } else {
+        (sprite.width, sprite.height, &sprite.pixels)
+    };
+    if sw == 0 || sh == 0 || pix.is_empty() {
         return;
     }
 
     let rotation = p.rotation.to_radians();
     let sin_r = rotation.sin();
     let cos_r = rotation.cos();
+    let has_rotation = sin_r.abs() > 0.001;
+    let (half_ext_x, half_ext_y) = if has_rotation {
+        let hw = dest_w * 0.5;
+        let hh = dest_h * 0.5;
+        let ex = (hw * cos_r.abs() + hh * sin_r.abs()).ceil();
+        let ey = (hw * sin_r.abs() + hh * cos_r.abs()).ceil();
+        (ex, ey)
+    } else {
+        (dest_w * 0.5, dest_h * 0.5)
+    };
+    let min_x = (local_x - half_ext_x).floor() as isize;
+    let min_y = (local_y - half_ext_y).floor() as isize;
+    let max_x = (local_x + half_ext_x).ceil() as isize;
+    let max_y = (local_y + half_ext_y).ceil() as isize;
+
+    let clamped_w = (max_x.min(config.width as isize) - min_x.max(0)).max(0) as usize;
+    let clamped_h = (max_y.min(config.height as isize) - min_y.max(0)).max(0) as usize;
+    if clamped_w * clamped_h > MAX_PARTICLE_PIXEL_BUDGET {
+        return;
+    }
 
     for y in min_y.max(0)..=max_y.min(config.height.saturating_sub(1) as isize) {
         for x in min_x.max(0)..=max_x.min(config.width.saturating_sub(1) as isize) {
@@ -435,36 +531,68 @@ fn draw_image_particle(
             let ry = -dx * sin_r + dy * cos_r;
             let u = (rx / dest_w) + 0.5;
             let v = (ry / dest_h) + 0.5;
-            let sx = (u * sprite.width as f32).floor() as isize;
-            let sy = (v * sprite.height as f32).floor() as isize;
-            if sx < 0 || sx >= sprite.width as isize {
-                continue;
-            }
-            if sy < 0 || sy >= sprite.height as isize {
-                continue;
-            }
 
-            let sidx = (sy as usize * sprite.width + sx as usize) * 4;
-            if sidx + 3 >= sprite.pixels.len() {
+            // Bilinear sample coordinates
+            let fx = u * sw as f32 - 0.5;
+            let fy = v * sh as f32 - 0.5;
+            if fx < -0.5 || fx >= sw as f32 - 0.5 || fy < -0.5 || fy >= sh as f32 - 0.5 {
                 continue;
             }
+            let ix0 = fx.floor() as isize;
+            let iy0 = fy.floor() as isize;
+            let frac_x = fx - ix0 as f32;
+            let frac_y = fy - iy0 as f32;
 
-            let source_alpha = sprite.pixels[sidx] as f32 / 255.0;
+            let sample = |cx: isize, cy: isize| -> [f32; 4] {
+                let cx = cx.clamp(0, sw as isize - 1) as usize;
+                let cy = cy.clamp(0, sh as isize - 1) as usize;
+                let i = (cy * sw + cx) * 4;
+                if i + 3 < pix.len() {
+                    [
+                        pix[i] as f32,
+                        pix[i + 1] as f32,
+                        pix[i + 2] as f32,
+                        pix[i + 3] as f32,
+                    ]
+                } else {
+                    [0.0; 4]
+                }
+            };
+            let s00 = sample(ix0, iy0);
+            let s10 = sample(ix0 + 1, iy0);
+            let s01 = sample(ix0, iy0 + 1);
+            let s11 = sample(ix0 + 1, iy0 + 1);
+
+            let inv_fx = 1.0 - frac_x;
+            let inv_fy = 1.0 - frac_y;
+            let lerped = [
+                (s00[0] * inv_fx + s10[0] * frac_x) * inv_fy
+                    + (s01[0] * inv_fx + s11[0] * frac_x) * frac_y,
+                (s00[1] * inv_fx + s10[1] * frac_x) * inv_fy
+                    + (s01[1] * inv_fx + s11[1] * frac_x) * frac_y,
+                (s00[2] * inv_fx + s10[2] * frac_x) * inv_fy
+                    + (s01[2] * inv_fx + s11[2] * frac_x) * frac_y,
+                (s00[3] * inv_fx + s10[3] * frac_x) * inv_fy
+                    + (s01[3] * inv_fx + s11[3] * frac_x) * frac_y,
+            ];
+
+            let source_alpha = lerped[0] / 255.0;
             if config.image_sampling.use_source_alpha && source_alpha <= 0.0 {
                 continue;
             }
 
-            let mut sprite_rgb = [
-                sprite.pixels[sidx + 1] as f32 / 255.0,
-                sprite.pixels[sidx + 2] as f32 / 255.0,
-                sprite.pixels[sidx + 3] as f32 / 255.0,
-            ];
-            if config.image_sampling.source_premultiplied && source_alpha > 0.0 {
-                let inv_alpha = 1.0 / source_alpha.max(1.0 / 255.0);
-                sprite_rgb[0] = (sprite_rgb[0] * inv_alpha).clamp(0.0, 1.0);
-                sprite_rgb[1] = (sprite_rgb[1] * inv_alpha).clamp(0.0, 1.0);
-                sprite_rgb[2] = (sprite_rgb[2] * inv_alpha).clamp(0.0, 1.0);
-            }
+            // Unpremultiply: AE layers are premultiplied, so recover straight RGB
+            let sprite_rgb =
+                if config.image_sampling.source_premultiplied && source_alpha > 1.0 / 255.0 {
+                    let inv_a = 1.0 / source_alpha;
+                    [
+                        (lerped[1] / 255.0 * inv_a).clamp(0.0, 1.0),
+                        (lerped[2] / 255.0 * inv_a).clamp(0.0, 1.0),
+                        (lerped[3] / 255.0 * inv_a).clamp(0.0, 1.0),
+                    ]
+                } else {
+                    [lerped[1] / 255.0, lerped[2] / 255.0, lerped[3] / 255.0]
+                };
             let alpha = if config.image_sampling.use_source_alpha {
                 source_alpha
             } else {
@@ -487,17 +615,37 @@ fn draw_image_particle(
                     p.color[3] * alpha,
                 ],
             };
-            blend_pixel(output, config.row_bytes(), x as usize, y as usize, color, sample_weight, config.blend_mode);
+            blend_pixel(
+                output,
+                config.row_bytes(),
+                x as usize,
+                y as usize,
+                color,
+                sample_weight,
+                config.blend_mode,
+            );
         }
     }
 }
 
 pub fn invert_camera_matrix(matrix: [[f64; 4]; 4]) -> Option<[[f64; 4]; 4]> {
     let col_major = [
-        matrix[0][0], matrix[1][0], matrix[2][0], matrix[3][0],
-        matrix[0][1], matrix[1][1], matrix[2][1], matrix[3][1],
-        matrix[0][2], matrix[1][2], matrix[2][2], matrix[3][2],
-        matrix[0][3], matrix[1][3], matrix[2][3], matrix[3][3],
+        matrix[0][0],
+        matrix[1][0],
+        matrix[2][0],
+        matrix[3][0],
+        matrix[0][1],
+        matrix[1][1],
+        matrix[2][1],
+        matrix[3][1],
+        matrix[0][2],
+        matrix[1][2],
+        matrix[2][2],
+        matrix[3][2],
+        matrix[0][3],
+        matrix[1][3],
+        matrix[2][3],
+        matrix[3][3],
     ];
     let inv = DMat4::from_cols_array(&col_major).inverse();
     if !inv.is_finite() {
@@ -527,7 +675,11 @@ pub(crate) fn blend_pixel(
     }
 
     let src_a = (color[3] * coverage).clamp(0.0, 1.0);
-    let src_rgb = [color[0].clamp(0.0, 1.0), color[1].clamp(0.0, 1.0), color[2].clamp(0.0, 1.0)];
+    let src_rgb = [
+        color[0].clamp(0.0, 1.0),
+        color[1].clamp(0.0, 1.0),
+        color[2].clamp(0.0, 1.0),
+    ];
     let dst_rgb = [
         output[idx + 1] as f32 / 255.0,
         output[idx + 2] as f32 / 255.0,
@@ -563,4 +715,124 @@ pub(crate) fn blend_pixel(
 pub(crate) fn smooth_falloff(value: f32) -> f32 {
     let t = value.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+pub fn composite_apply(
+    original: &[u8],
+    orig_w: usize,
+    orig_h: usize,
+    orig_ox: i32,
+    orig_oy: i32,
+    particles: &[u8],
+    part_w: usize,
+    part_h: usize,
+    part_ox: i32,
+    part_oy: i32,
+    output: &mut [u8],
+    out_w: usize,
+    out_h: usize,
+    out_ox: i32,
+    out_oy: i32,
+    mode: ApplyMode,
+) {
+    let unpremultiply = |rgb: f32, a: f32| -> f32 {
+        if a > 0.0 {
+            (rgb / a).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+
+    for gy in out_oy..(out_oy + out_h as i32) {
+        for gx in out_ox..(out_ox + out_w as i32) {
+            let ox = (gx - out_ox) as usize;
+            let oy = (gy - out_oy) as usize;
+            let out_i = (oy * out_w + ox) * 4;
+            if out_i + 3 >= output.len() {
+                continue;
+            }
+
+            let (oa, or, og, ob) = {
+                let lx = gx - orig_ox;
+                let ly = gy - orig_oy;
+                if lx >= 0 && (lx as usize) < orig_w && ly >= 0 && (ly as usize) < orig_h {
+                    let i = (ly as usize * orig_w + lx as usize) * 4;
+                    if i + 3 < original.len() {
+                        (
+                            original[i] as f32 / 255.0,
+                            original[i + 1] as f32 / 255.0,
+                            original[i + 2] as f32 / 255.0,
+                            original[i + 3] as f32 / 255.0,
+                        )
+                    } else {
+                        (0.0, 0.0, 0.0, 0.0)
+                    }
+                } else {
+                    (0.0, 0.0, 0.0, 0.0)
+                }
+            };
+
+            let (pa, pr, pg, pb) = {
+                let lx = gx - part_ox;
+                let ly = gy - part_oy;
+                if lx >= 0 && (lx as usize) < part_w && ly >= 0 && (ly as usize) < part_h {
+                    let i = (ly as usize * part_w + lx as usize) * 4;
+                    if i + 3 < particles.len() {
+                        (
+                            particles[i] as f32 / 255.0,
+                            particles[i + 1] as f32 / 255.0,
+                            particles[i + 2] as f32 / 255.0,
+                            particles[i + 3] as f32 / 255.0,
+                        )
+                    } else {
+                        (0.0, 0.0, 0.0, 0.0)
+                    }
+                } else {
+                    (0.0, 0.0, 0.0, 0.0)
+                }
+            };
+
+            let (ra, rr, rg, rb) = match mode {
+                ApplyMode::OnTransparent => (pa, pr, pg, pb),
+                ApplyMode::Normal => {
+                    let a = pa + oa * (1.0 - pa);
+                    if a > 0.0 {
+                        let rr = pr + or * (1.0 - pa);
+                        let rg = pg + og * (1.0 - pa);
+                        let rb = pb + ob * (1.0 - pa);
+                        (a, rr.min(a), rg.min(a), rb.min(a))
+                    } else {
+                        (0.0, 0.0, 0.0, 0.0)
+                    }
+                }
+                ApplyMode::Add => {
+                    let a = (pa + oa * (1.0 - pa)).clamp(0.0, 1.0);
+                    (
+                        a,
+                        (or + pr).clamp(0.0, a),
+                        (og + pg).clamp(0.0, a),
+                        (ob + pb).clamp(0.0, a),
+                    )
+                }
+                ApplyMode::Screen => {
+                    let a = (pa + oa * (1.0 - pa)).clamp(0.0, 1.0);
+                    let sr = unpremultiply(pr, pa);
+                    let sg = unpremultiply(pg, pa);
+                    let sb = unpremultiply(pb, pa);
+                    let dr = unpremultiply(or, oa);
+                    let dg = unpremultiply(og, oa);
+                    let db = unpremultiply(ob, oa);
+                    let rr = (1.0 - (1.0 - dr) * (1.0 - sr)) * a;
+                    let rg = (1.0 - (1.0 - dg) * (1.0 - sg)) * a;
+                    let rb = (1.0 - (1.0 - db) * (1.0 - sb)) * a;
+                    (a, rr.min(a), rg.min(a), rb.min(a))
+                }
+            };
+
+            output[out_i] = (ra.clamp(0.0, 1.0) * 255.0).round() as u8;
+            output[out_i + 1] = (rr.clamp(0.0, 1.0) * 255.0).round() as u8;
+            output[out_i + 2] = (rg.clamp(0.0, 1.0) * 255.0).round() as u8;
+            output[out_i + 3] = (rb.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    }
 }

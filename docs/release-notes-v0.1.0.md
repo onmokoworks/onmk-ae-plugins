@@ -1,6 +1,6 @@
 # TuiImage v0.1.0 Release Notes
 
-![TuiImage demo](./tuiimage-demo.gif)
+![TuiImage demo](https://raw.githubusercontent.com/onmokoworks/TuiImage/main/docs/tuiimage-demo.gif)
 
 ## English
 

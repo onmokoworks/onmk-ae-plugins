@@ -1,5 +1,0 @@
-PluginName := "TuiImage"
-BinaryName := "tui_image_renderer"
-BundleIdentifier := "work.onmk.TuiImage"
-
-import "AdobePlugin.just"

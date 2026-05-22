@@ -109,8 +109,6 @@ If you need a custom plug-in folder, set `TUIIMAGE_PLUGIN_DIR` before running th
 
 Do not commit generated `.aex` files to the repository. Build Windows and macOS artifacts separately from the same tagged commit, then attach those artifacts to a GitHub Release.
 
-The helper `rust/AdobePlugin.just` is kept for local development. It now builds/copies artifacts by default and installs into the system plug-in folder only when `INSTALL_AFTER_BUILD=1` is set.
-
 The macOS build helper is currently intended for local Apple Silicon testing and still needs host validation in After Effects.
 
 ## Basic Usage

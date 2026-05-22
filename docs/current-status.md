@@ -98,8 +98,6 @@ Created the actual Rust effect crate under `rust/`:
 
 - `Cargo.toml`
 - `build.rs`
-- `justfile`
-- `AdobePlugin.just`
 - `shader.wgsl`
 - `src/lib.rs`
 - `src/gpu.rs`

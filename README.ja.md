@@ -85,8 +85,6 @@ C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\
 
 生成した `.aex` は Git には含めません。配布時は GitHub Release の成果物として添付します。
 
-`rust/AdobePlugin.just` はローカル開発用として残しています。標準では build/copy のみ行い、システムの plug-ins フォルダへインストールする場合だけ `INSTALL_AFTER_BUILD=1` を設定します。
-
 macOS 用ビルド補助は Apple Silicon のローカル検証用です。After Effects 上でのホスト検証は別途必要です。
 
 ## パラメータ

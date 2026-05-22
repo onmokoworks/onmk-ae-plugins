@@ -4,85 +4,36 @@
 
 ![TuiImage demo](./docs/tuiimage-demo.gif)
 
-TuiImage is an experimental After Effects effect for creating ANSI-art-inspired / TUI-style cell renderings from image layers.
+TuiImage is an After Effects effect for creating ANSI art / TUI-style cell renderings from image layers.
 
-It samples the source image into a grid, maps brightness to procedural glyph density, and recolors the result with mono, source, or two-color gradient modes. It does not emit ANSI escape sequences; it recreates that style visually inside After Effects.
+It samples the input image into a grid, maps brightness to procedural glyph density, and reconstructs the result with Mono, Source, or Gradient color modes. It does not emit ANSI escape sequences; it recreates that visual style inside After Effects.
 
-> This project is still in active development. Parameter names, defaults, and rendering behavior may change before a stable release.
+> Specifications, UI, parameter names, and defaults may change in future versions.
 
-## Preview
+## Name
 
-The GIF above shows an early v0.1.0 preview of the effect running in After Effects.
-
-## Naming
-
-- Product / display name: `TuiImage`
+- Display name: `TuiImage`
 - After Effects match name: `TuiImage`
 - Plugin file name:
   - Windows: `TuiImage.aex`
   - macOS: `TuiImage.plugin`
 
-## Features
+## Main Features
 
 - Cell-based sampling of the input layer
-- Procedural ANSI-art-inspired, ASCII, block, and braille-like glyph patterns
-- Presets for ASCII Classic, Block, Braille, and TUI Gradient looks
+- Procedural ANSI art / TUI-style, ASCII-style, Block-style, and Braille-style glyph rendering
+- ASCII Classic / Block / Braille / TUI Gradient presets
 - Adjustable cell size, glyph scale, column gap, and row gap
-- Color modes: Mono, Source, and Gradient
+- Mono / Source / Gradient color modes
 - Experimental GPU rendering path enabled only through an environment variable
 
-## Requirements
-
-- Windows or Apple Silicon Mac
-- Adobe After Effects
-- Rust toolchain, for building from source
-- Permission to copy `.aex` / `.plugin` files into the After Effects plug-ins folder
-
-Current validation status:
+## Validation Status
 
 - Tested on Adobe After Effects 2025 / Windows
 - Tested on Adobe After Effects 2026 / Apple Silicon Mac
+- Release binaries are built per platform from the same commit / tag
 
-Release artifacts should be built per platform from the same source revision.
-
-## Installation
-
-### Install a release build
-
-On Windows, download `TuiImage.aex` from the GitHub Release page, close After Effects, then copy it to the After Effects plug-ins folder:
-
-```text
-C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\
-```
-
-On macOS, download `TuiImage-macos-arm64.plugin.zip` from the GitHub Release page, extract it, close After Effects, then copy `TuiImage.plugin` to the MediaCore plug-ins folder:
-
-```text
-/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/
-```
-
-Command-line install example:
-
-```bash
-unzip TuiImage-macos-arm64.plugin.zip
-sudo cp -R TuiImage.plugin "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/"
-```
-
-If macOS Gatekeeper blocks a downloaded `.plugin`, remove the quarantine attribute if needed:
-
-```bash
-sudo xattr -dr com.apple.quarantine "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/TuiImage.plugin"
-```
-
-Restart After Effects and apply the effect from:
-
-```text
-Stylize > TuiImage
-```
-
-The installer script in `scripts/install_tuiimage_admin.ps1` does the same copy step for local development, but manual copy is fine if you are not sure about running PowerShell scripts.
-
-### Build from source
+## Build
 
 On Windows, run this from the repository root:
 
@@ -90,25 +41,58 @@ On Windows, run this from the repository root:
 powershell -ExecutionPolicy Bypass -File .\scripts\build_release.ps1
 ```
 
-This creates:
+Output:
 
 ```text
 rust\target\release\TuiImage.aex
 ```
 
-On Apple Silicon Mac, run:
+On macOS, run this on an Apple Silicon Mac:
 
 ```bash
 bash ./scripts/build_macos_release.sh
 ```
 
-This creates:
+Output:
 
 ```text
 rust/target/release/TuiImage.plugin
 ```
 
-### Install a local build
+## Installation
+
+### Using a release build
+
+On Windows, download `TuiImage.aex` from GitHub Releases, close After Effects, then copy it to the plug-ins folder:
+
+```text
+C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\
+```
+
+On macOS, download `TuiImage-macos-arm64.plugin.zip` from GitHub Releases, extract it, close After Effects, then copy `TuiImage.plugin` to the MediaCore folder:
+
+```text
+/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/
+```
+
+Command-line copy example:
+
+```bash
+unzip TuiImage-macos-arm64.plugin.zip
+sudo cp -R TuiImage.plugin "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/"
+```
+
+If a downloaded `.plugin` is blocked by macOS Gatekeeper, remove the quarantine attribute if needed:
+
+```bash
+sudo xattr -dr com.apple.quarantine "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/TuiImage.plugin"
+```
+
+Restart After Effects and apply the effect from `Stylize > TuiImage`.
+
+If running PowerShell scripts is confusing, manual copy is fine.
+
+### Installing a local build
 
 Close After Effects, then run PowerShell as administrator:
 
@@ -116,108 +100,31 @@ Close After Effects, then run PowerShell as administrator:
 powershell -ExecutionPolicy Bypass -File .\scripts\install_tuiimage_admin.ps1
 ```
 
-By default this copies the locally built `TuiImage.aex` to:
+By default, it copies the plugin to:
 
 ```text
 C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\
 ```
 
-If you need a custom plug-in folder on Windows, set `TUIIMAGE_PLUGIN_DIR` before running the installer script.
+For a local macOS build, manually copy the generated `rust/target/release/TuiImage.plugin` bundle into the MediaCore folder.
 
-For a local macOS build, copy the generated `rust/target/release/TuiImage.plugin` bundle into the MediaCore plug-ins folder manually.
-
-### Release artifacts
-
-Do not commit generated `.aex` / `.plugin` files to the repository. Build Windows and macOS artifacts separately from the same tagged commit, then attach those artifacts to a GitHub Release.
+Generated `.aex` / `.plugin` files are not committed to Git. Distribution builds are attached as GitHub Release artifacts.
 
 The macOS release artifact is for Apple Silicon / arm64. It is currently ad-hoc signed; Developer ID signing and notarization are not provided yet.
 
-## Basic Usage
-
-1. Add `TuiImage` to a layer or precomp.
-2. Choose a `Preset` to set the base glyph style.
-3. Choose a `Color Mode`.
-4. Adjust `Cell Width` / `Cell Height` or enable `Uniform Cell Size`.
-5. Tune `Scale`, `Column Gap %`, and `Row Gap %` for the glyph layout.
-
-Existing effect instances may keep older parameter values after updating the plugin. For clean testing, remove the effect and apply it again.
-
-## Presets
-
-### ASCII Classic
-
-A rough terminal-like ASCII look using procedural glyph coverage.
-
-### Block
-
-A block-cell rendering style. This is a good starting point for checking density and scale.
-
-### Braille
-
-A dot-pattern rendering style inspired by braille-cell density.
-
-### TUI Gradient
-
-A block-based TUI look intended for simple two-color gradient rendering.
-
 ## Parameters
 
-### Preset
+- `Preset`: chooses the glyph style and initial values
+- `Cell Width` / `Cell Height`: controls grid density
+- `Uniform Cell Size`: links Cell Width and Cell Height
+- `Scale`: controls glyph size inside each cell
+- `Column Gap %` / `Row Gap %`: adjusts spacing corresponding to character and line spacing
+- `Color Mode`: selects Mono / Source / Gradient
+- `Source Mix`: mixes the generated result back toward the source layer
 
-Chooses the base glyph style and related starting values. Presets are not a separate color mode.
+## Environment Variables
 
-### Uniform Cell Size
-
-Links `Cell Width` and `Cell Height`. When enabled, `Cell Width` is shown as `Cell Size`.
-
-### Cell Width / Cell Height
-
-Controls the grid size. Smaller cells give more detail but cost more processing.
-
-### Columns / Rows
-
-Optionally overrides the grid count. `0` means automatic calculation from cell size.
-
-### Render Scale
-
-Controls internal processing scale.
-
-### Contrast / Gamma / Edge Boost / Invert
-
-Controls source luminance mapping before glyph density is chosen.
-
-### Color Mode
-
-- `Mono`: maps source luma to the selected preset's glyph density, then renders filled glyph areas with Foreground over Background.
-- `Source`: uses the source image color.
-- `Gradient`: interpolates from Background to Foreground.
-
-### Scale
-
-Controls the size of the generated glyph pattern inside each cell.
-
-- With `Uniform Scale` enabled, Column and Row scale are linked.
-- With `Uniform Scale` disabled, Column and Row scale can be adjusted separately.
-
-### Column Gap % / Row Gap %
-
-Adds horizontal and vertical spacing inside the cell layout.
-
-### Source Mix
-
-Mixes the generated TUI result back toward the original source color.
-
-### Use Source Luma
-
-Uses source brightness to determine glyph density.
-
-### Preserve Source Color
-
-Colors generated glyphs using the original source image color.
-
-## Environment
-
-GPU rendering is experimental and disabled by default.
+The GPU path is experimental and disabled by default. Set this only when testing it.
 
 ```powershell
 $env:TUIIMAGE_ENABLE_GPU = "1"
@@ -229,19 +136,12 @@ macOS / bash:
 export TUIIMAGE_ENABLE_GPU=1
 ```
 
-## Current Limitations
+## Limitations
 
-- The renderer does not draw real fonts yet.
-- ASCII / block / braille looks are procedural glyph-like patterns.
-- Arbitrary font selection is not implemented.
-- GPU rendering is experimental and disabled by default.
-- The public parameter layout is still being tuned.
-
-## Development Notes
-
-The current goal is a practical AE-native TUI-style raster effect: editable, fast enough for experimentation, and stable enough to use directly in After Effects.
-
-The plugin currently prioritizes controllable procedural looks over perfect terminal emulation or real font rasterization.
+- The current renderer does not draw real fonts
+- ASCII / Block / Braille styles are procedural glyph-like renderings
+- Arbitrary font selection is not implemented
+- GPU rendering is experimental
 
 ## License
 

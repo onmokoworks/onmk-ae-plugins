@@ -6,9 +6,9 @@
 
 TuiImage は、画像レイヤーから ANSI art / TUI 風のセル表現を作る After Effects エフェクトです。
 
-入力画像をグリッド状にサンプリングし、明るさを手続き的な glyph 密度に変換して、Mono / Source / Gradient の色モードで再構成します。ANSI エスケープシーケンスを出力するものではなく、After Effects 上でその見た目を再現するためのエフェクトです。
+入力画像をグリッド状にサンプリングし、明るさを手続き的な glyph 密度に変換して、Mono / Source / Gradient の色モードで再構成します。ANSIエスケープシーケンスを出力するものではなく、After Effects 上で見た目を再現するためのエフェクトです。
 
-> この README は作業中の簡易版です。仕様、UI、パラメータ名、既定値は今後変わる可能性があります。
+> 仕様、UI、パラメータ名、既定値は今後変わる可能性があります。
 
 ## 名前
 
@@ -18,19 +18,17 @@ TuiImage は、画像レイヤーから ANSI art / TUI 風のセル表現を作�
 
 ## 主な機能
 
-- After Effects 用ネイティブエフェクト
 - 入力レイヤーのセル単位サンプリング
 - ANSI art / TUI 風、ASCII / Block / Braille 風の手続き的な glyph 表現
 - ASCII Classic / Block / Braille / TUI Gradient プリセット
-- セルサイズ、glyph スケール、字間、行間の調整
+- セルサイズ、glyphスケール、字間、行間の調整
 - Mono / Source / Gradient の色モード
-- CPU レンダリングを標準使用
-- GPU 経路は実験的で、環境変数を設定した場合のみ有効
+- GPU レンダリング(実験的、環境変数を設定した場合のみ有効)
 
 ## 検証状況
 
-- Adobe After Effects 2025 / Windows で検証中
-- macOS ビルドと検証は別環境で実施予定
+- Adobe After Effects 2025 / Windows で検証
+- Adobe After Effects 2026 / Apple silicon mac で検証
 - リリース用バイナリは、同じ commit / tag から各プラットフォームごとに生成します
 
 ## ビルド

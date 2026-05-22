@@ -4,13 +4,13 @@
 
 ## English
 
-Initial public preview release of TuiImage, an After Effects effect that converts an input layer into a TUI / ASCII-inspired cell rendering.
+Initial public preview release of TuiImage, an After Effects effect for creating ANSI-art-inspired / TUI-style cell renderings from image layers.
 
 ### Highlights
 
 - Added macOS `.plugin` release artifact.
 - Tested on Apple Silicon Mac.
-- Includes procedural ASCII-like, block, braille-like, and TUI gradient-style rendering presets.
+- Includes procedural ANSI-art-inspired, ASCII-like, block, braille-like, and TUI gradient-style rendering presets.
 - Supports adjustable cell size, glyph scale, column/row spacing, foreground/background colors, source color mode, and two-color gradient mode.
 - Includes source code, build scripts, MIT License, and bilingual README files.
 
@@ -23,13 +23,13 @@ Initial public preview release of TuiImage, an After Effects effect that convert
 
 ## 日本語
 
-TuiImage の最初の公開プレビュー版です。After Effects の入力レイヤーを、TUI / ASCII 風のセル表現に変換するエフェクトです。
+TuiImage の最初の公開プレビュー版です。After Effects の画像レイヤーから、ANSI art / TUI 風のセル表現を作るエフェクトです。
 
 ### 主な内容
 
 - macOS 用 `.plugin` リリースアーティファクトを追加しました。
 - Apple Silicon Mac で動作確認しました。
-- ASCII 風、ブロック風、点字風、TUI グラデーション風のプリセットを含みます。
+- ANSI art / TUI 風、ASCII 風、ブロック風、点字風、TUI グラデーション風のプリセットを含みます。
 - セルサイズ、文字スケール、列/行の間隔、前景色/背景色、ソースカラー、2色グラデーションを調整できます。
 - ソースコード、ビルドスクリプト、MIT License、日本語/英語 README を同梱しています。
 

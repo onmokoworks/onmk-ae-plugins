@@ -4,9 +4,9 @@
 
 ![TuiImage demo](./docs/tuiimage-demo.gif)
 
-TuiImage は、After Effects のレイヤーを TUI / ASCII 風のセル表現に変換する実験的なエフェクトです。
+TuiImage は、画像レイヤーから ANSI art / TUI 風のセル表現を作る After Effects エフェクトです。
 
-入力画像をグリッド状にサンプリングし、明るさを手続き的な glyph 密度に変換して、Mono / Source / Gradient の色モードで再構成します。
+入力画像をグリッド状にサンプリングし、明るさを手続き的な glyph 密度に変換して、Mono / Source / Gradient の色モードで再構成します。ANSI エスケープシーケンスを出力するものではなく、After Effects 上でその見た目を再現するためのエフェクトです。
 
 > この README は作業中の簡易版です。仕様、UI、パラメータ名、既定値は今後変わる可能性があります。
 
@@ -20,7 +20,7 @@ TuiImage は、After Effects のレイヤーを TUI / ASCII 風のセル表現�
 
 - After Effects 用ネイティブエフェクト
 - 入力レイヤーのセル単位サンプリング
-- ASCII / Block / Braille 風の手続き的な glyph 表現
+- ANSI art / TUI 風、ASCII / Block / Braille 風の手続き的な glyph 表現
 - ASCII Classic / Block / Braille / TUI Gradient プリセット
 - セルサイズ、glyph スケール、字間、行間の調整
 - Mono / Source / Gradient の色モード

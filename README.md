@@ -4,9 +4,9 @@
 
 ![TuiImage demo](./docs/tuiimage-demo.gif)
 
-TuiImage is an experimental After Effects effect that converts a layer into a TUI / ASCII-like cell rendering.
+TuiImage is an experimental After Effects effect for creating ANSI-art-inspired / TUI-style cell renderings from image layers.
 
-It samples the source image into a grid, maps brightness to procedural glyph density, and recolors the result with mono, source, or two-color gradient modes.
+It samples the source image into a grid, maps brightness to procedural glyph density, and recolors the result with mono, source, or two-color gradient modes. It does not emit ANSI escape sequences; it recreates that style visually inside After Effects.
 
 > This project is still in active development. Parameter names, defaults, and rendering behavior may change before a stable release.
 
@@ -24,7 +24,7 @@ The GIF above shows an early v0.1.0 preview of the effect running in After Effec
 
 - Native After Effects effect
 - Cell-based sampling of the input layer
-- Procedural ASCII / block / braille-like glyph patterns
+- Procedural ANSI-art-inspired, ASCII, block, and braille-like glyph patterns
 - Presets for ASCII Classic, Block, Braille, and TUI Gradient looks
 - Adjustable cell size, glyph scale, column gap, and row gap
 - Color modes: Mono, Source, and Gradient

@@ -1,5 +1,7 @@
 # TuiImage
 
+[English](./README.md) | [日本語](./README.ja.md)
+
 TuiImage is an experimental After Effects effect that converts a layer into a TUI / ASCII-like cell rendering.
 
 It samples the source image into a grid, maps brightness to procedural glyph density, and recolors the result with mono, source, or two-color gradient modes.

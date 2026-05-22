@@ -1,5 +1,7 @@
 # TuiImage
 
+[日本語](./README.ja.md) | [English](./README.md)
+
 TuiImage は、After Effects のレイヤーを TUI / ASCII 風のセル表現に変換する実験的なエフェクトです。
 
 入力画像をグリッド状にサンプリングし、明るさを手続き的な glyph 密度に変換して、Mono / Source / Gradient の色モードで再構成します。

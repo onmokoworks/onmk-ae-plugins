@@ -1,0 +1,23 @@
+{
+  "id": "tui-gradient",
+  "label": "TUI Gradient",
+  "version": 1,
+  "glyphMode": "block",
+  "glyphs": [" ", "\u2591", "\u2592", "\u2593", "\u2588"],
+  "cell": {
+    "width": 8,
+    "height": 12
+  },
+  "sampling": {
+    "luma": "rec709",
+    "contrast": 1.05,
+    "gamma": 1.0,
+    "edgeBoost": 0.12,
+    "invert": false
+  },
+  "color": {
+    "mode": "gradient",
+    "foreground": "#ffffff",
+    "background": "#000000"
+  }
+}

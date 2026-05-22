@@ -1,0 +1,23 @@
+{
+  "id": "ascii-classic",
+  "label": "ASCII Classic",
+  "version": 1,
+  "glyphMode": "ascii",
+  "glyphs": [" ", ".", ":", "-", "=", "+", "*", "#", "%", "@"],
+  "cell": {
+    "width": 8,
+    "height": 14
+  },
+  "sampling": {
+    "luma": "rec709",
+    "contrast": 1.15,
+    "gamma": 1.0,
+    "edgeBoost": 0.1,
+    "invert": false
+  },
+  "color": {
+    "mode": "mono",
+    "foreground": "#ffffff",
+    "background": "#000000"
+  }
+}

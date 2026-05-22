@@ -18,30 +18,30 @@ The GIF above shows an early v0.1.0 preview of the effect running in After Effec
 
 - Product / display name: `TuiImage`
 - After Effects match name: `TuiImage`
-- Plugin file name: `TuiImage.aex`
+- Plugin file name:
+  - Windows: `TuiImage.aex`
+  - macOS: `TuiImage.plugin`
 
 ## Features
 
-- Native After Effects effect
 - Cell-based sampling of the input layer
 - Procedural ANSI-art-inspired, ASCII, block, and braille-like glyph patterns
 - Presets for ASCII Classic, Block, Braille, and TUI Gradient looks
 - Adjustable cell size, glyph scale, column gap, and row gap
 - Color modes: Mono, Source, and Gradient
-- CPU rendering path enabled by default
-- Experimental GPU path behind an environment variable
+- Experimental GPU rendering path enabled only through an environment variable
 
 ## Requirements
 
-- Windows
+- Windows or Apple Silicon Mac
 - Adobe After Effects
 - Rust toolchain, for building from source
-- Permission to copy `.aex` files into the After Effects plug-ins folder
+- Permission to copy `.aex` / `.plugin` files into the After Effects plug-ins folder
 
 Current validation status:
 
-- Tested on Adobe After Effects 2025 (Windows)
-- macOS build and validation planned separately
+- Tested on Adobe After Effects 2025 / Windows
+- Tested on Adobe After Effects 2026 / Apple Silicon Mac
 
 Release artifacts should be built per platform from the same source revision.
 
@@ -49,10 +49,29 @@ Release artifacts should be built per platform from the same source revision.
 
 ### Install a release build
 
-Download `TuiImage.aex` from the GitHub Release page, close After Effects, then copy it to the After Effects plug-ins folder:
+On Windows, download `TuiImage.aex` from the GitHub Release page, close After Effects, then copy it to the After Effects plug-ins folder:
 
 ```text
 C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\
+```
+
+On macOS, download `TuiImage-macos-arm64.plugin.zip` from the GitHub Release page, extract it, close After Effects, then copy `TuiImage.plugin` to the MediaCore plug-ins folder:
+
+```text
+/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/
+```
+
+Command-line install example:
+
+```bash
+unzip TuiImage-macos-arm64.plugin.zip
+sudo cp -R TuiImage.plugin "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/"
+```
+
+If macOS Gatekeeper blocks a downloaded `.plugin`, remove the quarantine attribute if needed:
+
+```bash
+sudo xattr -dr com.apple.quarantine "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/TuiImage.plugin"
 ```
 
 Restart After Effects and apply the effect from:
@@ -65,7 +84,7 @@ The installer script in `scripts/install_tuiimage_admin.ps1` does the same copy 
 
 ### Build from source
 
-From the repository root:
+On Windows, run this from the repository root:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build_release.ps1
@@ -77,7 +96,7 @@ This creates:
 rust\target\release\TuiImage.aex
 ```
 
-On macOS, use the experimental local build helper:
+On Apple Silicon Mac, run:
 
 ```bash
 bash ./scripts/build_macos_release.sh
@@ -103,13 +122,15 @@ By default this copies the locally built `TuiImage.aex` to:
 C:\Program Files\Adobe\Common\Plug-ins\7.0\MediaCore\
 ```
 
-If you need a custom plug-in folder, set `TUIIMAGE_PLUGIN_DIR` before running the installer script.
+If you need a custom plug-in folder on Windows, set `TUIIMAGE_PLUGIN_DIR` before running the installer script.
+
+For a local macOS build, copy the generated `rust/target/release/TuiImage.plugin` bundle into the MediaCore plug-ins folder manually.
 
 ### Release artifacts
 
-Do not commit generated `.aex` files to the repository. Build Windows and macOS artifacts separately from the same tagged commit, then attach those artifacts to a GitHub Release.
+Do not commit generated `.aex` / `.plugin` files to the repository. Build Windows and macOS artifacts separately from the same tagged commit, then attach those artifacts to a GitHub Release.
 
-The macOS build helper is currently intended for local Apple Silicon testing and still needs host validation in After Effects.
+The macOS release artifact is for Apple Silicon / arm64. It is currently ad-hoc signed; Developer ID signing and notarization are not provided yet.
 
 ## Basic Usage
 
@@ -200,6 +221,12 @@ GPU rendering is experimental and disabled by default.
 
 ```powershell
 $env:TUIIMAGE_ENABLE_GPU = "1"
+```
+
+macOS / bash:
+
+```bash
+export TUIIMAGE_ENABLE_GPU=1
 ```
 
 ## Current Limitations

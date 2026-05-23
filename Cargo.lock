@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "after-effects"
 version = "0.4.0"
-source = "git+https://github.com/virtualritz/after-effects.git#6326884ee0af7bf9e1e3f4df0057149a7fb16b5d"
+source = "git+https://github.com/virtualritz/after-effects.git?rev=6326884ee0af7bf9e1e3f4df0057149a7fb16b5d#6326884ee0af7bf9e1e3f4df0057149a7fb16b5d"
 dependencies = [
  "after-effects-sys",
  "bincode",
@@ -929,7 +929,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "pipl"
 version = "0.1.1"
-source = "git+https://github.com/virtualritz/after-effects.git#6326884ee0af7bf9e1e3f4df0057149a7fb16b5d"
+source = "git+https://github.com/virtualritz/after-effects.git?rev=6326884ee0af7bf9e1e3f4df0057149a7fb16b5d#6326884ee0af7bf9e1e3f4df0057149a7fb16b5d"
 dependencies = [
  "bitflags",
  "byteorder",

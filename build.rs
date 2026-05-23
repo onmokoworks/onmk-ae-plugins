@@ -24,15 +24,10 @@ fn main() {
             build: 1,
         },
         Property::AE_Effect_Info_Flags(0),
-        Property::AE_Effect_Global_OutFlags(OutFlags::DeepColorAware),
-        Property::AE_Effect_Global_OutFlags_2(
-            OutFlags2::FloatColorAware
-                | OutFlags2::SupportsSmartRender
-                | OutFlags2::SupportsThreadedRendering
-                | OutFlags2::SupportsGpuRenderF32,
-        ),
+        Property::AE_Effect_Global_OutFlags(OutFlags::empty()),
+        Property::AE_Effect_Global_OutFlags_2(OutFlags2::SupportsSmartRender),
         Property::AE_Effect_Match_Name("TimeSlice"),
         Property::AE_Reserved_Info(10),
-        Property::AE_Effect_Support_URL("https://github.com"),
+        Property::AE_Effect_Support_URL("https://github.com/onmokoworks/TimeSliceRust"),
     ]);
 }

@@ -276,7 +276,7 @@ impl GpuProcessor {
         h: usize,
         map: &[f64],
         original: &[u8],
-    ) -> Vec<u8> {
+    ) -> Option<Vec<u8>> {
         let (ww, hh, n) = (w as u32, h as u32, w * h);
         let num_frames = frames.len() as u32;
 
@@ -332,18 +332,20 @@ impl GpuProcessor {
         let slice = state.staging_buf.slice(..);
         let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
         slice.map_async(MapMode::Read, move |v| {
-            tx.send(v).unwrap();
+            let _ = tx.send(v);
         });
         let _ = self.device.poll(PollType::Wait);
 
         // Bytes are already in ARGB order.
-        let mut result = vec![0u8; n * 4];
         if let Some(Ok(())) = pollster::block_on(rx.receive()) {
+            let mut result = vec![0u8; n * 4];
             let data = slice.get_mapped_range();
             result.copy_from_slice(&data[..n * 4]);
             drop(data);
             state.staging_buf.unmap();
+            Some(result)
+        } else {
+            None
         }
-        result
     }
 }

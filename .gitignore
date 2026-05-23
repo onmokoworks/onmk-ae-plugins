@@ -12,3 +12,9 @@ Desktop.ini
 *.log
 *.tmp
 *.bak
+
+# Built plug-in binaries (output of `just build` / `just release`)
+*.aex
+*.dll
+*.dylib
+*.so

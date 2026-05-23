@@ -154,7 +154,7 @@ impl AdobePluginGlobal for Plugin {
         match cmd {
             ae::Command::About => {
                 out_data.set_return_msg(
-                    "TimeSlice v1.1\rSlit-scan effect with map support.\rGPU accelerated. Written in Rust.",
+                    "TimeSlice v1.0.0\rSlit-scan effect with map support.\rGPU accelerated. Written in Rust.",
                 );
             }
             ae::Command::Render {
@@ -180,9 +180,6 @@ impl AdobePluginGlobal for Plugin {
                 )?;
             }
             ae::Command::SmartRender { extra } => {
-                smart_render(&extra, params, &in_data)?;
-            }
-            ae::Command::SmartRenderGpu { extra } => {
                 smart_render(&extra, params, &in_data)?;
             }
             _ => {}
@@ -452,11 +449,9 @@ fn smart_render(
         )
     };
 
-    let result = if let Some(g) = get_gpu() {
-        g.process(&sp, &frames, w, h, &map, &src)
-    } else {
-        slit_scan::render(&sp, &frames, w, h, &map, &src)
-    };
+    let result = get_gpu()
+        .and_then(|g| g.process(&sp, &frames, w, h, &map, &src))
+        .unwrap_or_else(|| slit_scan::render(&sp, &frames, w, h, &map, &src));
     flat_to_layer(&result, &mut output_world, w, h);
 
     cb.checkin_layer_pixels(0)?;

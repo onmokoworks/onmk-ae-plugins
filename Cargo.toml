@@ -1,0 +1,18 @@
+[package]
+name = "time-slice"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+after-effects = { git = "https://github.com/virtualritz/after-effects.git" }
+wgpu = "26"
+pollster = "0.4"
+futures-intrusive = "0.5"
+parking_lot = "0.12"
+num_cpus = "1.17"
+
+[build-dependencies]
+pipl = { git = "https://github.com/virtualritz/after-effects.git" }

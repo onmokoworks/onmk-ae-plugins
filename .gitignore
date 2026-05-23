@@ -1,0 +1,14 @@
+/target/
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+
+# Local logs and temporary output
+*.log
+*.tmp
+*.bak

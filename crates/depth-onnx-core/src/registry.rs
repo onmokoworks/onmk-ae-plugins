@@ -117,9 +117,7 @@ fn user_models_root() -> Option<PathBuf> {
     }
     #[cfg(target_os = "windows")]
     {
-        let mut path = std::env::current_exe().ok()?;
-        path.pop();
-        Some(path.join("models"))
+        crate::ort_loader::plugin_install_dir().map(|dir| dir.join("models"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

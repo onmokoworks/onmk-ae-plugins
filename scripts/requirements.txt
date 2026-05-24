@@ -1,6 +1,7 @@
 torch>=2.2
 transformers>=4.40
 onnx>=1.16
+onnxscript>=0.1.0
 onnxruntime>=1.18
 pillow>=10
 numpy>=1.26

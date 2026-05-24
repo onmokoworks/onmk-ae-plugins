@@ -25,4 +25,9 @@ cmake-build-*/
 
 # third-party (managed manually)
 third_party/onnxruntime*/
+third_party/onnxruntime*.zip
+third_party/onnxruntime*.nupkg
 third_party/AfterEffectsSDK*/
+
+# local backups
+_backup_cpp_plugin_*/

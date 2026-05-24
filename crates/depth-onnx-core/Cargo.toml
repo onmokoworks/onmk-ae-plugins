@@ -20,5 +20,12 @@ version = "=2.0.0-rc.12"
 default-features = false
 features = ["std", "ndarray", "load-dynamic", "directml", "api-18"]
 
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+]
+
 [dev-dependencies]
 tempfile = "3"

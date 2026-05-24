@@ -1,0 +1,124 @@
+[
+  {
+    "size": 266,
+    "requested_provider": "CoreMLExecutionProvider",
+    "dtype": "fp32",
+    "error": "Fail(\"[ONNXRuntimeError] : 1 : FAIL : Non-zero status code returned while running 17420251976663888867_CoreML_17420251976663888867_2 node. Name:'CoreMLExecutionProvider_17420251976663888867_CoreML_17420251976663888867_2_2' Status Message: Error executing model: Error in dynamically resizing for sequence length (error: -7).\")",
+    "model": "depth_anything_v2_small.onnx",
+    "precision": "fp32"
+  },
+  {
+    "size": 392,
+    "requested_provider": "CoreMLExecutionProvider",
+    "dtype": "fp32",
+    "error": "Fail(\"[ONNXRuntimeError] : 1 : FAIL : Non-zero status code returned while running 17420251976663888867_CoreML_17420251976663888867_2 node. Name:'CoreMLExecutionProvider_17420251976663888867_CoreML_17420251976663888867_2_2' Status Message: Error executing model: Error in dynamically resizing for sequence length (error: -7).\")",
+    "model": "depth_anything_v2_small.onnx",
+    "precision": "fp32"
+  },
+  {
+    "size": 518,
+    "dtype": "<class 'numpy.float32'>",
+    "requested_provider": "CoreMLExecutionProvider",
+    "active_providers": [
+      "CoreMLExecutionProvider",
+      "CPUExecutionProvider"
+    ],
+    "iters": 5,
+    "mean_ms": 1086.4,
+    "min_ms": 810.0,
+    "max_ms": 1395.2,
+    "model": "depth_anything_v2_small.onnx",
+    "precision": "fp32"
+  },
+  {
+    "size": 266,
+    "requested_provider": "CPUExecutionProvider",
+    "dtype": "fp32",
+    "error": "RuntimeException(\"[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION : Non-zero status code returned while running Add node. Name:'node_add_17' Status Message: /Users/cloudtest/vss/_work/1/s/onnxruntime/core/providers/cpu/math/element_wise_ops.h:560 void onnxruntime::BroadcastIterator::Append(ptrdiff_t, ptrdiff_t) axis == 1 || axis == largest was false. Attempting to broadcast an axis by a dimension other than 1. 362 by 1370\\n\")",
+    "model": "depth_anything_v2_small.onnx",
+    "precision": "fp32"
+  },
+  {
+    "size": 392,
+    "requested_provider": "CPUExecutionProvider",
+    "dtype": "fp32",
+    "error": "RuntimeException(\"[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION : Non-zero status code returned while running Add node. Name:'node_add_17' Status Message: /Users/cloudtest/vss/_work/1/s/onnxruntime/core/providers/cpu/math/element_wise_ops.h:560 void onnxruntime::BroadcastIterator::Append(ptrdiff_t, ptrdiff_t) axis == 1 || axis == largest was false. Attempting to broadcast an axis by a dimension other than 1. 785 by 1370\\n\")",
+    "model": "depth_anything_v2_small.onnx",
+    "precision": "fp32"
+  },
+  {
+    "size": 518,
+    "dtype": "<class 'numpy.float32'>",
+    "requested_provider": "CPUExecutionProvider",
+    "active_providers": [
+      "CPUExecutionProvider"
+    ],
+    "iters": 5,
+    "mean_ms": 414.6,
+    "min_ms": 412.4,
+    "max_ms": 416.2,
+    "model": "depth_anything_v2_small.onnx",
+    "precision": "fp32"
+  },
+  {
+    "size": 266,
+    "requested_provider": "CoreMLExecutionProvider",
+    "dtype": "fp16",
+    "error": "RuntimeException(\"[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION : Non-zero status code returned while running Add node. Name:'node_add_17' Status Message: /Users/cloudtest/vss/_work/1/s/onnxruntime/core/providers/cpu/math/element_wise_ops.h:560 void onnxruntime::BroadcastIterator::Append(ptrdiff_t, ptrdiff_t) axis == 1 || axis == largest was false. Attempting to broadcast an axis by a dimension other than 1. 362 by 1370\\n\")",
+    "model": "depth_anything_v2_small_fp16.onnx",
+    "precision": "fp16"
+  },
+  {
+    "size": 392,
+    "requested_provider": "CoreMLExecutionProvider",
+    "dtype": "fp16",
+    "error": "RuntimeException(\"[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION : Non-zero status code returned while running Add node. Name:'node_add_17' Status Message: /Users/cloudtest/vss/_work/1/s/onnxruntime/core/providers/cpu/math/element_wise_ops.h:560 void onnxruntime::BroadcastIterator::Append(ptrdiff_t, ptrdiff_t) axis == 1 || axis == largest was false. Attempting to broadcast an axis by a dimension other than 1. 785 by 1370\\n\")",
+    "model": "depth_anything_v2_small_fp16.onnx",
+    "precision": "fp16"
+  },
+  {
+    "size": 518,
+    "dtype": "<class 'numpy.float16'>",
+    "requested_provider": "CoreMLExecutionProvider",
+    "active_providers": [
+      "CoreMLExecutionProvider",
+      "CPUExecutionProvider"
+    ],
+    "iters": 5,
+    "mean_ms": 456.7,
+    "min_ms": 452.3,
+    "max_ms": 464.3,
+    "model": "depth_anything_v2_small_fp16.onnx",
+    "precision": "fp16"
+  },
+  {
+    "size": 266,
+    "requested_provider": "CPUExecutionProvider",
+    "dtype": "fp16",
+    "error": "RuntimeException(\"[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION : Non-zero status code returned while running Add node. Name:'node_add_17' Status Message: /Users/cloudtest/vss/_work/1/s/onnxruntime/core/providers/cpu/math/element_wise_ops.h:560 void onnxruntime::BroadcastIterator::Append(ptrdiff_t, ptrdiff_t) axis == 1 || axis == largest was false. Attempting to broadcast an axis by a dimension other than 1. 362 by 1370\\n\")",
+    "model": "depth_anything_v2_small_fp16.onnx",
+    "precision": "fp16"
+  },
+  {
+    "size": 392,
+    "requested_provider": "CPUExecutionProvider",
+    "dtype": "fp16",
+    "error": "RuntimeException(\"[ONNXRuntimeError] : 6 : RUNTIME_EXCEPTION : Non-zero status code returned while running Add node. Name:'node_add_17' Status Message: /Users/cloudtest/vss/_work/1/s/onnxruntime/core/providers/cpu/math/element_wise_ops.h:560 void onnxruntime::BroadcastIterator::Append(ptrdiff_t, ptrdiff_t) axis == 1 || axis == largest was false. Attempting to broadcast an axis by a dimension other than 1. 785 by 1370\\n\")",
+    "model": "depth_anything_v2_small_fp16.onnx",
+    "precision": "fp16"
+  },
+  {
+    "size": 518,
+    "dtype": "<class 'numpy.float16'>",
+    "requested_provider": "CPUExecutionProvider",
+    "active_providers": [
+      "CPUExecutionProvider"
+    ],
+    "iters": 5,
+    "mean_ms": 463.0,
+    "min_ms": 448.7,
+    "max_ms": 479.3,
+    "model": "depth_anything_v2_small_fp16.onnx",
+    "precision": "fp16"
+  }
+]

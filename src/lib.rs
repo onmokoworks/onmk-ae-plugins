@@ -154,7 +154,7 @@ impl AdobePluginGlobal for Plugin {
         match cmd {
             ae::Command::About => {
                 out_data.set_return_msg(
-                    "TimeSlice v1.0.0\rSlit-scan effect with map support.\rGPU accelerated. Written in Rust.",
+                    "FrameSlice v1.0.0\rSlit-scan effect with map support.\rGPU accelerated. Written in Rust.",
                 );
             }
             ae::Command::Render {

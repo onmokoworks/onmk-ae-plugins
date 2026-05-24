@@ -3,7 +3,7 @@ use pipl::*;
 fn main() {
     pipl::plugin_build(vec![
         Property::Kind(PIPLType::AEEffect),
-        Property::Name("TimeSlice"),
+        Property::Name("FrameSlice"),
         Property::Category("Time"),
         #[cfg(target_os = "windows")]
         Property::CodeWin64X86("EffectMain"),
@@ -26,8 +26,8 @@ fn main() {
         Property::AE_Effect_Info_Flags(0),
         Property::AE_Effect_Global_OutFlags(OutFlags::empty()),
         Property::AE_Effect_Global_OutFlags_2(OutFlags2::SupportsSmartRender),
-        Property::AE_Effect_Match_Name("TimeSlice"),
+        Property::AE_Effect_Match_Name("FrameSlice"),
         Property::AE_Reserved_Info(10),
-        Property::AE_Effect_Support_URL("https://github.com/onmokoworks/TimeSliceRust"),
+        Property::AE_Effect_Support_URL("https://github.com/onmokoworks/FrameSlice-Ae"),
     ]);
 }

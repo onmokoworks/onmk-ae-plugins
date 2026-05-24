@@ -1,5 +1,5 @@
 [package]
-name = "time-slice"
+name = "frame-slice"
 version = "1.0.0"
 edition = "2021"
 

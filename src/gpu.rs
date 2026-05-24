@@ -118,7 +118,7 @@ impl GpuProcessor {
         .expect("Failed to create GPU device");
 
         let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("timeslice"),
+            label: Some("frameslice"),
             source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("../shader.wgsl"))),
         });
 

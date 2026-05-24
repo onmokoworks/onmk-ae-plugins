@@ -2,6 +2,8 @@
 
 [English](./README.md) | [日本語](./README.ja.md)
 
+![FrameSlice demo](./docs/frameslice-demo.gif)
+
 FrameSlice は、映像を時間方向にスリットスキャンする Adobe After Effects 用エフェクトです。
 
 各ピクセルごとに異なる時刻のフレームを参照し、横方向・縦方向・放射状・マップレイヤーによる時間のずれを作ります。
@@ -80,8 +82,8 @@ After Effects を再起動し、`Time > FrameSlice` からエフェクトを適�
 
 ## Parameters
 
-- `Time Frames`: 時間方向に参照するフレーム範囲
-- `Frame Step`: サンプリングするフレーム間隔
+- `Time Frames`: 時間方向に参照するフレーム範囲、2-1000
+- `Frame Step`: サンプリングするフレーム間隔、1-100
 - `Time Direction`: `Past` / `Future` / `Both` を選択
 - `Slice Mode`: `Horizontal` / `Vertical` / `Radial` / `Map Layer` を選択
 - `Gradient Phase`: 自動生成される時間マップのオフセット

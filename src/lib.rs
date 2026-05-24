@@ -49,9 +49,9 @@ impl AdobePluginGlobal for Plugin {
             "Time Frames",
             ae::SliderDef::setup(|f| {
                 f.set_valid_min(2);
-                f.set_valid_max(120);
+                f.set_valid_max(1000);
                 f.set_slider_min(2);
-                f.set_slider_max(60);
+                f.set_slider_max(240);
                 f.set_default(30);
             }),
         )?;
@@ -61,9 +61,9 @@ impl AdobePluginGlobal for Plugin {
             "Frame Step",
             ae::SliderDef::setup(|f| {
                 f.set_valid_min(1);
-                f.set_valid_max(10);
+                f.set_valid_max(100);
                 f.set_slider_min(1);
-                f.set_slider_max(5);
+                f.set_slider_max(30);
                 f.set_default(1);
             }),
         )?;

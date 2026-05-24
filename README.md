@@ -2,6 +2,8 @@
 
 [English](./README.md) | [日本語](./README.ja.md)
 
+![FrameSlice demo](./docs/frameslice-demo.gif)
+
 FrameSlice is an Adobe After Effects effect plug-in for creating slit-scan style time offsets inside image layers.
 
 It samples each pixel from a different point in time, using horizontal, vertical, radial, or map-layer driven time maps.
@@ -80,8 +82,8 @@ Generated `.aex` / `.dll` files are not committed to Git.
 
 ## Parameters
 
-- `Time Frames`: frame range sampled along the time axis
-- `Frame Step`: interval between sampled frames
+- `Time Frames`: frame range sampled along the time axis, 2-1000
+- `Frame Step`: interval between sampled frames, 1-100
 - `Time Direction`: chooses `Past`, `Future`, or `Both`
 - `Slice Mode`: chooses `Horizontal`, `Vertical`, `Radial`, or `Map Layer`
 - `Gradient Phase`: offsets the generated time map

@@ -1,7 +1,7 @@
 # Depth ONNX
 
-After Effects 2025+ 向け SmartFX プラグイン
-ONNX Runtime で単眼深度マップを推論できます。
+After Effects 2025+ 向け SmartFX プラグイン。
+ONNX Runtime を用いて深度マップを推論できます。
 
 Depth Anything などの ONNX モデルは同梱しません。下記 `DepthONNX/models/` にモデルフォルダ（`manifest.json` と `.onnx`）を置いてください。  
 リポジトリには [Depth Anything V2 Small](https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf) 向けの設定例（`model/depth_anything_v2_small/manifest.json`）が入っています。プラグインは Depth Anything 専用ではなく、各フォルダの `manifest.json` に書かれた ONNX を読み込んで推論する汎用の Depth 推論ホストです。

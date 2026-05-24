@@ -5,6 +5,7 @@ ONNX Runtime を用いて深度マップを推論できます。
 
 Depth Anything などの ONNX モデルは同梱しません。下記 `DepthONNX/models/` にモデルフォルダ（`manifest.json` と `.onnx`）を置いてください。  
 リポジトリには [Depth Anything V2 Small](https://huggingface.co/depth-anything/Depth-Anything-V2-Small-hf) 向けの設定例（`model/depth_anything_v2_small/manifest.json`）が入っています。プラグインは Depth Anything 専用ではなく、各フォルダの `manifest.json` に書かれた ONNX を読み込んで推論する汎用の Depth 推論ホストです。
+Depth Anything V2 smallで動作を確認しています。
 
 ## モデルの置き場所
 

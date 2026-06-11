@@ -1,6 +1,6 @@
 # Mac 対応 & GPU 対応 タスク整理
 
-現状: Windows CPU (rayon 並列) のみ。`build.rs` には Mac / GPU フラグは入っているが、実装・検証は未着手。
+現状: Windows CPU (rayon 並列) のみ。`rust/build.rs` には Mac / GPU フラグは入っているが、実装・検証は未着手。
 
 ---
 
@@ -14,14 +14,14 @@
   - 他人に配る場合は Apple Developer ID 署名 + 公証 (notarization) が必要
 
 ### 既に対応済みの箇所
-- `build.rs`: `Property::CodeMacIntel64("EffectMain")`, `Property::CodeMacARM64("EffectMain")` は設定済み
-- `justfile` → `AdobePlugin.just` を import している。この共通 justfile が .plugin バンドル生成レシピを持っているはず (要確認)
+- `rust/build.rs`: `Property::CodeMacIntel64("EffectMain")`, `Property::CodeMacARM64("EffectMain")` は設定済み
+- `rust/justfile` → `rust/AdobePlugin.just` を import している。この共通 justfile が .plugin バンドル生成レシピを持っているはず (要確認)
 
 ### コード側の作業
-- [ ] `AdobePlugin.just` の内容を読み、`just build-mac` 相当のレシピがあるか確認
+- [ ] `rust/AdobePlugin.just` の内容を読み、`just build-mac` 相当のレシピがあるか確認
 - [ ] rayon は macOS でそのまま動くので変更不要
 - [ ] `#[cfg(target_os = "macos")]` 条件分岐が必要な箇所は今のところない想定 (要ビルド時に確認)
-- [ ] `Cargo.toml` の `[profile.release]` は macOS でも共通で OK
+- [ ] `rust/Cargo.toml` の `[profile.release]` は macOS でも共通で OK
 
 ### ビルド・パッケージング作業
 - [ ] `rustup target add x86_64-apple-darwin aarch64-apple-darwin` (Mac 上で)
@@ -83,7 +83,7 @@
 ### 共通の前作業 (どの方針でも必要)
 - [ ] `after-effects` crate の `src/pf/gpu.rs` を読み、`GpuDeviceSetup` / `GpuDeviceSetdown` / `SmartRenderGpu` の Rust 側の API 形状を把握
 - [ ] サンプル `examples/rust_gpu/` (wgpu + WGSL + rust-gpu) を読み、`SmartRenderGpu` 時の入力取り出し方・出力書き戻し方を確認
-- [ ] `build.rs` の `OutFlags2::SupportsGpuRenderF32` は既に ON になっているので追加不要
+- [ ] `rust/build.rs` の `OutFlags2::SupportsGpuRenderF32` は既に ON になっているので追加不要
 - [ ] `lib.rs` で `Command::SmartRenderGpu { extra }` を別ハンドラに分岐 (現在は CPU にフォールバック)
 
 ### アルゴリズム GPU 化の分解
@@ -110,10 +110,10 @@ refract.rs の処理段階を GPU kernel 単位に分ける:
 - [ ] テクスチャ: input RGBA f32, bg RGBA f32, mask luminance R32F, height R32F (ping-pong), normals RG32F, edge_mask R32F, output RGBA f32
 
 ### 方針 A (ネイティブカーネル) を選んだ場合のタスク
-- [ ] `kernels/refract.cu` (CUDA) を書く
-- [ ] `kernels/refract.metal` (Metal) を書く
-- [ ] `kernels/refract.cl` (OpenCL) を書く (macOS Intel 用。AMD/Intel GPU 用)
-- [ ] `build.rs` を拡張:
+- [ ] `rust/kernels/refract.cu` (CUDA) を書く
+- [ ] `rust/kernels/refract.metal` (Metal) を書く
+- [ ] `rust/kernels/refract.cl` (OpenCL) を書く (macOS Intel 用。AMD/Intel GPU 用)
+- [ ] `rust/build.rs` を拡張:
   - Windows: `nvcc` 経由で .cu → .ptx または .cubin
   - macOS: `xcrun metal` → .air → .metallib
   - OpenCL: そのまま文字列として埋め込み
@@ -123,8 +123,8 @@ refract.rs の処理段階を GPU kernel 単位に分ける:
 - [ ] AE が渡してくる GPU device ポインタ (`PF_GPUDeviceInfo`) を使う。Rust ラッパがなければ `after-effects-sys` 経由で FFI 呼び出し
 
 ### 方針 B (wgpu) を選んだ場合のタスク
-- [ ] `Cargo.toml` に `wgpu`, `pollster`, `bytemuck` を追加
-- [ ] `kernels/refract.wgsl` を書く (height blur / edge blur / normals / refract main の 4 entry point)
+- [ ] `rust/Cargo.toml` に `wgpu`, `pollster`, `bytemuck` を追加
+- [ ] `rust/kernels/refract.wgsl` を書く (height blur / edge blur / normals / refract main の 4 entry point)
 - [ ] プラグインロード時 (GlobalSetup) に wgpu instance / adapter / device を 1 回初期化してキャッシュ (per-effect 再初期化は遅い)
 - [ ] `SmartRenderGpu` (あるいは `SmartRender` 内で条件分岐) で:
   1. AE の input world 内容を staging buffer 経由で wgpu texture に upload

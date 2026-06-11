@@ -2,12 +2,15 @@
 
 [English](./README.md) | [日本語](./README.ja.md)
 
-RefractionDispersion は、シェイプまたはマスクレイヤーからガラス風の屈折と色分散を作る Adobe After Effects エフェクトプラグインです。
+RefractionDispersion は、マスクまたはシェイプレイヤーからガラス風の屈折、色分散、ハイライト表現を作る Adobe After Effects 用エフェクトプラグインです。
 
-マスクの輝度/アルファから高さ場を作り、疑似法線、RGB または 6ch の分散サンプリング、Blinn-Phong 風のハイライトを合成します。実用レンダー経路は Rayon 並列の CPU 実装です。CUDA 経路は配線確認用の実験段階で、現在は passthrough kernel です。
+選択したレイヤーから高さ場を作り、疑似法線を計算し、入力または任意の背景レイヤーを RGB / 6ch 分散でサンプリングしてから元画像へ合成します。CPU レンダラーと任意の `wgpu` レンダラーを持っています。
+
+> 仕様、UI、パラメータ名、初期値は今後変更される可能性があります。
 
 ## 名前
 
+- リポジトリ名: `RefractionDispersion-Ae`
 - 表示名: `RefractionDispersion`
 - After Effects match name: `RefractionDispersion`
 - プラグインファイル名:
@@ -18,23 +21,26 @@ RefractionDispersion は、シェイプまたはマスクレイヤーからガ�
 
 - シェイプ/マスクレイヤー駆動の屈折
 - 任意の背景レイヤー参照
-- RGB 別の IOR 制御
-- RGB または 6ch 分散モード
-- X/Y 個別の色収差制御
-- Height Blur、Edge Blur、Fresnel、Diffuse、Specular、Saturation、Mix
+- RGB Split / Base IOR モード
+- RGB または 6ch の色分散
+- マスター分散量、チャンネル別 IOR、軸別 chromatic aberration
+- Height Source、Coverage Source、Height Blur、Map Blur、Edge Mode
+- Fresnel、Diffuse、Specular、Saturation、Brightness、Contrast、Affected Blur、Mix
+- Output / Input / Mask Map / Delta Map / Debug 出力
 - Smart Render 対応
+- 任意の `wgpu` レンダリング経路と CPU フォールバック
 
-## 検証状態
+## 検証状況
 
-- CUDA Toolkit 13.2 が入った Windows 環境で `cargo check` 済み
-- 現在の実用レンダー経路は CPU/Rayon
-- CUDA バックエンドは実験用 passthrough のため、実出力では `Use GPU (CUDA)` を無効にする
-- 現在のピクセル経路は ARGB 8-bit buffer
-- macOS のパッケージングと公証は未検証
+- Windows のリリースビルドスクリプトを開発中に使用しています。
+- 開発環境で `wgpu` smoke test が通っています。
+- CPU レンダラーを基準実装として扱っています。
+- 現在のピクセル経路は ARGB 8-bit buffer です。
+- macOS Apple Silicon 向けビルドスクリプトはありますが、署名と notarization は未提供です。
 
 ## ビルド
 
-Adobe After Effects SDK と Rust/MSVC toolchain が必要です。Rust プロジェクトは `rust/` にあります。Windows build では `rust/build.rs` が CUDA PTX をコンパイルするため、CUDA Toolkit の `nvcc` も必要です。
+Adobe After Effects SDK と Rust toolchain が必要です。Rust プロジェクトは `rust/` にあります。
 
 Windows ではリポジトリルートから実行します。
 
@@ -62,7 +68,7 @@ rust/target/release/RefractionDispersion.plugin
 
 ## インストール
 
-### リリースビルドを使う
+### リリースビルドを使う場合
 
 Windows では GitHub Releases から `RefractionDispersion.aex` をダウンロードし、After Effects を終了してから plug-ins フォルダへコピーします。
 
@@ -83,7 +89,7 @@ unzip RefractionDispersion-macos-arm64.plugin.zip
 sudo cp -R RefractionDispersion.plugin "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/"
 ```
 
-ダウンロードした `.plugin` が Gatekeeper にブロックされる場合は、必要に応じて quarantine 属性を外します。
+ダウンロードした `.plugin` が macOS Gatekeeper でブロックされる場合は、必要に応じて quarantine 属性を外します。
 
 ```bash
 sudo xattr -dr com.apple.quarantine "/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore/RefractionDispersion.plugin"
@@ -91,39 +97,49 @@ sudo xattr -dr com.apple.quarantine "/Library/Application Support/Adobe/Common/P
 
 After Effects を再起動し、`Distort > RefractionDispersion` から適用します。
 
-### ローカルビルドを入れる
+### ローカルビルドをインストールする場合
 
-After Effects を終了し、管理者 PowerShell で実行します。
+After Effects を終了してから、管理者権限の PowerShell で実行します。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build_release.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\install_refractiondispersion_admin.ps1
 ```
 
-macOS のローカルビルドでは、生成された `rust/target/release/RefractionDispersion.plugin` bundle を MediaCore フォルダに手動コピーします。
+macOS のローカルビルドでは、生成された `rust/target/release/RefractionDispersion.plugin` bundle を MediaCore フォルダへ手動コピーします。
 
 生成された `.aex` / `.plugin` は Git にコミットしません。配布ビルドは GitHub Release の artifacts として添付します。
 
-macOS リリース artifact は Apple Silicon / arm64 向けです。現時点では ad-hoc 署名のみで、Developer ID 署名と notarization は未対応です。macOS では CUDA を無効化し、CPU renderer を使います。
+macOS リリース artifact は Apple Silicon / arm64 向けです。現時点では ad-hoc 署名のみで、Developer ID 署名と notarization は未対応です。
 
 ## パラメータ
 
-- `IOR Red`, `IOR Green`, `IOR Blue`: チャンネル別の屈折率
-- `Refract Power`: 背景サンプリングのずれ量
-- `Chromatic Aberration`: 共通の色分散量
-- `Per-axis Chroma`: X/Y 個別色収差を有効化
-- `Chromatic Aberration X`, `Chromatic Aberration Y`: 軸別の色収差量
+- `IOR Mode`: RGB Split / Base IOR の切り替え
+- `Base IOR`: Base IOR モードで使う屈折率
+- `Refract Power`: 屈折サンプリングのオフセット量
 - `Samples`: ピクセルあたりのサンプル数
-- `Fresnel Power`, `Shininess`, `Diffuseness`: ハイライトとライティング調整
-- `Light Angle X`, `Light Angle Y`: ライト方向
-- `Saturation`: 屈折サンプリング後の彩度
-- `Height Strength`, `Height Blur`: マスク由来の高さと法線の調整
-- `Edge Blur`: 合成マスクの柔らかさ
+- `Edge Mode`: 画面外サンプリングの扱い
+- `Dispersion`: 色分散のマスター量
+- `IOR Red`, `IOR Green`, `IOR Blue`: RGB チャンネル別の屈折率
+- `Chromatic Aberration`: 共通の色収差量
+- `Per-axis Chroma`: X/Y 個別の色収差を有効化
+- `Chromatic Aberration X`, `Chromatic Aberration Y`: 軸別の色収差量
 - `Use 6ch Dispersion (rygcbv)`: 6ch 分散モード
 - `Mask (shape)`: 高さ/マスクとして使うレイヤー
+- `Map Blur`: 高さ抽出前のマップブラー
+- `Height Source`: 高さ場に使うチャンネル
+- `Invert Height`: 高さ場を反転
+- `Coverage Source`: 影響範囲に使うチャンネル
+- `Height Strength`, `Height Blur`: 疑似法線の強さと滑らかさ
+- `Edge Blur`: 出力マスクの柔らかさ
+- `Fresnel Power`, `Shininess`, `Diffuseness`: ハイライトとライティング調整
+- `Light Angle X`, `Light Angle Y`: ライト方向
+- `Saturation`, `Affected Brightness`, `Affected Contrast`: 影響範囲の色調整
+- `Affected Box Blur`: 影響範囲内のブラー
 - `Background`: 背景としてサンプリングする任意レイヤー
-- `Mix with Original`: 元画像とのブレンド量
-- `Use GPU (CUDA)`: 実験用 passthrough backend。デフォルト無効
+- `Mix with Original`: 元画像とのブレンド
+- `Output Mode`: Output / Input / Mask Map / Delta Map / Debug Regions の切り替え
+- `Use GPU`: 任意の `wgpu` レンダリング経路を有効化
 
 ## 開発チェック
 
@@ -135,11 +151,17 @@ cargo test
 cargo build --release
 ```
 
+## 参考・謝辞
+
+初期の表現設計では、Maxime Heckel 氏の記事を参考にしました。
+
+- [Refraction, Dispersion, and Other Shader Light Effects](https://blog.maximeheckel.com/posts/refraction-dispersion-and-other-shader-light-effects/)
+
 ## メモ
 
-- `rust/kernels/refract.cu` は CUDA device setup と転送を確認する passthrough kernel です。
-- CPU 版の参照実装は `rust/src/refract.rs` です。
-- macOS と本格 GPU 化の作業は `docs/mac-gpu-roadmap.md` に整理しています。
+- CPU レンダラーは `rust/src/refract.rs` にあります。
+- `wgpu` レンダラーは `rust/src/gpu.rs` と `rust/shader.wgsl` にあります。
+- macOS と GPU 対応の作業は `docs/mac-gpu-roadmap.md` に整理しています。
 
 ## ライセンス
 

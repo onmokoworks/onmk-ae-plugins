@@ -1,5 +1,0 @@
-PluginName := "MinimaxMap"
-BinaryName := "minimax_map"
-BundleIdentifier := "com.custom.MinimaxMap"
-
-import "AdobePlugin.just"

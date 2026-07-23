@@ -36,6 +36,9 @@ pub fn minimax(
     let do_color = mp.channel == CH_COLOR || mp.channel == CH_COLOR_ALPHA;
 
     let mut ch_a = vec![0u8; npx];
+    // AE's 8-bit effect buffer is premultiplied ARGB.  Morphology must run
+    // on straight RGB values; otherwise transparent black participates in
+    // the min/max and produces dark fringes or RGB values larger than alpha.
     let mut ch_r = vec![0u8; npx];
     let mut ch_g = vec![0u8; npx];
     let mut ch_b = vec![0u8; npx];
@@ -43,9 +46,9 @@ pub fn minimax(
     for i in 0..npx {
         let off = i * 4;
         ch_a[i] = src[off];
-        ch_r[i] = src[off + 1];
-        ch_g[i] = src[off + 2];
-        ch_b[i] = src[off + 3];
+        ch_r[i] = unpremultiply(src[off + 1], src[off]);
+        ch_g[i] = unpremultiply(src[off + 2], src[off]);
+        ch_b[i] = unpremultiply(src[off + 3], src[off]);
     }
 
     let do_h = (mp.direction == DIR_HORIZONTAL || mp.direction == DIR_BOTH) && radius_h > 0.0;
@@ -80,9 +83,12 @@ pub fn minimax(
     for i in 0..npx {
         let off = i * 4;
         out[off] = lerp(src[off], ch_a[i], mix);
-        out[off + 1] = lerp(src[off + 1], ch_r[i], mix);
-        out[off + 2] = lerp(src[off + 2], ch_g[i], mix);
-        out[off + 3] = lerp(src[off + 3], ch_b[i], mix);
+        let straight_r = lerp(unpremultiply(src[off + 1], src[off]), ch_r[i], mix);
+        let straight_g = lerp(unpremultiply(src[off + 2], src[off]), ch_g[i], mix);
+        let straight_b = lerp(unpremultiply(src[off + 3], src[off]), ch_b[i], mix);
+        out[off + 1] = premultiply(straight_r, out[off]);
+        out[off + 2] = premultiply(straight_g, out[off]);
+        out[off + 3] = premultiply(straight_b, out[off]);
     }
 
     out
@@ -506,4 +512,58 @@ fn lerp(a: u8, b: u8, t: f32) -> u8 {
 
 fn blend_channels(a: &[u8], b: &[u8], t: f32) -> Vec<u8> {
     a.iter().zip(b).map(|(&av, &bv)| lerp(av, bv, t)).collect()
+}
+
+#[inline]
+fn unpremultiply(channel: u8, alpha: u8) -> u8 {
+    if alpha == 0 {
+        0
+    } else {
+        ((channel as u16 * 255 + alpha as u16 / 2) / alpha as u16).min(255) as u8
+    }
+}
+
+#[inline]
+fn premultiply(channel: u8, alpha: u8) -> u8 {
+    ((channel as u16 * alpha as u16 + 127) / 255) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(amount: f32, channel: i32) -> MinimaxParams {
+        MinimaxParams {
+            amount,
+            ratio_x: 1.0,
+            ratio_y: 0.0,
+            direction: DIR_HORIZONTAL,
+            channel,
+            repeat_edge: true,
+            mix: 1.0,
+            invert_map: false,
+        }
+    }
+
+    #[test]
+    fn color_max_does_not_create_rgb_in_zero_alpha_pixels() {
+        // Transparent black followed by opaque red, in premultiplied ARGB.
+        let src = vec![0, 0, 0, 0, 255, 255, 0, 0];
+        let out = minimax(&params(1.0, CH_COLOR), &src, 2, 1, None);
+
+        assert_eq!(&out[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&out[4..8], &[255, 255, 0, 0]);
+    }
+
+    #[test]
+    fn alpha_max_keeps_output_premultiplied() {
+        let src = vec![0, 0, 0, 0, 128, 128, 0, 0];
+        let out = minimax(&params(1.0, CH_ALPHA), &src, 2, 1, None);
+
+        for pixel in out.chunks_exact(4) {
+            assert!(pixel[1] <= pixel[0]);
+            assert!(pixel[2] <= pixel[0]);
+            assert!(pixel[3] <= pixel[0]);
+        }
+    }
 }

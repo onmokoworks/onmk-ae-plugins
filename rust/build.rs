@@ -24,10 +24,9 @@ fn main() {
             build: 1,
         },
         Property::AE_Effect_Info_Flags(0),
-        Property::AE_Effect_Global_OutFlags(OutFlags::DeepColorAware),
+        Property::AE_Effect_Global_OutFlags(OutFlags::None),
         Property::AE_Effect_Global_OutFlags_2(
-            OutFlags2::FloatColorAware
-                | OutFlags2::SupportsSmartRender
+            OutFlags2::SupportsSmartRender
                 | OutFlags2::SupportsThreadedRendering
                 | OutFlags2::SupportsGetFlattenedSequenceData,
         ),

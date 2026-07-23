@@ -331,9 +331,9 @@ fn smart_pre_render(
     extra.set_result_rect(res);
     extra.set_max_result_rect(max_res);
 
-    // Checkout map layer (param index 7, checkout_id = MAP_CHECKOUT_ID)
+    // Checkout map layer (param index 8: input is index 0, checkout_id = MAP_CHECKOUT_ID)
     let _ = cb.checkout_layer(
-        7,
+        8,
         MAP_CHECKOUT_ID,
         &req,
         in_data.current_time(),

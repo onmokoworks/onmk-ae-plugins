@@ -1,0 +1,24 @@
+[package]
+name = "celglow"
+version = "0.2.0"
+edition = "2021"
+authors = ["onmk"]
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+after-effects = { git = "https://github.com/virtualritz/after-effects.git" }
+wgpu = "26"
+pollster = "0.4"
+futures-intrusive = "0.5"
+parking_lot = "0.12"
+
+[build-dependencies]
+pipl = { git = "https://github.com/virtualritz/after-effects.git" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

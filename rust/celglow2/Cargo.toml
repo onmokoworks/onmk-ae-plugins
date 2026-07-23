@@ -1,0 +1,23 @@
+[package]
+name = "celglow2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+after-effects = { git = "https://github.com/virtualritz/after-effects.git" }
+celglow-core = { path = "../celglow-core" }
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+
+[build-dependencies]
+pipl = { git = "https://github.com/virtualritz/after-effects.git" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

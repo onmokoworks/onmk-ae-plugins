@@ -67,6 +67,41 @@ enum Params {
     SourceThreshold = 42,
     SourceThresholdSoftness = 43,
     View = 44,
+
+    // UI-only topic identifiers used by the opt-in CelGlow v3 build. They
+    // are appended so the default CelGlow v2 stream remains unchanged.
+    #[cfg(feature = "grouped-ui")]
+    GroupQuickStart = 45,
+    #[cfg(feature = "grouped-ui")]
+    GroupQuickEnd = 46,
+    #[cfg(feature = "grouped-ui")]
+    GroupSourceStart = 47,
+    #[cfg(feature = "grouped-ui")]
+    GroupSourceEnd = 48,
+    #[cfg(feature = "grouped-ui")]
+    GroupRingsStart = 49,
+    #[cfg(feature = "grouped-ui")]
+    GroupRingsEnd = 50,
+    #[cfg(feature = "grouped-ui")]
+    GroupWobbleStart = 51,
+    #[cfg(feature = "grouped-ui")]
+    GroupWobbleEnd = 52,
+    #[cfg(feature = "grouped-ui")]
+    GroupRoughenStart = 53,
+    #[cfg(feature = "grouped-ui")]
+    GroupRoughenEnd = 54,
+    #[cfg(feature = "grouped-ui")]
+    GroupHazeStart = 55,
+    #[cfg(feature = "grouped-ui")]
+    GroupHazeEnd = 56,
+    #[cfg(feature = "grouped-ui")]
+    GroupColorStart = 57,
+    #[cfg(feature = "grouped-ui")]
+    GroupColorEnd = 58,
+    #[cfg(feature = "grouped-ui")]
+    GroupDiagnosticsStart = 59,
+    #[cfg(feature = "grouped-ui")]
+    GroupDiagnosticsEnd = 60,
 }
 
 #[cfg(test)]
@@ -177,7 +212,90 @@ macro_rules! color {
 }
 
 impl AdobePluginGlobal for Plugin {
+    #[allow(unreachable_code)]
     fn params_setup(&self, p: &mut ae::Parameters<Params>, _i: ae::InData, _o: ae::OutData) -> Result<(), ae::Error> {
+        #[cfg(feature = "grouped-ui")]
+        {
+            p.add_group(Params::GroupQuickStart, Params::GroupQuickEnd, "Quick Controls", false, |p| {
+                popup!(p, SourceChannel, "Source Channel", &["Alpha", "Luma", "Luma + Alpha"], 3);
+                slider!(p, SourceSpread, "Source Spread (px)", 0.0, 500.0, 260.0, 1);
+                slider!(p, RingCount, "Ring Count", 1.0, 64.0, 12.0, 0);
+                slider!(p, RingLineWidth, "Line Width (%)", 5.0, 95.0, 30.0, 1);
+                slider!(p, RingCoreLevel, "Core Level (%)", 10.0, 100.0, 70.0, 1);
+                slider!(p, Opacity, "Glow Opacity (%)", 0.0, 200.0, 75.0, 1);
+                Ok(())
+            })?;
+            p.add_group(Params::GroupSourceStart, Params::GroupSourceEnd, "Source / Threshold", false, |p| {
+                slider!(p, SourceGain, "Source Gain (%)", 0.0, 400.0, 100.0, 1);
+                slider!(p, SourceGamma, "Source Gamma", 0.2, 3.0, 1.0, 2);
+                slider!(p, SourceFieldGamma, "Field Gamma", 0.2, 3.0, 1.0, 2);
+                slider!(p, SourceThreshold, "Source Threshold (%)", 0.0, 100.0, 0.0, 1);
+                slider!(p, SourceThresholdSoftness, "Threshold Softness (%)", 0.0, 100.0, 0.0, 1);
+                Ok(())
+            })?;
+            p.add_group(Params::GroupRingsStart, Params::GroupRingsEnd, "Bands / Rings", true, |p| {
+                slider!(p, RingDistribution, "Ring Distribution", 0.3, 3.0, 1.0, 2);
+                slider!(p, RingHardness, "Line Hardness (%)", 0.0, 100.0, 80.0, 1);
+                slider!(p, RingCoreSoftness, "Core Softness (%)", 0.0, 50.0, 10.0, 1);
+                slider!(p, RingOuterFalloff, "Outer Falloff", 0.0, 4.0, 0.0, 2);
+                slider!(p, RingBrightness, "Brightness Variation (%)", 0.0, 100.0, 0.0, 1);
+                slider!(p, RingScramble, "Color Scramble (%)", 0.0, 100.0, 0.0, 1);
+                slider!(p, RingSeed, "Random Seed", 0.0, 65535.0, 1.0, 0);
+                slider!(p, RingPhase, "Ring Phase (deg)", -360.0, 360.0, 0.0, 1);
+                p.add(Params::RingShowOutermost, "Show Outermost", ae::CheckBoxDef::setup(|f| { f.set_default(false); f.set_label("On"); }))?;
+                Ok(())
+            })?;
+            p.add_group(Params::GroupWobbleStart, Params::GroupWobbleEnd, "Turbulent Displace", true, |p| {
+                slider!(p, WobbleAmount, "Amount (px)", 0.0, 100.0, 3.0, 1);
+                slider!(p, WobbleScale, "Scale (px)", 2.0, 200.0, 24.0, 1);
+                slider!(p, WobbleComplexity, "Complexity", 1.0, 4.0, 1.0, 0);
+                slider!(p, WobbleEvolution, "Evolution (deg)", 0.0, 360.0, 0.0, 1);
+                Ok(())
+            })?;
+            p.add_group(Params::GroupRoughenStart, Params::GroupRoughenEnd, "Roughen Edges", true, |p| {
+                popup!(p, TextureEdgeType, "Edge Type", &["Cut", "Roughen"], 1);
+                slider!(p, TextureBorder, "Border (px)", 0.0, 50.0, 4.0, 1);
+                slider!(p, TextureInfluence, "Fractal Influence (px)", 0.0, 50.0, 3.5, 1);
+                slider!(p, TextureScale, "Scale (px)", 2.0, 200.0, 3.5, 1);
+                slider!(p, TextureSharpness, "Sharpness", 0.0, 20.0, 20.0, 1);
+                slider!(p, TextureComplexity, "Complexity", 1.0, 4.0, 3.0, 0);
+                slider!(p, TextureEvolution, "Evolution (deg)", 0.0, 360.0, 0.0, 1);
+                Ok(())
+            })?;
+            p.add_group(Params::GroupHazeStart, Params::GroupHazeEnd, "Fractal Haze", true, |p| {
+                slider!(p, UnevenAmount, "Amount (%)", 0.0, 100.0, 28.0, 1);
+                slider!(p, UnevenScale, "Scale (px)", 50.0, 20000.0, 430.0, 1);
+                slider!(p, UnevenEvolution, "Evolution (deg)", 0.0, 360.0, 0.0, 1);
+                Ok(())
+            })?;
+            p.add_group(Params::GroupColorStart, Params::GroupColorEnd, "Color / Composite", true, |p| {
+                popup!(p, ColorMode, "Color Mode", &["Fill", "Inner - Outer", "Rainbow", "Source Color"], 1);
+                color!(p, FillColor, "Fill Color", 51, 92, 158);
+                color!(p, InnerColor, "Inner Color", 255, 255, 255);
+                color!(p, OuterColor, "Outer Color", 128, 204, 255);
+                slider!(p, RainbowCycles, "Rainbow Cycles", 0.25, 8.0, 1.0, 2);
+                slider!(p, RainbowSaturation, "Rainbow Saturation (%)", 0.0, 100.0, 70.0, 1);
+                popup!(p, BlendMode, "Blend Mode", &["Add", "Screen", "Normal"], 1);
+                popup!(p, Placement, "Placement", &["Behind Source", "In Front"], 1);
+                p.add(Params::GlowAlpha, "Glow Alpha", ae::CheckBoxDef::setup(|f| { f.set_default(true); f.set_label("On"); }))?;
+                popup!(p, Quality, "Quality", &["Draft (GPU)", "Normal", "Best"], 2);
+                Ok(())
+            })?;
+            p.add_group(Params::GroupDiagnosticsStart, Params::GroupDiagnosticsEnd, "Diagnostics", true, |p| {
+                p.add_with_flags(
+                    Params::View,
+                    "View",
+                    ae::PopupDef::setup(|f| {
+                        f.set_options(&["Result", "Input", "Field", "Radius", "Rings", "Texture Mask"]);
+                        f.set_default(1);
+                    }),
+                    ae::ParamFlag::USE_VALUE_FOR_OLD_PROJECTS,
+                    ae::ParamUIFlags::NONE,
+                )?;
+                Ok(())
+            })?;
+            return Ok(());
+        }
         popup!(p, SourceChannel, "Source Channel", &["Alpha", "Luma", "Luma + Alpha"], 3);
         slider!(p, SourceGain, "Source Gain (%)", 0.0, 400.0, 100.0, 1);
         slider!(p, SourceGamma, "Source Gamma", 0.2, 3.0, 1.0, 2);
@@ -238,7 +356,10 @@ impl AdobePluginGlobal for Plugin {
 
     fn handle_command(&self, cmd: ae::Command, i: ae::InData, mut o: ae::OutData, p: &mut ae::Parameters<Params>) -> Result<(), ae::Error> {
         match cmd {
-            ae::Command::About => { o.set_return_msg("CelGlow v2"); Ok(()) }
+            ae::Command::About => {
+                o.set_return_msg(if cfg!(feature = "grouped-ui") { "CelGlow v3" } else { "CelGlow v2" });
+                Ok(())
+            }
             ae::Command::GlobalSetup => {
                 o.set_out_flag(ae::OutFlags::DeepColorAware, true);
                 o.set_out_flag(ae::OutFlags::PixIndependent, true);
@@ -248,6 +369,8 @@ impl AdobePluginGlobal for Plugin {
                 o.set_out_flag2(ae::OutFlags2::SupportsGpuRenderF32, true);
                 o.set_out_flag2(ae::OutFlags2::SupportsThreadedRendering, true);
                 o.set_out_flag2(ae::OutFlags2::SupportsGetFlattenedSequenceData, true);
+                #[cfg(feature = "grouped-ui")]
+                o.set_out_flag2(ae::OutFlags2::ParamGroupStartCollapsedFlag, true);
                 Ok(())
             }
             ae::Command::UserChangedParam { .. } => Ok(()),

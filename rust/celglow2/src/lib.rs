@@ -11,6 +11,11 @@ struct CelGlowPlane {
     input_plane: ae::Rect,
 }
 
+// SmartFX checkout IDs are not parameter ordinals. Adobe requires each ID to
+// be positive and unique within a pre-render/render pair. Parameter index 0 is
+// still the effect input; ID 1 is how we retrieve that checkout in SmartRender.
+const INPUT_CHECKOUT_ID: u32 = 1;
+
 /// Stable AE parameter ordinals.
 ///
 /// The first parameter slot exposed by the PF host is 1 (slot 0 is the input
@@ -388,7 +393,7 @@ impl AdobePluginGlobal for Plugin {
                 request.rect = inflate_rect(request.rect.into(), pad).into();
                 let result = extra.callbacks().checkout_layer(
                     0,
-                    0,
+                    INPUT_CHECKOUT_ID as i32,
                     &request,
                     i.current_time(),
                     i.time_step(),
@@ -586,12 +591,12 @@ fn write_rgba_f32_to_layer(flat: &[f32], layer: &mut ae::Layer, w: usize, h: usi
 
 fn smart_render(extra: &ae::pf::SmartRenderExtra, in_data: &ae::InData, params: &ae::Parameters<Params>) -> Result<(), ae::Error> {
     let cb = extra.callbacks();
-    let Some(input_world) = cb.checkout_layer_pixels(0)? else { return Ok(()); };
-    let Some(mut output_world) = cb.checkout_output()? else { let _ = cb.checkin_layer_pixels(0); return Ok(()); };
+    let Some(input_world) = cb.checkout_layer_pixels(INPUT_CHECKOUT_ID)? else { return Ok(()); };
+    let Some(mut output_world) = cb.checkout_output()? else { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Ok(()); };
     let (rgba, iw, ih) = layer_to_rgba_f32(&input_world);
     let ow = output_world.width() as usize;
     let oh = output_world.height() as usize;
-    if iw == 0 || ih == 0 || ow == 0 || oh == 0 { let _ = cb.checkin_layer_pixels(0); return Ok(()); }
+    if iw == 0 || ih == 0 || ow == 0 || oh == 0 { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Ok(()); }
     let plane = extra.pre_render_data::<CelGlowPlane>().map(|v| v.input_plane).unwrap_or(ae::Rect { left: 0, top: 0, right: iw as i32, bottom: ih as i32 });
     let output_origin = (in_data.output_origin().h, in_data.output_origin().v);
     // The diagnostic view is still a real core render.  The old adapter used
@@ -637,7 +642,7 @@ fn smart_render(extra: &ae::pf::SmartRenderExtra, in_data: &ae::InData, params: 
         }
     }
     write_rgba_f32_to_layer(&out, &mut output_world, ow, oh);
-    let _ = cb.checkin_layer_pixels(0);
+    let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID);
     Ok(())
 }
 
@@ -646,19 +651,19 @@ fn smart_render_gpu(extra: &ae::pf::SmartRenderExtra, in_data: &ae::InData, para
         return smart_render(extra, in_data, params);
     }
     let cb = extra.callbacks();
-    let Some(input_world) = cb.checkout_layer_pixels(0)? else { return Ok(()); };
-    let Some(mut output_world) = cb.checkout_output()? else { let _ = cb.checkin_layer_pixels(0); return Ok(()); };
+    let Some(input_world) = cb.checkout_layer_pixels(INPUT_CHECKOUT_ID)? else { return Ok(()); };
+    let Some(mut output_world) = cb.checkout_output()? else { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Ok(()); };
     let (rgba, iw, ih) = layer_to_rgba_f32(&input_world);
     let ow = output_world.width() as usize;
     let oh = output_world.height() as usize;
-    if iw == 0 || ih == 0 || ow == 0 || oh == 0 { let _ = cb.checkin_layer_pixels(0); return Ok(()); }
+    if iw == 0 || ih == 0 || ow == 0 || oh == 0 { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Ok(()); }
     let plane = extra.pre_render_data::<CelGlowPlane>().map(|v| v.input_plane).unwrap_or(ae::Rect { left: 0, top: 0, right: iw as i32, bottom: ih as i32 });
     let core = read_core_params(params).map_err(|_| ae::Error::InvalidParms)?;
     let gpu = gpu::render(celglow_core::FrameBuf { w: iw, h: ih, rgba: &rgba }, &core);
     let Ok(full) = gpu else {
         // GPU setup or interop can be unavailable on a host/device. Re-run the
         // exact CPU path after checking the layer back in.
-        let _ = cb.checkin_layer_pixels(0);
+        let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID);
         return smart_render(extra, in_data, params);
     };
     let ox = in_data.output_origin().h;
@@ -676,7 +681,7 @@ fn smart_render_gpu(extra: &ae::pf::SmartRenderExtra, in_data: &ae::InData, para
         }
     }
     write_rgba_f32_to_layer(&out, &mut output_world, ow, oh);
-    let _ = cb.checkin_layer_pixels(0);
+    let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID);
     Ok(())
 }
 

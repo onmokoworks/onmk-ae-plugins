@@ -366,11 +366,6 @@ impl AdobePluginGlobal for Plugin {
                 o.set_out_flag(ae::OutFlags::UseOutputExtent, true);
                 o.set_out_flag2(ae::OutFlags2::SupportsSmartRender, true);
                 o.set_out_flag2(ae::OutFlags2::FloatColorAware, true);
-                // Adjustment-layer inputs can contain meaningful RGB in
-                // pixels whose alpha is zero (the composite below the
-                // adjustment layer is not a normal source layer).  Tell AE
-                // not to trim those pixels before checkout.
-                o.set_out_flag2(ae::OutFlags2::RevealsZeroAlpha, true);
                 o.set_out_flag2(ae::OutFlags2::SupportsGpuRenderF32, true);
                 o.set_out_flag2(ae::OutFlags2::SupportsThreadedRendering, true);
                 o.set_out_flag2(ae::OutFlags2::SupportsGetFlattenedSequenceData, true);
@@ -543,11 +538,10 @@ fn layer_to_rgba_f32(layer: &ae::Layer) -> (Vec<f32>, usize, usize) {
                     }
                 };
                 let alpha = read(0).clamp(0.0, 1.0);
-                // Preserve RGB for zero-alpha samples.  This is required for
-                // adjustment-layer composites and is safe for ordinary
-                // premultiplied input because a genuinely empty pixel has
-                // zero RGB as well.  The plugin advertises RevealsZeroAlpha
-                // above, so AE will retain such samples in the checkout.
+                // Preserve RGB for zero-alpha samples if the host supplies
+                // them. This is useful for adjustment-layer composites and
+                // safe for ordinary premultiplied input, where an empty pixel
+                // normally has zero RGB as well.
                 let unpremultiply = if alpha > 1.0e-6 { 1.0 / alpha } else { 1.0 };
                 out[di] = read(1) * unpremultiply;
                 out[di + 1] = read(2) * unpremultiply;

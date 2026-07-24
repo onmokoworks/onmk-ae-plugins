@@ -12,6 +12,7 @@ fn main() {
         | OutFlags2::SupportsGpuRenderF32
         | OutFlags2::SupportsThreadedRendering
         | OutFlags2::SupportsGetFlattenedSequenceData
+        | OutFlags2::RevealsZeroAlpha
         | if grouped_ui { OutFlags2::ParamGroupStartCollapsedFlag } else { OutFlags2::None };
     pipl::plugin_build(vec![
         Property::Kind(PIPLType::AEEffect),

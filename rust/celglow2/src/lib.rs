@@ -366,6 +366,11 @@ impl AdobePluginGlobal for Plugin {
                 o.set_out_flag(ae::OutFlags::UseOutputExtent, true);
                 o.set_out_flag2(ae::OutFlags2::SupportsSmartRender, true);
                 o.set_out_flag2(ae::OutFlags2::FloatColorAware, true);
+                // Adjustment-layer inputs can contain meaningful RGB in
+                // pixels whose alpha is zero (the composite below the
+                // adjustment layer is not a normal source layer).  Tell AE
+                // not to trim those pixels before checkout.
+                o.set_out_flag2(ae::OutFlags2::RevealsZeroAlpha, true);
                 o.set_out_flag2(ae::OutFlags2::SupportsGpuRenderF32, true);
                 o.set_out_flag2(ae::OutFlags2::SupportsThreadedRendering, true);
                 o.set_out_flag2(ae::OutFlags2::SupportsGetFlattenedSequenceData, true);
@@ -538,7 +543,12 @@ fn layer_to_rgba_f32(layer: &ae::Layer) -> (Vec<f32>, usize, usize) {
                     }
                 };
                 let alpha = read(0).clamp(0.0, 1.0);
-                let unpremultiply = if alpha > 1.0e-6 { 1.0 / alpha } else { 0.0 };
+                // Preserve RGB for zero-alpha samples.  This is required for
+                // adjustment-layer composites and is safe for ordinary
+                // premultiplied input because a genuinely empty pixel has
+                // zero RGB as well.  The plugin advertises RevealsZeroAlpha
+                // above, so AE will retain such samples in the checkout.
+                let unpremultiply = if alpha > 1.0e-6 { 1.0 / alpha } else { 1.0 };
                 out[di] = read(1) * unpremultiply;
                 out[di + 1] = read(2) * unpremultiply;
                 out[di + 2] = read(3) * unpremultiply;
@@ -584,32 +594,24 @@ fn smart_render(extra: &ae::pf::SmartRenderExtra, in_data: &ae::InData, params: 
     let cb = extra.callbacks();
     let Some(input_world) = cb.checkout_layer_pixels(0)? else { return Ok(()); };
     let Some(mut output_world) = cb.checkout_output()? else { let _ = cb.checkin_layer_pixels(0); return Ok(()); };
-    let raw_view_value = params.get(Params::View)?.as_popup()?.value() as i32;
     let (rgba, iw, ih) = layer_to_rgba_f32(&input_world);
     let ow = output_world.width() as usize;
     let oh = output_world.height() as usize;
     if iw == 0 || ih == 0 || ow == 0 || oh == 0 { let _ = cb.checkin_layer_pixels(0); return Ok(()); }
     let plane = extra.pre_render_data::<CelGlowPlane>().map(|v| v.input_plane).unwrap_or(ae::Rect { left: 0, top: 0, right: iw as i32, bottom: ih as i32 });
     let output_origin = (in_data.output_origin().h, in_data.output_origin().v);
-    let core = if raw_view_value == 1 {
-        read_core_params(params).map_err(|_| ae::Error::InvalidParms)?
-    } else {
-        // Debug views must remain inspectable even if an older host has not
-        // initialised one of the newly appended controls yet.
-        celglow_core::Params::default()
-    };
+    // The diagnostic view is still a real core render.  The old adapter used
+    // to short-circuit here and copy the input world for every non-Result
+    // view.  That made View appear to work only when the host happened to
+    // show a cached result, and was especially confusing on adjustment layers
+    // whose checked-out input is not the same as the visible composite.
+    // Read the same parameter snapshot for every view so Field/Radius/Rings/
+    // Texture Mask use the exact source and distance-field path as Result.
+    // Keep a default fallback for old serialized instances while their
+    // appended controls are being initialized by AE.
+    let core = read_core_params(params).unwrap_or_default();
     let mut out = vec![0.0f32; ow * oh * 4];
     let view = read_view(params).unwrap_or(celglow_core::DebugView::Result);
-    if raw_view_value != 1 || !matches!(view, celglow_core::DebugView::Result) {
-        // Intermediate views are diagnostics, not the production composite.
-        // Keep them on a small, panic-free path in the AE adapter: older hosts
-        // swallow a panic from the core callback and leave the output world at
-        // its 0xCC sentinel, which appears as a misleading SmartFX -6 error.
-        if rgba.len() == out.len() { out.copy_from_slice(&rgba); }
-        write_rgba_f32_to_layer(&out, &mut output_world, ow, oh);
-        let _ = cb.checkin_layer_pixels(0);
-        return Ok(());
-    }
     let rendered = catch_unwind(AssertUnwindSafe(|| celglow_core::render(
         celglow_core::FrameBuf { w: iw, h: ih, rgba: &rgba },
         (plane.left, plane.top),

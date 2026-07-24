@@ -228,7 +228,7 @@ impl AdobePluginGlobal for Plugin {
             "View",
             ae::PopupDef::setup(|f| {
                 f.set_options(&["Result", "Input", "Field", "Radius", "Rings", "Texture Mask"]);
-                f.set_default(3);
+                f.set_default(1);
             }),
             ae::ParamFlag::USE_VALUE_FOR_OLD_PROJECTS,
             ae::ParamUIFlags::NONE,

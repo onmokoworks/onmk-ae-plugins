@@ -28,6 +28,6 @@ fn main() {
         Property::AE_Effect_Global_OutFlags_2(OutFlags2::empty()),
         Property::AE_Effect_Match_Name("ONMK_RioGrade"),
         Property::AE_Reserved_Info(10),
-        Property::AE_Effect_Support_URL("https://github.com/onmokoworks/Rio-De-Janeiro-Filter"),
+        Property::AE_Effect_Support_URL("https://github.com/onmokoworks/Rio-De-Janeiro-Filter-Ae"),
     ]);
 }

@@ -45,6 +45,32 @@ impl Image {
     }
 }
 
+/// Generates an identity UV map for a flat image plane.
+///
+/// Coordinates point at pixel centers so projecting an equally sized texture
+/// through the generated map reproduces the texture without a half-pixel shift.
+pub fn generate_planar(width: usize, height: usize, v_origin_bottom: bool) -> Image {
+    let mut out = Image::transparent(width, height);
+    if width == 0 || height == 0 {
+        return out;
+    }
+
+    for y in 0..height {
+        let top_origin_v = (y as f32 + 0.5) / height as f32;
+        let v = if v_origin_bottom {
+            1.0 - top_origin_v
+        } else {
+            top_origin_v
+        };
+        for x in 0..width {
+            let u = (x as f32 + 0.5) / width as f32;
+            out.pixels[y * width + x] = [1.0, u, v, 0.0];
+        }
+    }
+
+    out
+}
+
 #[inline]
 fn wrap_index(i: i32, n: i32, mode: WrapMode) -> i32 {
     if n <= 1 {
@@ -213,5 +239,44 @@ mod tests {
         );
         assert!((result.pixels[0][0] - 0.5).abs() < 1.0e-6);
         assert!((result.pixels[0][1] - 0.5).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn planar_uv_round_trips_an_equal_size_texture() {
+        let texture = Image {
+            pixels: vec![
+                [1.0, 1.0, 0.0, 0.0],
+                [1.0, 0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0, 1.0],
+                [1.0, 1.0, 1.0, 1.0],
+            ],
+            width: 2,
+            height: 2,
+        };
+        let uv = generate_planar(2, 2, true);
+        let result = project(
+            &UvParams {
+                v_origin_bottom: true,
+                wrap: WrapMode::Clamp,
+                bilinear: false,
+                use_uv_alpha: true,
+                opacity: 1.0,
+            },
+            &uv,
+            &texture,
+            2,
+            2,
+        );
+        assert_eq!(result.pixels, texture.pixels);
+    }
+
+    #[test]
+    fn planar_uv_respects_v_origin() {
+        let top = generate_planar(1, 2, false);
+        let bottom = generate_planar(1, 2, true);
+        assert_eq!(top.pixels[0], [1.0, 0.5, 0.25, 0.0]);
+        assert_eq!(top.pixels[1], [1.0, 0.5, 0.75, 0.0]);
+        assert_eq!(bottom.pixels[0], [1.0, 0.5, 0.75, 0.0]);
+        assert_eq!(bottom.pixels[1], [1.0, 0.5, 0.25, 0.0]);
     }
 }

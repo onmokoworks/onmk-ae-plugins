@@ -28,12 +28,15 @@ UV マップの赤チャンネルを U、緑チャンネルを V として各ピ
    テクスチャを指定します。
 2. テクスチャ側に適用する場合は `Input Is` を `Texture` にし、`Other Layer` に
    UV マップを指定します。
-3. Blender由来のUVパスでは32 bpcのOpenEXRとAEの32 bpcプロジェクトを推奨します。
+3. 平面レイヤーからUVマップを作る場合は `Input Is` を `Generate Planar UV Map`
+   にします。このモードでは `Other Layer` は不要です。
+4. Blender由来のUVパスでは32 bpcのOpenEXRとAEの32 bpcプロジェクトを推奨します。
 
 ## Main Features
 
 - STMap 方式の UV リマップ: 任意のテクスチャレイヤーを UV / ST パス経由で投影
 - UVマップ側／テクスチャ側のどちらにエフェクトを適用するか切替可能
+- 平面レイヤーのピクセル中心に対応するUVマップを生成
 - 8 / 16 / 32 bpc対応
 - アンチエイリアスされたUVマップの半透明エッジをアンプリマルチして座標を復元
 - V 軸原点の切替: 上原点（After Effects / 画像座標）または 下原点（Nuke / 3D）
@@ -98,7 +101,8 @@ After Effects を再起動し、`Distort > UVProject` からエフェクトを�
 ## Parameters
 
 - `Other Layer (Texture / UV Map)`: `Input Is` で選んだ適用先と反対側のレイヤー。
-- `Input Is`: エフェクトの適用先がUVマップかテクスチャかを指定。
+- `Input Is`: エフェクトの適用先がUVマップかテクスチャか、または平面UVマップを
+  生成するかを指定。
 - `V Origin`: `Top (After Effects)` または `Bottom (Nuke / 3D)`。3D・レンダー由来の
   UV パスは下原点（既定）、画像座標系のマップは上原点を使います。
 - `Wrap`: 0..1 を超えるテクスチャ座標の扱い — `Clamp` / `Repeat` / `Mirror`。

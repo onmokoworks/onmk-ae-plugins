@@ -1,0 +1,27 @@
+/target/
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+
+# Local logs and temporary output
+*.log
+*.tmp
+*.bak
+
+# Internal docs / scratch (personal notes, investigation logs — never committed)
+_internal/
+docs/internal/
+NOTES.local.md
+SCRATCH.md
+TODO.local.md
+
+# Built plug-in binaries (output of `cargo build` / `just build` / `just release`)
+*.aex
+*.dll
+*.dylib
+*.so

@@ -28,6 +28,10 @@ onmkが開発・メンテナンスするAfter Effectsプラグインのモノレ
 | [MedianPro](./plugins/median-pro/) | アルファ対応のMedian／Weighted Medianフィルター | 実験的 |
 | [AdaptiveFilter](./plugins/adaptive-filter/) | Kuwahara／Generalized Kuwahara／Bilateralフィルター | 実験的・仮称 |
 | [Particle Kit](./plugins/particle-kit/) | パーティクルエフェクト、共有エンジン、Node UI、Lattice Lab | 実験的 |
+| [UVProject](./plugins/uv-project/) | UV／STマップを使ったテクスチャ投影 | 開発中 |
+| [CelGlow](./plugins/cel-glow/) | イラスト・アニメ向けの段階的なセルグロー | 実験的 |
+| [onmkGlow](./plugins/onmk-glow/) | After Glowとストリークを備えたマルチパス・グロー | 実験的 |
+| [ONMK Starglow](./plugins/starglow/) | 複数方向の光条とスペクトル色を生成するスターグロー | 実験的 |
 
 ---
 
@@ -61,3 +65,7 @@ Existing plugins are being migrated incrementally while preserving their Git his
 | [MedianPro](./plugins/median-pro/) | Alpha-safe Median and Weighted Median filtering | Experimental |
 | [AdaptiveFilter](./plugins/adaptive-filter/) | Kuwahara, Generalized Kuwahara, and Bilateral filtering | Experimental / working name |
 | [Particle Kit](./plugins/particle-kit/) | Particle effect, shared engine, Node UI, and Lattice Lab | Experimental |
+| [UVProject](./plugins/uv-project/) | Projects textures through UV / ST maps | In development |
+| [CelGlow](./plugins/cel-glow/) | Stepped cel-glow rendering for illustration and anime compositing | Experimental |
+| [onmkGlow](./plugins/onmk-glow/) | Multi-pass glow with after-glow shaping and streaks | Experimental |
+| [ONMK Starglow](./plugins/starglow/) | Multi-direction spectral star glow | Experimental |

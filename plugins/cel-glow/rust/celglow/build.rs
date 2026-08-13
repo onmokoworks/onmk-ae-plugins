@@ -35,6 +35,8 @@ fn main() {
         ),
         Property::AE_Effect_Match_Name("ANTH CelGlow"),
         Property::AE_Reserved_Info(0),
-        Property::AE_Effect_Support_URL("https://github.com/onmk/CelGlow"),
+        Property::AE_Effect_Support_URL(
+            "https://github.com/onmokoworks/onmk-ae-plugins/tree/main/plugins/cel-glow",
+        ),
     ]);
 }

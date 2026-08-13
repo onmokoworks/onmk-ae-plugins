@@ -1,0 +1,23 @@
+{
+  "id": "braille",
+  "label": "Braille",
+  "version": 1,
+  "glyphMode": "braille-2x4",
+  "glyphs": [],
+  "cell": {
+    "width": 8,
+    "height": 16
+  },
+  "sampling": {
+    "luma": "rec709",
+    "contrast": 1.2,
+    "gamma": 0.95,
+    "edgeBoost": 0.2,
+    "invert": false
+  },
+  "color": {
+    "mode": "mono",
+    "foreground": "#ffffff",
+    "background": "#000000"
+  }
+}

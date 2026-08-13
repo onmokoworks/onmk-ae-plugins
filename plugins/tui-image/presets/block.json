@@ -1,0 +1,23 @@
+{
+  "id": "block",
+  "label": "Block",
+  "version": 1,
+  "glyphMode": "block",
+  "glyphs": [" ", "\u2591", "\u2592", "\u2593", "\u2588"],
+  "cell": {
+    "width": 8,
+    "height": 12
+  },
+  "sampling": {
+    "luma": "rec709",
+    "contrast": 1.1,
+    "gamma": 1.0,
+    "edgeBoost": 0.15,
+    "invert": false
+  },
+  "color": {
+    "mode": "mono",
+    "foreground": "#ffffff",
+    "background": "#000000"
+  }
+}

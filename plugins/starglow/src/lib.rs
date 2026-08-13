@@ -43,6 +43,8 @@ enum Params {
     SourceOpacity, StarglowOpacity, TransferMode,
     // Map
     MapLayer, InvertMap,
+    // Appended for compatibility with existing projects.
+    AffectAlpha,
 }
 
 // ---- Plugin ----
@@ -220,6 +222,8 @@ impl AdobePluginGlobal for Plugin {
             ae::LayerDef::setup(|_f| {}))?;
         params.add(Params::InvertMap, "Invert Map",
             ae::CheckBoxDef::setup(|f| { f.set_default(false); f.set_label("Invert"); }))?;
+        params.add(Params::AffectAlpha, "Affect Alpha",
+            ae::CheckBoxDef::setup(|f| { f.set_default(true); f.set_label("Extend Alpha with Glow"); }))?;
 
         Ok(())
     }
@@ -287,6 +291,7 @@ pub struct EffectParams {
     pub starglow_opacity: f64,
     pub transfer_mode: i32,
     pub invert_map: bool,
+    pub affect_alpha: bool,
 }
 
 fn color_to_f64(p: ae::Pixel8) -> [f64; 3] {
@@ -332,6 +337,7 @@ fn get_params(params: &ae::Parameters<Params>) -> Result<EffectParams, ae::Error
         starglow_opacity: params.get(Params::StarglowOpacity)?.as_float_slider()?.value() / 100.0,
         transfer_mode: params.get(Params::TransferMode)?.as_popup()?.value() as i32,
         invert_map: params.get(Params::InvertMap)?.as_checkbox()?.value(),
+        affect_alpha: params.get(Params::AffectAlpha)?.as_checkbox()?.value(),
     })
 }
 

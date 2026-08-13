@@ -27,6 +27,7 @@ onmkが開発・メンテナンスするAfter Effectsプラグインのモノレ
 | [MinimaxMap](./plugins/minimax-map/) | 符号付きのMinimum／Maximumモルフォロジー | 開発中 |
 | [MedianPro](./plugins/median-pro/) | アルファ対応のMedian／Weighted Medianフィルター | 実験的 |
 | [AdaptiveFilter](./plugins/adaptive-filter/) | Kuwahara／Generalized Kuwahara／Bilateralフィルター | 実験的・仮称 |
+| [Particle Kit](./plugins/particle-kit/) | パーティクルエフェクト、共有エンジン、Node UI、Lattice Lab | 実験的 |
 
 ---
 
@@ -59,3 +60,4 @@ Existing plugins are being migrated incrementally while preserving their Git his
 | [MinimaxMap](./plugins/minimax-map/) | Performs signed Minimum / Maximum morphology | In development |
 | [MedianPro](./plugins/median-pro/) | Alpha-safe Median and Weighted Median filtering | Experimental |
 | [AdaptiveFilter](./plugins/adaptive-filter/) | Kuwahara, Generalized Kuwahara, and Bilateral filtering | Experimental / working name |
+| [Particle Kit](./plugins/particle-kit/) | Particle effect, shared engine, Node UI, and Lattice Lab | Experimental |

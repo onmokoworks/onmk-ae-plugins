@@ -1,0 +1,12 @@
+{
+  "id": "depth_anything_v2_small",
+  "label": "Depth Anything V2 Small",
+  "preprocess": "imagenet_rgb",
+  "input_name": "pixel_values",
+  "output_name": "predicted_depth",
+  "variants": {
+    "266": "depth_anything_v2_small_266.onnx",
+    "392": "depth_anything_v2_small_392.onnx",
+    "518": "depth_anything_v2_small.onnx"
+  }
+}

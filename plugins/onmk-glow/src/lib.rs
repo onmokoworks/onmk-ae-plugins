@@ -303,8 +303,8 @@ impl AdobePluginGlobal for Plugin {
             ae::Command::SmartRender { extra } => {
                 smart_render_cpu(&extra, params)?;
             }
-            ae::Command::SmartRenderGpu { extra } => {
-                smart_render_cpu(&extra, params)?;
+            ae::Command::SmartRenderGpu { .. } => {
+                return Err(ae::Error::BadCallbackParameter);
             }
             _ => {}
         }

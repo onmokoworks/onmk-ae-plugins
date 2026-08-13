@@ -125,6 +125,10 @@ impl AdobePluginGlobal for Plugin {
                 out_data.set_out_flag2(ae::OutFlags2::SupportsSmartRender, true);
                 out_data.set_out_flag2(ae::OutFlags2::FloatColorAware, true);
                 out_data.set_out_flag2(ae::OutFlags2::SupportsThreadedRendering, true);
+                out_data.set_out_flag2(
+                    ae::OutFlags2::SupportsGetFlattenedSequenceData,
+                    true,
+                );
             }
             ae::Command::QueryDynamicFlags => {}
             _ => {}

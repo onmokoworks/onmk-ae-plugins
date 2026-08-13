@@ -1,6 +1,8 @@
 use pipl::*;
 
 fn main() {
+    println!("cargo:rustc-cfg=catch_panics");
+    println!("cargo:rustc-check-cfg=cfg(catch_panics)");
     pipl::plugin_build(vec![
         Property::Kind(PIPLType::AEEffect),
         Property::Name("ONMK PathArray"),

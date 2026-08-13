@@ -1,6 +1,8 @@
 use pipl::*;
 
 fn main() {
+    println!("cargo:rustc-cfg=catch_panics");
+    println!("cargo:rustc-check-cfg=cfg(catch_panics)");
     pipl::plugin_build(vec![
         Property::Kind(PIPLType::AEEffect),
         Property::Name("ScatterMap"),
@@ -31,8 +33,7 @@ fn main() {
             OutFlags2::FloatColorAware
                 | OutFlags2::SupportsSmartRender
                 | OutFlags2::SupportsThreadedRendering
-                | OutFlags2::SupportsGetFlattenedSequenceData
-                | OutFlags2::SupportsGpuRenderF32,
+                | OutFlags2::SupportsGetFlattenedSequenceData,
         ),
         Property::AE_Effect_Match_Name("ScatterMap"),
         Property::AE_Reserved_Info(10),

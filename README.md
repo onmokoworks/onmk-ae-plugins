@@ -17,12 +17,15 @@ onmkが開発・メンテナンスするAfter Effectsプラグインのモノレ
 
 ## プラグイン
 
-- [Rio de Janeiro Filter](./plugins/rio-de-janeiro-filter/) — Rio de Janeiroフィルター風の色調を再現するエフェクト
-- [RefractionDispersion](./plugins/refraction-dispersion/) — ガラス風の屈折、色分散、ハイライト表現を作るエフェクト
-- [FrameSlice](./plugins/frame-slice/) — 画像内にスリットスキャン風の時間差を作るエフェクト
-- [TuiImage](./plugins/tui-image/) — 画像をANSIアート／TUI風のセル表現に変換するエフェクト
-- [Depth ONNX](./plugins/depth-onnx/) — ONNX Runtimeによる単眼深度推定エフェクト
-- [MinimaxMap](./plugins/minimax-map/) — 符号付きのMinimum／Maximumモルフォロジーを行うエフェクト
+| プラグイン | 概要 | 状態 |
+|---|---|---|
+| [Rio de Janeiro Filter](./plugins/rio-de-janeiro-filter/) | Rio de Janeiroフィルター風の色調を再現 | 開発中 |
+| [RefractionDispersion](./plugins/refraction-dispersion/) | ガラス風の屈折、色分散、ハイライト表現 | 開発中 |
+| [FrameSlice](./plugins/frame-slice/) | 画像内にスリットスキャン風の時間差を生成 | 開発中 |
+| [TuiImage](./plugins/tui-image/) | 画像をANSIアート／TUI風のセル表現に変換 | v0.1.0／開発中 |
+| [Depth ONNX](./plugins/depth-onnx/) | ONNX Runtimeによる単眼深度推定 | 開発中 |
+| [MinimaxMap](./plugins/minimax-map/) | 符号付きのMinimum／Maximumモルフォロジー | 開発中 |
+| [MedianPro](./plugins/median-pro/) | アルファ対応のMedian／Weighted Medianフィルター | 開発中 |
 
 ---
 
@@ -45,9 +48,12 @@ Existing plugins are being migrated incrementally while preserving their Git his
 
 ### Plugins
 
-- [Rio de Janeiro Filter](./plugins/rio-de-janeiro-filter/) — Recreates a look inspired by the Rio de Janeiro filter
-- [RefractionDispersion](./plugins/refraction-dispersion/) — Creates glass-like refraction, chromatic dispersion, and highlight shaping
-- [FrameSlice](./plugins/frame-slice/) — Creates slit-scan style time offsets inside image layers
-- [TuiImage](./plugins/tui-image/) — Converts images into ANSI art / TUI-style cell renderings
-- [Depth ONNX](./plugins/depth-onnx/) — Performs monocular depth estimation with ONNX Runtime
-- [MinimaxMap](./plugins/minimax-map/) — Performs signed Minimum / Maximum morphology
+| Plugin | Description | Status |
+|---|---|---|
+| [Rio de Janeiro Filter](./plugins/rio-de-janeiro-filter/) | Recreates a look inspired by the Rio de Janeiro filter | In development |
+| [RefractionDispersion](./plugins/refraction-dispersion/) | Creates glass-like refraction, chromatic dispersion, and highlight shaping | In development |
+| [FrameSlice](./plugins/frame-slice/) | Creates slit-scan style time offsets inside image layers | In development |
+| [TuiImage](./plugins/tui-image/) | Converts images into ANSI art / TUI-style cell renderings | v0.1.0 / In development |
+| [Depth ONNX](./plugins/depth-onnx/) | Performs monocular depth estimation with ONNX Runtime | In development |
+| [MinimaxMap](./plugins/minimax-map/) | Performs signed Minimum / Maximum morphology | In development |
+| [MedianPro](./plugins/median-pro/) | Alpha-safe Median and Weighted Median filtering | In development |

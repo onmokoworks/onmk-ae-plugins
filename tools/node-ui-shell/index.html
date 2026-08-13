@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ParticleLab Node UI Shell</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>Node UI Shell</h1>
+          <p id="subtitle">Load a ParticleLab or Lattice bootstrap JSON.</p>
+        </div>
+        <div class="toolbar" aria-label="Node UI commands">
+          <button id="loadFileButton" type="button" title="Open JSON file">Open</button>
+          <button id="pasteButton" type="button" title="Paste JSON text">Paste</button>
+          <button id="particleDemoButton" type="button" title="Load ParticleLab demo payload">
+            Particle Demo
+          </button>
+          <button id="latticeDemoButton" type="button" title="Load Lattice Lab demo payload">
+            Lattice Demo
+          </button>
+          <button
+            id="saveBootstrapButton"
+            class="primary-action"
+            type="button"
+            title="Save bootstrap JSON"
+          >
+            Save Bootstrap
+          </button>
+          <button
+            id="saveSnapshotButton"
+            class="primary-action"
+            type="button"
+            title="Save snapshot JSON"
+          >
+            Save Snapshot
+          </button>
+          <input id="fileInput" type="file" accept="application/json,.json" hidden />
+        </div>
+      </header>
+
+      <main class="workspace">
+        <aside class="sidebar">
+          <section class="panel">
+            <div class="panel-header">
+              <h2>Catalog</h2>
+              <span id="catalogCount" class="counter">0</span>
+            </div>
+            <div id="catalogList" class="catalog-list"></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <h2>Published</h2>
+              <span id="publishedCount" class="counter">0</span>
+            </div>
+            <div id="publishedList" class="list-empty">No published controls.</div>
+          </section>
+        </aside>
+
+        <section class="graph-area" aria-label="Graph editor">
+          <div class="graph-summary">
+            <div>
+              <strong id="productLabel">No payload</strong>
+              <span id="schemaLabel">schema -</span>
+            </div>
+            <div id="statusLine" class="status-line">Ready.</div>
+          </div>
+          <div id="graphCanvas" class="graph-canvas">
+            <svg id="edgeLayer" class="edge-layer" aria-hidden="true"></svg>
+            <div id="nodeLayer" class="node-layer"></div>
+          </div>
+        </section>
+
+        <aside class="inspector">
+          <section class="panel">
+            <div class="panel-header">
+              <h2>Inspector</h2>
+              <span id="selectedNodeType" class="counter">none</span>
+            </div>
+            <div id="inspectorBody" class="list-empty">Select a graph node.</div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-header">
+              <h2>Diagnostics</h2>
+              <span id="diagnosticCount" class="counter">0</span>
+            </div>
+            <div id="diagnosticList" class="diagnostic-list"></div>
+          </section>
+        </aside>
+      </main>
+    </div>
+
+    <dialog id="pasteDialog" class="paste-dialog">
+      <form method="dialog">
+        <h2>Paste JSON</h2>
+        <textarea id="pasteInput" spellcheck="false"></textarea>
+        <div class="dialog-actions">
+          <button value="cancel" type="submit">Cancel</button>
+          <button id="applyPasteButton" value="default" type="button">Apply</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="./startup-payload.js"></script>
+    <script src="./app.js" defer></script>
+  </body>
+</html>

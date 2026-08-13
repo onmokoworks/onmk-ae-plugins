@@ -9,6 +9,9 @@ Cargo.lock.bak
 particle_debug.txt
 *.log
 
+# Private planning notes and internal review memos
+docs/private/
+
 # IDE
 .vscode/
 .idea/
@@ -16,7 +19,7 @@ particle_debug.txt
 
 # Stray zero-byte scratch files
 /,
-/{
+/[{]
 
 # OS
 Thumbs.db

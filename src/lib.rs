@@ -1,6 +1,4 @@
 use after_effects as ae;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 #[cfg(windows)]
 use std::fs;
 #[cfg(windows)]
@@ -10,7 +8,7 @@ use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
 #[cfg(windows)]
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
@@ -20,15 +18,16 @@ mod file_dialog {
     use std::path::PathBuf;
     use std::process::Command;
 
-    pub fn open_file_dialog(initial_dir: &str, _title: &str) -> Option<PathBuf> {
+    pub fn open_file_dialog(initial_dir: &str, title: &str) -> Option<PathBuf> {
         let script = format!(
             "Add-Type -AssemblyName System.Windows.Forms; \
              $d = New-Object System.Windows.Forms.OpenFileDialog; \
              $d.InitialDirectory = '{}'; \
-             $d.Filter = 'Preset (*.json)|*.json|All Files|*.*'; \
-             $d.Title = 'Load Preset'; \
+             $d.Filter = 'JSON (*.json)|*.json|All Files|*.*'; \
+             $d.Title = '{}'; \
              if ($d.ShowDialog() -eq 'OK') {{ Write-Output $d.FileName }}",
-            initial_dir.replace('\'', "''")
+            initial_dir.replace('\'', "''"),
+            title.replace('\'', "''")
         );
         let output = Command::new("powershell")
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -42,21 +41,18 @@ mod file_dialog {
         }
     }
 
-    pub fn save_file_dialog(
-        initial_dir: &str,
-        _title: &str,
-        default_name: &str,
-    ) -> Option<PathBuf> {
+    pub fn save_file_dialog(initial_dir: &str, title: &str, default_name: &str) -> Option<PathBuf> {
         let script = format!(
             "Add-Type -AssemblyName System.Windows.Forms; \
              $d = New-Object System.Windows.Forms.SaveFileDialog; \
              $d.InitialDirectory = '{}'; \
-             $d.Filter = 'Preset (*.json)|*.json'; \
-             $d.Title = 'Save Preset'; \
+             $d.Filter = 'JSON (*.json)|*.json'; \
+             $d.Title = '{}'; \
              $d.FileName = '{}'; \
              $d.DefaultExt = 'json'; \
              if ($d.ShowDialog() -eq 'OK') {{ Write-Output $d.FileName }}",
             initial_dir.replace('\'', "''"),
+            title.replace('\'', "''"),
             default_name.replace('\'', "''")
         );
         let output = Command::new("powershell")
@@ -72,22 +68,41 @@ mod file_dialog {
     }
 }
 
+mod classic_params;
+mod engine;
+mod graph;
+mod node_graph_core;
 mod particle;
-mod plexus;
-mod plexus_render;
+mod preset;
+mod project_state;
+mod render_core;
 mod renderer;
 
-use particle::{
-    AppearanceConfig, ChildConfig, EmitterConfig, EmitterType, ParticleSystem, PhysicsConfig,
+use classic_params::extract_engine_config;
+use engine::{
+    render_particle_engine_8bit, ParticleEngineConfig, ParticleRenderPlan, ParticleRuntimeInputs,
 };
-use plexus::{PlexusConfig, PointGroupConfig, PointSourceType};
+use graph::{GraphPublishedValue, GraphPublishedValueOverride};
+use particle::{EmitterConfig, EmitterType};
+use preset::{load_preset_snapshot, PresetColor, PresetSnapshot, PRESET_VERSION};
+use project_state::{
+    EngineConfigSource, NodeUiGraphStateSnapshot, ParticleLabProjectState, PROJECT_STATE_VERSION,
+    PUBLISHED_HOST_FLOAT_SLOT_COUNT,
+};
+use render_core::RenderSurface;
 use renderer::{
-    invert_camera_matrix, project_point_3d, ApplyMode, BlendMode, CameraProjection, ImageColorMode,
-    ImageFitMode, ImageSamplingConfig, ParticleShape, RenderConfig, SpriteImage, TimeSamplingMode,
+    invert_camera_matrix, project_point_3d, ApplyMode, CameraProjection, ParticleShape,
+    RenderConfig, SpriteImage, TimeSamplingMode,
 };
+
+const NODE_UI_SHELL_INDEX_HTML: &str = include_str!("../tools/node-ui-shell/index.html");
+const NODE_UI_SHELL_APP_JS: &str = include_str!("../tools/node-ui-shell/app.js");
+const NODE_UI_SHELL_STYLES_CSS: &str = include_str!("../tools/node-ui-shell/styles.css");
+const NODE_UI_SHELL_STARTUP_JS: &str = include_str!("../tools/node-ui-shell/startup-payload.js");
 
 // ---- Parameter IDs ----
 
+#[repr(u16)]
 #[derive(Eq, PartialEq, Hash, Clone, Copy, Debug)]
 enum Params {
     PresetGroupStart,
@@ -184,7 +199,13 @@ enum Params {
     // System
     Seed,
     SystemGroupEnd,
-    // ---- Plexus ----
+    // ---- Retired Plexus ABI slots ----
+    //
+    // These parameters are no longer used by the particle renderer, but they
+    // must stay registered forever. The after-effects wrapper derives stable
+    // host parameter IDs from the enum variant names, and AE projects also
+    // rely on setup order. Removing or renaming these would shift saved project
+    // streams when the effect is updated.
     PluginMode,
     PlexusGroupStart,
     PlexusGroupEnd,
@@ -257,17 +278,24 @@ enum Params {
     RotationVar,
     ApplyMode,
     OpacityVar,
+    PublishedControlsGroupStart,
+    PublishedFloat1,
+    PublishedFloat2,
+    PublishedFloat3,
+    PublishedFloat4,
+    PublishedControlsGroupEnd,
+    NodeGraphGroupStart,
+    ExportNodeGraphState,
+    ImportNodeGraphState,
+    SeedNodeGraphFromParams,
+    DisableNodeGraph,
+    NodeGraphGroupEnd,
+    NodeUiSidecarGroupStart,
+    OpenNodeUiShell,
+    NodeUiSidecarGroupEnd,
 }
 
 // ---- Plugin ----
-
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
-struct PresetColor {
-    alpha: u8,
-    red: u8,
-    green: u8,
-    blue: u8,
-}
 
 impl From<ae::Pixel8> for PresetColor {
     fn from(value: ae::Pixel8) -> Self {
@@ -291,298 +319,70 @@ impl From<PresetColor> for ae::Pixel8 {
     }
 }
 
-/// Current preset format version. Fields not present in older presets are
-/// filled in by `#[serde(default)]`, but compatibility migrations still need
-/// a version bump when defaults would change behavior.
-const PRESET_VERSION: u32 = 4;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-struct PresetSnapshot {
-    version: u32,
-    name: String,
-    // ---- Emitter ----
-    emitter_type: i32,
-    emit_mode: i32,
-    position_point: (f32, f32),
-    position_z: f64,
-    image_proxy_scale: i32,
-    path_sample_density: f64,
-    grid_res_x: i32,
-    grid_res_y: i32,
-    grid_res_z: i32,
-    emitter_size_linked: bool,
-    emitter_size_x: f64,
-    emitter_size_y: f64,
-    emitter_size_z: f64,
-    birth_rate: f64,
-    lifespan: f64,
-    lifespan_var: f64,
-    // ---- Motion ----
-    speed: f64,
-    speed_var: f64,
-    direction_x: f64,
-    direction_y: f64,
-    direction_z: f64,
-    spread: f64,
-    initial_size: f64,
-    size_var: f64,
-    rotation: f64,
-    rotation_speed: f64,
-    // ---- Physics ----
-    gravity_strength: f64,
-    wind_x: f64,
-    wind_y: f64,
-    turb_strength: f64,
-    turb_scale: f64,
-    turb_speed: f64,
-    air_resistance: f64,
-    bounce_enabled: bool,
-    bounce_damping: f64,
-    // ---- Appearance ----
-    color_mode: i32,
-    color_start: PresetColor,
-    color_end: PresetColor,
-    opacity_curve_preset: i32,
-    opacity_start: f64,
-    opacity_mid_a: f64,
-    opacity_mid_b: f64,
-    opacity_end: f64,
-    size_curve_preset: i32,
-    size_life_start: f64,
-    size_life_mid_a: f64,
-    size_life_mid_b: f64,
-    size_life_end: f64,
-    // ---- Rendering ----
-    shape: i32,
-    sprite_time_sampling: i32,
-    sprite_frame_count: i32,
-    image_color_mode: i32,
-    image_fit_mode: i32,
-    use_source_alpha: bool,
-    source_premultiplied: bool,
-    image_alpha_clip: f64,
-    blend_mode: i32,
-    motion_blur: f64,
-    edge_softness: f64,
-    dof_enabled: bool,
-    dof_focal_dist: f64,
-    dof_aperture: f64,
-    size_multiplier: f64,
-    composite_on_orig: bool,
-    apply_mode: i32,
-    rotation_variation: f64,
-    opacity_variation: f64,
-    // ---- Child ----
-    child_enabled: bool,
-    child_count: i32,
-    child_inherit_vel: f64,
-    child_lifespan: f64,
-    child_speed: f64,
-    child_spread: f64,
-    child_size_scale: f64,
-    // ---- System ----
-    seed: i32,
-    // ---- Plexus ----
-    plugin_mode: i32,
-    point_a_enabled: bool,
-    point_a_source_type: i32,
-    point_a_grid_res_x: i32,
-    point_a_grid_res_y: i32,
-    point_a_grid_res_z: i32,
-    point_a_grid_spacing: f64,
-    point_a_max_points: i32,
-    point_b_enabled: bool,
-    point_b_source_type: i32,
-    point_b_grid_res_x: i32,
-    point_b_grid_res_y: i32,
-    point_b_grid_spacing: f64,
-    noise_enabled: bool,
-    noise_amplitude: f64,
-    noise_frequency: f64,
-    noise_speed: f64,
-    noise_octaves: i32,
-    noise_axis_scale: i32,
-    lines_enabled: bool,
-    lines_max_distance: f64,
-    lines_width: f64,
-    lines_opacity_falloff: f64,
-    lines_color: PresetColor,
-    mesh_enabled: bool,
-    mesh_max_edge: f64,
-    mesh_opacity: f64,
-    mesh_color: PresetColor,
-    beams_enabled: bool,
-    beams_source_group: i32,
-    beams_max_distance: f64,
-    beams_width: f64,
-    beams_color: PresetColor,
-    plexus_point_size: f64,
-    plexus_point_color: PresetColor,
-}
-
-impl Default for PresetSnapshot {
-    // IMPORTANT: every numeric default here MUST match the `f.set_default(…)`
-    // of the corresponding parameter in `params_setup`. When the two diverge,
-    // a preset file that omits a field (older-version preset, hand-edited
-    // JSON, corrupted write) is loaded via `#[serde(default)]` and silently
-    // rewrites that param to a wrong value on `apply_preset`. A few of these
-    // were dangerously wrong in v2 (size_life_* at 35–100 vs. param range
-    // 0.0–5.0; size_multiplier at 100.0 vs. range 0.01–10.0), so fixing them
-    // is the main reason the preset format was bumped to v4.
-    fn default() -> Self {
-        Self {
-            version: PRESET_VERSION,
-            name: String::new(),
-            emitter_type: 1,
-            emit_mode: 1,
-            position_point: (50.0, 50.0),
-            position_z: 0.0,
-            image_proxy_scale: 3, // param default: /8
-            path_sample_density: 10.0,
-            grid_res_x: 8,
-            grid_res_y: 8,
-            grid_res_z: 1,
-            emitter_size_linked: true,
-            emitter_size_x: 0.0,
-            emitter_size_y: 0.0,
-            emitter_size_z: 0.0,
-            birth_rate: 180.0,
-            lifespan: 1.6,
-            lifespan_var: 0.15,
-            speed: 240.0,
-            speed_var: 0.2,
-            direction_x: 0.0,
-            direction_y: -1.0,
-            direction_z: 0.0,
-            spread: 18.0,
-            initial_size: 9.0,
-            size_var: 0.2,
-            rotation: 0.0,
-            rotation_speed: 0.0,
-            gravity_strength: 160.0,
-            wind_x: 0.0,
-            wind_y: 0.0,
-            turb_strength: 12.0,
-            turb_scale: 0.75,
-            turb_speed: 1.0,
-            air_resistance: 0.3,
-            bounce_enabled: false,
-            bounce_damping: 0.5,
-            color_mode: 2, // Gradient
-            color_start: PresetColor {
-                alpha: 255,
-                red: 255,
-                green: 255,
-                blue: 255,
-            },
-            color_end: PresetColor {
-                alpha: 255,
-                red: 255,
-                green: 255,
-                blue: 255,
-            },
-            opacity_curve_preset: 3, // Fade Out
-            opacity_start: 100.0,
-            opacity_mid_a: 90.0,
-            opacity_mid_b: 45.0,
-            opacity_end: 0.0,
-            size_curve_preset: 3, // Shrink
-            size_life_start: 1.0,
-            size_life_mid_a: 1.0,
-            size_life_mid_b: 0.65,
-            size_life_end: 0.35,
-            shape: 1,
-            sprite_time_sampling: 1,
-            sprite_frame_count: 1,
-            image_color_mode: 1,
-            image_fit_mode: 1,
-            use_source_alpha: true,
-            source_premultiplied: true,
-            image_alpha_clip: 0.01,
-            blend_mode: 1, // Normal
-            motion_blur: 0.2,
-            edge_softness: 0.0,
-            dof_enabled: false,
-            dof_focal_dist: 0.0,
-            dof_aperture: 5.0,
-            size_multiplier: 1.15,
-            composite_on_orig: true,
-            apply_mode: 2,
-            rotation_variation: 0.0,
-            opacity_variation: 0.0,
-            child_enabled: false,
-            child_count: 3,
-            child_inherit_vel: 0.65,
-            child_lifespan: 0.5,
-            child_speed: 80.0,
-            child_spread: 110.0,
-            child_size_scale: 0.4,
-            seed: 12345,
-            // ---- Plexus defaults (match params_setup) ----
-            plugin_mode: 1, // Particles
-            point_a_enabled: true,
-            point_a_source_type: 1,
-            point_a_grid_res_x: 10,
-            point_a_grid_res_y: 10,
-            point_a_grid_res_z: 1,
-            point_a_grid_spacing: 50.0,
-            point_a_max_points: 5000,
-            point_b_enabled: false,
-            point_b_source_type: 1,
-            point_b_grid_res_x: 10,
-            point_b_grid_res_y: 10,
-            point_b_grid_spacing: 50.0,
-            noise_enabled: false,
-            noise_amplitude: 50.0,
-            noise_frequency: 0.01,
-            noise_speed: 1.0,
-            noise_octaves: 2,
-            noise_axis_scale: 1,
-            lines_enabled: true,
-            lines_max_distance: 120.0,
-            lines_width: 1.0,
-            lines_opacity_falloff: 0.8,
-            lines_color: PresetColor {
-                alpha: 255,
-                red: 255,
-                green: 255,
-                blue: 255,
-            },
-            mesh_enabled: false,
-            mesh_max_edge: 150.0,
-            mesh_opacity: 30.0,
-            mesh_color: PresetColor {
-                alpha: 255,
-                red: 100,
-                green: 150,
-                blue: 255,
-            },
-            beams_enabled: false,
-            beams_source_group: 1,
-            beams_max_distance: 300.0,
-            beams_width: 2.0,
-            beams_color: PresetColor {
-                alpha: 255,
-                red: 100,
-                green: 200,
-                blue: 255,
-            },
-            plexus_point_size: 4.0,
-            plexus_point_color: PresetColor {
-                alpha: 255,
-                red: 255,
-                green: 255,
-                blue: 255,
-            },
-        }
-    }
-}
-
 #[derive(Default)]
 struct Plugin;
 
-ae::define_effect!(Plugin, (), Params);
+ae::define_effect!(Plugin, ParticleLabProjectState, Params);
+
+const LEGACY_PLEXUS_PARAMS: &[Params] = &[
+    Params::PluginMode,
+    Params::PlexusGroupStart,
+    Params::PointGroupAStart,
+    Params::PointAEnabled,
+    Params::PointASourceType,
+    Params::PointASourceLayer,
+    Params::PointAGridResX,
+    Params::PointAGridResY,
+    Params::PointAGridResZ,
+    Params::PointAGridSpacing,
+    Params::PointAMaxPoints,
+    Params::PointGroupAEnd,
+    Params::PointGroupBStart,
+    Params::PointBEnabled,
+    Params::PointBSourceType,
+    Params::PointBSourceLayer,
+    Params::PointBGridResX,
+    Params::PointBGridResY,
+    Params::PointBGridSpacing,
+    Params::PointGroupBEnd,
+    Params::NoiseGroupStart,
+    Params::NoiseEnabled,
+    Params::NoiseAmplitude,
+    Params::NoiseFrequency,
+    Params::NoiseSpeed,
+    Params::NoiseOctaves,
+    Params::NoiseAxisScale,
+    Params::NoiseGroupEnd,
+    Params::LinesGroupStart,
+    Params::LinesEnabled,
+    Params::LinesMaxDistance,
+    Params::LinesWidth,
+    Params::LinesOpacityFalloff,
+    Params::LinesColor,
+    Params::LinesGroupEnd,
+    Params::MeshGroupStart,
+    Params::MeshEnabled,
+    Params::MeshMaxEdge,
+    Params::MeshOpacity,
+    Params::MeshColor,
+    Params::MeshGroupEnd,
+    Params::BeamsGroupStart,
+    Params::BeamsEnabled,
+    Params::BeamsSourceGroup,
+    Params::BeamsMaxDistance,
+    Params::BeamsWidth,
+    Params::BeamsColor,
+    Params::BeamsGroupEnd,
+    Params::PlexusRenderGroupStart,
+    Params::PlexusPointSize,
+    Params::PlexusPointColor,
+    Params::PlexusRenderGroupEnd,
+    Params::PlexusGroupEnd,
+];
+
+fn legacy_param_ui_flags() -> ae::ParamUIFlags {
+    ae::ParamUIFlags::NO_ECW_UI | ae::ParamUIFlags::INVISIBLE
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ImageCacheKey {
@@ -599,38 +399,29 @@ struct ImageCacheKey {
     generation: u64,
 }
 
-type SpriteCacheMap = std::collections::HashMap<ImageCacheKey, Arc<Vec<SpriteImage>>>;
-type EmitterPointCacheMap = std::collections::HashMap<ImageCacheKey, Arc<Vec<glam::Vec3>>>;
+type SpriteCacheMap = rustc_hash::FxHashMap<ImageCacheKey, Arc<Vec<SpriteImage>>>;
+type EmitterPointCacheMap = rustc_hash::FxHashMap<ImageCacheKey, Arc<Vec<glam::Vec3>>>;
 
 static IMAGE_CACHE: OnceLock<RwLock<SpriteCacheMap>> = OnceLock::new();
 static EMITTER_CACHE: OnceLock<RwLock<EmitterPointCacheMap>> = OnceLock::new();
 static IMAGE_CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
+static IMAGE_CACHE_POPULATED: AtomicBool = AtomicBool::new(false);
+static EMITTER_CACHE_POPULATED: AtomicBool = AtomicBool::new(false);
 /// Data collected in SmartPreRender (main thread) and passed to SmartRender (render thread).
 /// This avoids calling AE param/camera APIs from render threads.
 struct SmartRenderData {
-    mode: i32,
-    emitter: EmitterConfig,
-    physics: PhysicsConfig,
-    appearance: AppearanceConfig,
-    child: ChildConfig,
-    render_cfg: RenderConfig,
-    seed: u64,
-    camera_projection: Option<CameraProjection>,
-    t: f32,
-    dt: f32,
-    plexus_cfg: PlexusConfig,
-    expected_output_w: usize,
-    expected_output_h: usize,
-    expected_origin_x: i32,
-    expected_origin_y: i32,
+    engine: ParticleEngineConfig,
+    plan: ParticleRenderPlan,
+    source: EngineConfigSource,
 }
 
-const DEBUG_MODULE: &str = "ONMK_ParticleLab";
+const DEBUG_MODULE: &str = "ParticleKit";
 const MAX_RENDER_BYTES: usize = 256 * 1024 * 1024;
 const MAX_OUTPUT_PIXELS: i64 = 20_000_000; // ~4472x4472 max
 const MIN_SMART_PRE_RENDER_MARGIN: i32 = 256;
 const MAX_SMART_PRE_RENDER_MARGIN: i32 = 4096;
 const RENDER_TIME_BUDGET_MS: u128 = 10_000;
+const AE_PARAM_DYNAMIC_NAME_MAX_CHARS: usize = 31;
 
 #[cfg(windows)]
 fn debug_log(level: &str, message: impl AsRef<str>) {
@@ -656,7 +447,7 @@ fn debug_log(level: &str, message: impl AsRef<str>) {
     if let Ok(profile) = std::env::var("USERPROFILE") {
         let log_path = std::path::Path::new(&profile)
             .join("Documents")
-            .join("ParticleLab")
+            .join("Particle Kit")
             .join("debug.log");
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -711,6 +502,18 @@ fn command_name(cmd: &ae::Command) -> &'static str {
     }
 }
 
+fn command_is_sequence_owned(cmd: &ae::Command) -> bool {
+    matches!(
+        cmd,
+        ae::Command::Render { .. }
+            | ae::Command::SmartPreRender { .. }
+            | ae::Command::SmartRender { .. }
+            | ae::Command::SmartRenderGpu { .. }
+            | ae::Command::UserChangedParam { .. }
+            | ae::Command::UpdateParamsUi
+    )
+}
+
 fn should_refresh_ui(param: Params) -> bool {
     matches!(
         param,
@@ -722,20 +525,621 @@ fn should_refresh_ui(param: Params) -> bool {
             | Params::RefreshImageCache
             | Params::OpacityCurvePreset
             | Params::SizeCurvePreset
-            | Params::PluginMode
-            | Params::PointASourceType
-            | Params::PointBSourceType
     )
 }
 
 fn should_invalidate_source_cache(param: Params) -> bool {
     matches!(
         param,
-        Params::ImageSourceLayer
-            | Params::ImageProxyScale
-            | Params::RefreshImageCache
-            | Params::SpriteTimeSampling
-            | Params::SpriteFrameCount
+        Params::ImageSourceLayer | Params::ImageProxyScale | Params::RefreshImageCache
+    )
+}
+
+fn add_legacy_checkbox(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    name: &str,
+    default: bool,
+) -> Result<(), ae::Error> {
+    params.add_with_flags(
+        id,
+        name,
+        ae::CheckBoxDef::setup(|f| {
+            f.set_default(default);
+            f.set_value(default);
+            f.set_label("Enable");
+        }),
+        ae::ParamFlag::empty(),
+        legacy_param_ui_flags(),
+    )
+}
+
+fn add_legacy_popup(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    name: &str,
+    options: &[&str],
+    default: i32,
+) -> Result<(), ae::Error> {
+    params.add_with_flags(
+        id,
+        name,
+        ae::PopupDef::setup(|f| {
+            f.set_options(options);
+            f.set_default(default);
+            f.set_value(default);
+        }),
+        ae::ParamFlag::empty(),
+        legacy_param_ui_flags(),
+    )
+}
+
+fn add_legacy_slider(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    name: &str,
+    min: i32,
+    max: i32,
+    slider_min: i32,
+    slider_max: i32,
+    default: i32,
+) -> Result<(), ae::Error> {
+    params.add_with_flags(
+        id,
+        name,
+        ae::SliderDef::setup(|f| {
+            f.set_valid_min(min);
+            f.set_valid_max(max);
+            f.set_slider_min(slider_min);
+            f.set_slider_max(slider_max);
+            f.set_default(default);
+            f.set_value(default);
+        }),
+        ae::ParamFlag::empty(),
+        legacy_param_ui_flags(),
+    )
+}
+
+fn add_legacy_float(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    name: &str,
+    min: f64,
+    max: f64,
+    slider_min: f64,
+    slider_max: f64,
+    default: f64,
+    precision: i16,
+) -> Result<(), ae::Error> {
+    params.add_with_flags(
+        id,
+        name,
+        ae::FloatSliderDef::setup(|f| {
+            f.set_valid_min(min as f32);
+            f.set_valid_max(max as f32);
+            f.set_slider_min(slider_min as f32);
+            f.set_slider_max(slider_max as f32);
+            f.set_default(default);
+            f.set_value(default);
+            f.set_precision(precision);
+        }),
+        ae::ParamFlag::empty(),
+        legacy_param_ui_flags(),
+    )
+}
+
+fn add_legacy_color(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    name: &str,
+    default: ae::Pixel8,
+) -> Result<(), ae::Error> {
+    params.add_with_flags(
+        id,
+        name,
+        ae::ColorDef::setup(|f| {
+            f.set_default(default);
+            f.set_value(default);
+        }),
+        ae::ParamFlag::empty(),
+        legacy_param_ui_flags(),
+    )
+}
+
+fn add_legacy_layer(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    name: &str,
+) -> Result<(), ae::Error> {
+    params.add_with_flags(
+        id,
+        name,
+        ae::LayerDef::new(),
+        ae::ParamFlag::empty(),
+        legacy_param_ui_flags(),
+    )
+}
+
+fn add_legacy_plexus_params(params: &mut ae::Parameters<Params>) -> Result<(), ae::Error> {
+    add_legacy_popup(
+        params,
+        Params::PluginMode,
+        "Mode",
+        &["Particles", "Plexus", "Combined"],
+        1,
+    )?;
+
+    params.add_group(
+        Params::PlexusGroupStart,
+        Params::PlexusGroupEnd,
+        "Plexus",
+        true,
+        |params| {
+            params.add_group(
+                Params::PointGroupAStart,
+                Params::PointGroupAEnd,
+                "Point Group A",
+                false,
+                |params| {
+                    add_legacy_checkbox(params, Params::PointAEnabled, "Enable", true)?;
+                    add_legacy_popup(
+                        params,
+                        Params::PointASourceType,
+                        "Source Type",
+                        &["Grid", "Layer", "OBJ File", "AE Lights", "Particles"],
+                        1,
+                    )?;
+                    add_legacy_layer(params, Params::PointASourceLayer, "Source Layer")?;
+                    add_legacy_slider(
+                        params,
+                        Params::PointAGridResX,
+                        "Grid Res X",
+                        2,
+                        200,
+                        2,
+                        100,
+                        10,
+                    )?;
+                    add_legacy_slider(
+                        params,
+                        Params::PointAGridResY,
+                        "Grid Res Y",
+                        2,
+                        200,
+                        2,
+                        100,
+                        10,
+                    )?;
+                    add_legacy_slider(
+                        params,
+                        Params::PointAGridResZ,
+                        "Grid Res Z",
+                        1,
+                        100,
+                        1,
+                        50,
+                        1,
+                    )?;
+                    add_legacy_float(
+                        params,
+                        Params::PointAGridSpacing,
+                        "Grid Spacing",
+                        1.0,
+                        500.0,
+                        5.0,
+                        200.0,
+                        50.0,
+                        1,
+                    )?;
+                    add_legacy_slider(
+                        params,
+                        Params::PointAMaxPoints,
+                        "Max Points",
+                        10,
+                        10000,
+                        100,
+                        10000,
+                        5000,
+                    )?;
+                    Ok(())
+                },
+            )?;
+
+            params.add_group(
+                Params::PointGroupBStart,
+                Params::PointGroupBEnd,
+                "Point Group B",
+                true,
+                |params| {
+                    add_legacy_checkbox(params, Params::PointBEnabled, "Enable", false)?;
+                    add_legacy_popup(
+                        params,
+                        Params::PointBSourceType,
+                        "Source Type",
+                        &["Grid", "Layer", "OBJ File", "AE Lights"],
+                        1,
+                    )?;
+                    add_legacy_layer(params, Params::PointBSourceLayer, "Source Layer")?;
+                    add_legacy_slider(
+                        params,
+                        Params::PointBGridResX,
+                        "Grid Res X",
+                        2,
+                        200,
+                        2,
+                        100,
+                        10,
+                    )?;
+                    add_legacy_slider(
+                        params,
+                        Params::PointBGridResY,
+                        "Grid Res Y",
+                        2,
+                        200,
+                        2,
+                        100,
+                        10,
+                    )?;
+                    add_legacy_float(
+                        params,
+                        Params::PointBGridSpacing,
+                        "Grid Spacing",
+                        1.0,
+                        500.0,
+                        5.0,
+                        200.0,
+                        50.0,
+                        1,
+                    )?;
+                    Ok(())
+                },
+            )?;
+
+            params.add_group(
+                Params::NoiseGroupStart,
+                Params::NoiseGroupEnd,
+                "Noise Displacement",
+                true,
+                |params| {
+                    add_legacy_checkbox(params, Params::NoiseEnabled, "Enable Noise", false)?;
+                    add_legacy_float(
+                        params,
+                        Params::NoiseAmplitude,
+                        "Amplitude",
+                        0.0,
+                        1000.0,
+                        0.0,
+                        200.0,
+                        50.0,
+                        1,
+                    )?;
+                    add_legacy_float(
+                        params,
+                        Params::NoiseFrequency,
+                        "Frequency",
+                        0.001,
+                        1.0,
+                        0.001,
+                        0.1,
+                        0.01,
+                        3,
+                    )?;
+                    add_legacy_float(
+                        params,
+                        Params::NoiseSpeed,
+                        "Speed",
+                        0.0,
+                        10.0,
+                        0.0,
+                        5.0,
+                        1.0,
+                        2,
+                    )?;
+                    add_legacy_slider(params, Params::NoiseOctaves, "Octaves", 1, 8, 1, 5, 2)?;
+                    add_legacy_popup(
+                        params,
+                        Params::NoiseAxisScale,
+                        "Axis Scale",
+                        &["Uniform", "XY Only", "Z Only"],
+                        1,
+                    )?;
+                    Ok(())
+                },
+            )?;
+
+            params.add_group(
+                Params::LinesGroupStart,
+                Params::LinesGroupEnd,
+                "Lines",
+                true,
+                |params| {
+                    add_legacy_checkbox(params, Params::LinesEnabled, "Enable Lines", true)?;
+                    add_legacy_float(
+                        params,
+                        Params::LinesMaxDistance,
+                        "Max Distance",
+                        0.0,
+                        1000.0,
+                        0.0,
+                        500.0,
+                        120.0,
+                        1,
+                    )?;
+                    add_legacy_float(
+                        params,
+                        Params::LinesWidth,
+                        "Width",
+                        0.1,
+                        20.0,
+                        0.1,
+                        10.0,
+                        1.0,
+                        2,
+                    )?;
+                    add_legacy_float(
+                        params,
+                        Params::LinesOpacityFalloff,
+                        "Opacity Falloff",
+                        0.0,
+                        2.0,
+                        0.0,
+                        1.0,
+                        0.8,
+                        2,
+                    )?;
+                    add_legacy_color(
+                        params,
+                        Params::LinesColor,
+                        "Line Color",
+                        ae::Pixel8 {
+                            alpha: 255,
+                            red: 255,
+                            green: 255,
+                            blue: 255,
+                        },
+                    )?;
+                    Ok(())
+                },
+            )?;
+
+            params.add_group(
+                Params::MeshGroupStart,
+                Params::MeshGroupEnd,
+                "Mesh",
+                true,
+                |params| {
+                    add_legacy_checkbox(params, Params::MeshEnabled, "Enable Mesh", false)?;
+                    add_legacy_float(
+                        params,
+                        Params::MeshMaxEdge,
+                        "Max Edge Length",
+                        0.0,
+                        1000.0,
+                        0.0,
+                        500.0,
+                        150.0,
+                        1,
+                    )?;
+                    add_legacy_float(
+                        params,
+                        Params::MeshOpacity,
+                        "Mesh Opacity",
+                        0.0,
+                        100.0,
+                        0.0,
+                        100.0,
+                        30.0,
+                        1,
+                    )?;
+                    add_legacy_color(
+                        params,
+                        Params::MeshColor,
+                        "Mesh Color",
+                        ae::Pixel8 {
+                            alpha: 255,
+                            red: 100,
+                            green: 150,
+                            blue: 255,
+                        },
+                    )?;
+                    Ok(())
+                },
+            )?;
+
+            params.add_group(
+                Params::BeamsGroupStart,
+                Params::BeamsGroupEnd,
+                "Beams",
+                true,
+                |params| {
+                    add_legacy_checkbox(params, Params::BeamsEnabled, "Enable Beams", false)?;
+                    add_legacy_popup(
+                        params,
+                        Params::BeamsSourceGroup,
+                        "Source Group",
+                        &["A", "B"],
+                        1,
+                    )?;
+                    add_legacy_float(
+                        params,
+                        Params::BeamsMaxDistance,
+                        "Max Distance",
+                        0.0,
+                        2000.0,
+                        0.0,
+                        1000.0,
+                        300.0,
+                        1,
+                    )?;
+                    add_legacy_float(
+                        params,
+                        Params::BeamsWidth,
+                        "Width",
+                        0.1,
+                        50.0,
+                        0.1,
+                        20.0,
+                        2.0,
+                        2,
+                    )?;
+                    add_legacy_color(
+                        params,
+                        Params::BeamsColor,
+                        "Beam Color",
+                        ae::Pixel8 {
+                            alpha: 255,
+                            red: 100,
+                            green: 200,
+                            blue: 255,
+                        },
+                    )?;
+                    Ok(())
+                },
+            )?;
+
+            params.add_group(
+                Params::PlexusRenderGroupStart,
+                Params::PlexusRenderGroupEnd,
+                "Render",
+                false,
+                |params| {
+                    add_legacy_float(
+                        params,
+                        Params::PlexusPointSize,
+                        "Point Size",
+                        0.1,
+                        50.0,
+                        1.0,
+                        20.0,
+                        4.0,
+                        1,
+                    )?;
+                    add_legacy_color(
+                        params,
+                        Params::PlexusPointColor,
+                        "Point Color",
+                        ae::Pixel8 {
+                            alpha: 255,
+                            red: 255,
+                            green: 255,
+                            blue: 255,
+                        },
+                    )?;
+                    Ok(())
+                },
+            )?;
+
+            Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
+fn published_host_float_param(slot: u8) -> Option<Params> {
+    if slot == 0 || slot > PUBLISHED_HOST_FLOAT_SLOT_COUNT {
+        return None;
+    }
+    match slot {
+        1 => Some(Params::PublishedFloat1),
+        2 => Some(Params::PublishedFloat2),
+        3 => Some(Params::PublishedFloat3),
+        4 => Some(Params::PublishedFloat4),
+        _ => None,
+    }
+}
+
+fn add_published_host_float_param(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    name: &str,
+) -> Result<(), ae::Error> {
+    params.add(
+        id,
+        name,
+        ae::FloatSliderDef::setup(|f| {
+            f.set_valid_min(-1_000_000.0);
+            f.set_valid_max(1_000_000.0);
+            f.set_slider_min(-100.0);
+            f.set_slider_max(100.0);
+            f.set_default(0.0);
+            f.set_precision(2);
+        }),
+    )
+}
+
+fn add_published_host_params(params: &mut ae::Parameters<Params>) -> Result<(), ae::Error> {
+    params.add_group(
+        Params::PublishedControlsGroupStart,
+        Params::PublishedControlsGroupEnd,
+        "Published Graph Controls",
+        true,
+        |params| {
+            add_published_host_float_param(params, Params::PublishedFloat1, "Published Float 1")?;
+            add_published_host_float_param(params, Params::PublishedFloat2, "Published Float 2")?;
+            add_published_host_float_param(params, Params::PublishedFloat3, "Published Float 3")?;
+            add_published_host_float_param(params, Params::PublishedFloat4, "Published Float 4")?;
+            Ok(())
+        },
+    )
+}
+
+fn add_node_graph_tool_params(params: &mut ae::Parameters<Params>) -> Result<(), ae::Error> {
+    params.add_group(
+        Params::NodeGraphGroupStart,
+        Params::NodeGraphGroupEnd,
+        "Node Graph",
+        true,
+        |params| {
+            params.add(
+                Params::ExportNodeGraphState,
+                "Export Node Graph",
+                ae::ButtonDef::setup(|f| {
+                    f.set_label("Export");
+                }),
+            )?;
+            params.add(
+                Params::ImportNodeGraphState,
+                "Import Node Graph",
+                ae::ButtonDef::setup(|f| {
+                    f.set_label("Import");
+                }),
+            )?;
+            params.add(
+                Params::SeedNodeGraphFromParams,
+                "Seed From Current Params",
+                ae::ButtonDef::setup(|f| {
+                    f.set_label("Seed");
+                }),
+            )?;
+            params.add(
+                Params::DisableNodeGraph,
+                "Disable Node Graph",
+                ae::ButtonDef::setup(|f| {
+                    f.set_label("Disable");
+                }),
+            )?;
+            Ok(())
+        },
+    )
+}
+
+fn add_node_ui_sidecar_params(params: &mut ae::Parameters<Params>) -> Result<(), ae::Error> {
+    params.add_group(
+        Params::NodeUiSidecarGroupStart,
+        Params::NodeUiSidecarGroupEnd,
+        "Node UI Sidecar",
+        true,
+        |params| {
+            params.add(
+                Params::OpenNodeUiShell,
+                "Open Node UI Shell",
+                ae::ButtonDef::setup(|f| {
+                    f.set_label("Open Shell");
+                }),
+            )?;
+            Ok(())
+        },
     )
 }
 
@@ -995,7 +1399,7 @@ impl AdobePluginGlobal for Plugin {
                         f.set_valid_max(1.0);
                         f.set_slider_min(0.0);
                         f.set_slider_max(1.0);
-                        f.set_default(0.2);
+                        f.set_default(0.0);
                         f.set_precision(2);
                     }),
                 )?;
@@ -1715,485 +2119,10 @@ impl AdobePluginGlobal for Plugin {
             },
         )?;
 
-        // ---- Plexus ----
-        params.add_with_flags(
-            Params::PluginMode,
-            "Mode",
-            ae::PopupDef::setup(|f| {
-                f.set_options(&["Particles", "Plexus", "Combined"]);
-                f.set_default(1);
-            }),
-            ae::ParamFlag::SUPERVISE,
-            ae::ParamUIFlags::empty(),
-        )?;
-
-        params.add_group(
-            Params::PlexusGroupStart,
-            Params::PlexusGroupEnd,
-            "Plexus",
-            true,
-            |params| {
-                // Point Group A
-                params.add_group(
-                    Params::PointGroupAStart,
-                    Params::PointGroupAEnd,
-                    "Point Group A",
-                    false,
-                    |params| {
-                        params.add(
-                            Params::PointAEnabled,
-                            "Enable",
-                            ae::CheckBoxDef::setup(|f| {
-                                f.set_default(true);
-                                f.set_label("Enable");
-                            }),
-                        )?;
-                        params.add_with_flags(
-                            Params::PointASourceType,
-                            "Source Type",
-                            ae::PopupDef::setup(|f| {
-                                f.set_options(&[
-                                    "Grid",
-                                    "Layer",
-                                    "OBJ File",
-                                    "AE Lights",
-                                    "Particles",
-                                ]);
-                                f.set_default(1);
-                            }),
-                            ae::ParamFlag::SUPERVISE,
-                            ae::ParamUIFlags::empty(),
-                        )?;
-                        params.add(
-                            Params::PointASourceLayer,
-                            "Source Layer",
-                            ae::LayerDef::new(),
-                        )?;
-                        params.add(
-                            Params::PointAGridResX,
-                            "Grid Res X",
-                            ae::SliderDef::setup(|f| {
-                                f.set_valid_min(2);
-                                f.set_valid_max(200);
-                                f.set_slider_min(2);
-                                f.set_slider_max(100);
-                                f.set_default(10);
-                            }),
-                        )?;
-                        params.add(
-                            Params::PointAGridResY,
-                            "Grid Res Y",
-                            ae::SliderDef::setup(|f| {
-                                f.set_valid_min(2);
-                                f.set_valid_max(200);
-                                f.set_slider_min(2);
-                                f.set_slider_max(100);
-                                f.set_default(10);
-                            }),
-                        )?;
-                        params.add(
-                            Params::PointAGridResZ,
-                            "Grid Res Z",
-                            ae::SliderDef::setup(|f| {
-                                f.set_valid_min(1);
-                                f.set_valid_max(100);
-                                f.set_slider_min(1);
-                                f.set_slider_max(50);
-                                f.set_default(1);
-                            }),
-                        )?;
-                        params.add(
-                            Params::PointAGridSpacing,
-                            "Grid Spacing",
-                            ae::FloatSliderDef::setup(|f| {
-                                f.set_valid_min(1.0);
-                                f.set_valid_max(500.0);
-                                f.set_slider_min(5.0);
-                                f.set_slider_max(200.0);
-                                f.set_default(50.0);
-                                f.set_precision(1);
-                            }),
-                        )?;
-                        params.add(
-                            Params::PointAMaxPoints,
-                            "Max Points",
-                            ae::SliderDef::setup(|f| {
-                                f.set_valid_min(10);
-                                f.set_valid_max(10000);
-                                f.set_slider_min(100);
-                                f.set_slider_max(10000);
-                                f.set_default(5000);
-                            }),
-                        )?;
-                        Ok(())
-                    },
-                )?;
-
-                // Point Group B
-                params.add_group(
-                    Params::PointGroupBStart,
-                    Params::PointGroupBEnd,
-                    "Point Group B",
-                    true,
-                    |params| {
-                        params.add(
-                            Params::PointBEnabled,
-                            "Enable",
-                            ae::CheckBoxDef::setup(|f| {
-                                f.set_default(false);
-                                f.set_label("Enable");
-                            }),
-                        )?;
-                        params.add_with_flags(
-                            Params::PointBSourceType,
-                            "Source Type",
-                            ae::PopupDef::setup(|f| {
-                                f.set_options(&["Grid", "Layer", "OBJ File", "AE Lights"]);
-                                f.set_default(1);
-                            }),
-                            ae::ParamFlag::SUPERVISE,
-                            ae::ParamUIFlags::empty(),
-                        )?;
-                        params.add(
-                            Params::PointBSourceLayer,
-                            "Source Layer",
-                            ae::LayerDef::new(),
-                        )?;
-                        params.add(
-                            Params::PointBGridResX,
-                            "Grid Res X",
-                            ae::SliderDef::setup(|f| {
-                                f.set_valid_min(2);
-                                f.set_valid_max(200);
-                                f.set_slider_min(2);
-                                f.set_slider_max(100);
-                                f.set_default(10);
-                            }),
-                        )?;
-                        params.add(
-                            Params::PointBGridResY,
-                            "Grid Res Y",
-                            ae::SliderDef::setup(|f| {
-                                f.set_valid_min(2);
-                                f.set_valid_max(200);
-                                f.set_slider_min(2);
-                                f.set_slider_max(100);
-                                f.set_default(10);
-                            }),
-                        )?;
-                        params.add(
-                            Params::PointBGridSpacing,
-                            "Grid Spacing",
-                            ae::FloatSliderDef::setup(|f| {
-                                f.set_valid_min(1.0);
-                                f.set_valid_max(500.0);
-                                f.set_slider_min(5.0);
-                                f.set_slider_max(200.0);
-                                f.set_default(50.0);
-                                f.set_precision(1);
-                            }),
-                        )?;
-                        Ok(())
-                    },
-                )?;
-
-                // Noise
-                params.add_group(
-                    Params::NoiseGroupStart,
-                    Params::NoiseGroupEnd,
-                    "Noise Displacement",
-                    true,
-                    |params| {
-                        params.add(
-                            Params::NoiseEnabled,
-                            "Enable",
-                            ae::CheckBoxDef::setup(|f| {
-                                f.set_default(false);
-                                f.set_label("Enable");
-                            }),
-                        )?;
-                        params.add(
-                            Params::NoiseAmplitude,
-                            "Amplitude",
-                            ae::FloatSliderDef::setup(|f| {
-                                f.set_valid_min(0.0);
-                                f.set_valid_max(1000.0);
-                                f.set_slider_min(0.0);
-                                f.set_slider_max(300.0);
-                                f.set_default(50.0);
-                                f.set_precision(1);
-                            }),
-                        )?;
-                        params.add(
-                            Params::NoiseFrequency,
-                            "Frequency",
-                            ae::FloatSliderDef::setup(|f| {
-                                f.set_valid_min(0.001);
-                                f.set_valid_max(10.0);
-                                f.set_slider_min(0.01);
-                                f.set_slider_max(2.0);
-                                f.set_default(0.01);
-                                f.set_precision(3);
-                            }),
-                        )?;
-                        params.add(
-                            Params::NoiseSpeed,
-                            "Speed",
-                            ae::FloatSliderDef::setup(|f| {
-                                f.set_valid_min(0.0);
-                                f.set_valid_max(10.0);
-                                f.set_slider_min(0.0);
-                                f.set_slider_max(5.0);
-                                f.set_default(1.0);
-                                f.set_precision(2);
-                            }),
-                        )?;
-                        params.add(
-                            Params::NoiseOctaves,
-                            "Octaves",
-                            ae::SliderDef::setup(|f| {
-                                f.set_valid_min(1);
-                                f.set_valid_max(6);
-                                f.set_slider_min(1);
-                                f.set_slider_max(6);
-                                f.set_default(2);
-                            }),
-                        )?;
-                        params.add(
-                            Params::NoiseAxisScale,
-                            "Mode",
-                            ae::PopupDef::setup(|f| {
-                                f.set_options(&["Uniform", "Per-Axis"]);
-                                f.set_default(1);
-                            }),
-                        )?;
-                        Ok(())
-                    },
-                )?;
-
-                // Lines
-                params.add_group(
-                    Params::LinesGroupStart,
-                    Params::LinesGroupEnd,
-                    "Lines",
-                    true,
-                    |params| {
-                        params.add(
-                            Params::LinesEnabled,
-                            "Enable",
-                            ae::CheckBoxDef::setup(|f| {
-                                f.set_default(true);
-                                f.set_label("Enable");
-                            }),
-                        )?;
-                        params.add(
-                            Params::LinesMaxDistance,
-                            "Max Distance",
-                            ae::FloatSliderDef::setup(|f| {
-                                f.set_valid_min(1.0);
-                                f.set_valid_max(2000.0);
-                                f.set_slider_min(10.0);
-                                f.set_slider_max(500.0);
-                                f.set_default(120.0);
-                                f.set_precision(1);
-                            }),
-                        )?;
-                        params.add(
-                            Params::LinesWidth,
-                            "Line Width",
-                            ae::FloatSliderDef::setup(|f| {
-                                f.set_valid_min(0.5);
-                                f.set_valid_max(20.0);
-                                f.set_slider_min(0.5);
-                                f.set_slider_max(10.0);
-                                f.set_default(1.0);
-                                f.set_precision(1);
-                            }),
-                        )?;
-                        params.add(
-                            Params::LinesOpacityFalloff,
-                            "Opacity Falloff",
-                            ae::FloatSliderDef::setup(|f| {
-                                f.set_valid_min(0.0);
-                                f.set_valid_max(1.0);
-                                f.set_slider_min(0.0);
-                                f.set_slider_max(1.0);
-                                f.set_default(0.8);
-                                f.set_precision(2);
-                            }),
-                        )?;
-                        params.add(
-                            Params::LinesColor,
-                            "Line Color",
-                            ae::ColorDef::setup(|f| {
-                                f.set_default(ae::Pixel8 {
-                                    alpha: 255,
-                                    red: 255,
-                                    green: 255,
-                                    blue: 255,
-                                });
-                            }),
-                        )?;
-                        Ok(())
-                    },
-                )?;
-
-                // Mesh
-                params.add_group(
-                    Params::MeshGroupStart,
-                    Params::MeshGroupEnd,
-                    "Mesh",
-                    true,
-                    |params| {
-                        params.add(
-                            Params::MeshEnabled,
-                            "Enable",
-                            ae::CheckBoxDef::setup(|f| {
-                                f.set_default(false);
-                                f.set_label("Enable");
-                            }),
-                        )?;
-                        params.add(
-                            Params::MeshMaxEdge,
-                            "Max Edge Length",
-                            ae::FloatSliderDef::setup(|f| {
-                                f.set_valid_min(1.0);
-                                f.set_valid_max(2000.0);
-                                f.set_slider_min(10.0);
-                                f.set_slider_max(500.0);
-                                f.set_default(150.0);
-                                f.set_precision(1);
-                            }),
-                        )?;
-                        params.add(
-                            Params::MeshOpacity,
-                            "Mesh Opacity",
-                            ae::FloatSliderDef::setup(|f| {
-                                f.set_valid_min(0.0);
-                                f.set_valid_max(100.0);
-                                f.set_slider_min(0.0);
-                                f.set_slider_max(100.0);
-                                f.set_default(30.0);
-                                f.set_precision(1);
-                            }),
-                        )?;
-                        params.add(
-                            Params::MeshColor,
-                            "Mesh Color",
-                            ae::ColorDef::setup(|f| {
-                                f.set_default(ae::Pixel8 {
-                                    alpha: 255,
-                                    red: 100,
-                                    green: 150,
-                                    blue: 255,
-                                });
-                            }),
-                        )?;
-                        Ok(())
-                    },
-                )?;
-
-                // Beams
-                params.add_group(
-                    Params::BeamsGroupStart,
-                    Params::BeamsGroupEnd,
-                    "Beams",
-                    true,
-                    |params| {
-                        params.add(
-                            Params::BeamsEnabled,
-                            "Enable",
-                            ae::CheckBoxDef::setup(|f| {
-                                f.set_default(false);
-                                f.set_label("Enable");
-                            }),
-                        )?;
-                        params.add(
-                            Params::BeamsSourceGroup,
-                            "Direction",
-                            ae::PopupDef::setup(|f| {
-                                f.set_options(&["A -> B", "B -> A", "A -> A", "B -> B"]);
-                                f.set_default(1);
-                            }),
-                        )?;
-                        params.add(
-                            Params::BeamsMaxDistance,
-                            "Max Distance",
-                            ae::FloatSliderDef::setup(|f| {
-                                f.set_valid_min(1.0);
-                                f.set_valid_max(5000.0);
-                                f.set_slider_min(10.0);
-                                f.set_slider_max(1000.0);
-                                f.set_default(300.0);
-                                f.set_precision(1);
-                            }),
-                        )?;
-                        params.add(
-                            Params::BeamsWidth,
-                            "Beam Width",
-                            ae::FloatSliderDef::setup(|f| {
-                                f.set_valid_min(0.5);
-                                f.set_valid_max(30.0);
-                                f.set_slider_min(0.5);
-                                f.set_slider_max(15.0);
-                                f.set_default(2.0);
-                                f.set_precision(1);
-                            }),
-                        )?;
-                        params.add(
-                            Params::BeamsColor,
-                            "Beam Color",
-                            ae::ColorDef::setup(|f| {
-                                f.set_default(ae::Pixel8 {
-                                    alpha: 255,
-                                    red: 100,
-                                    green: 200,
-                                    blue: 255,
-                                });
-                            }),
-                        )?;
-                        Ok(())
-                    },
-                )?;
-
-                // Plexus Rendering
-                params.add_group(
-                    Params::PlexusRenderGroupStart,
-                    Params::PlexusRenderGroupEnd,
-                    "Point Rendering",
-                    false,
-                    |params| {
-                        params.add(
-                            Params::PlexusPointSize,
-                            "Point Size",
-                            ae::FloatSliderDef::setup(|f| {
-                                f.set_valid_min(0.5);
-                                f.set_valid_max(50.0);
-                                f.set_slider_min(1.0);
-                                f.set_slider_max(20.0);
-                                f.set_default(4.0);
-                                f.set_precision(1);
-                            }),
-                        )?;
-                        params.add(
-                            Params::PlexusPointColor,
-                            "Point Color",
-                            ae::ColorDef::setup(|f| {
-                                f.set_default(ae::Pixel8 {
-                                    alpha: 255,
-                                    red: 255,
-                                    green: 255,
-                                    blue: 255,
-                                });
-                            }),
-                        )?;
-                        Ok(())
-                    },
-                )?;
-
-                Ok(())
-            },
-        )?;
+        add_legacy_plexus_params(params)?;
+        add_published_host_params(params)?;
+        add_node_graph_tool_params(params)?;
+        add_node_ui_sidecar_params(params)?;
 
         Ok(())
     }
@@ -2215,10 +2144,14 @@ impl AdobePluginGlobal for Plugin {
         ));
 
         let result = match panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), ae::Error> {
+            if command_is_sequence_owned(&cmd) {
+                return Ok(());
+            }
+
             match cmd {
                 ae::Command::About => {
                     out_data.set_return_msg(
-                        "ONMK_ParticleLab v2.0\rParticle system plugin.\rEmitters, physics, child particles.\rWritten in Rust.",
+                        "Particle Kit v1.0\rOpen-source particle effect plugin for After Effects.\rEmitters, physics, child particles.\rWritten in Rust.",
                     );
                     Ok(())
                 }
@@ -2227,111 +2160,23 @@ impl AdobePluginGlobal for Plugin {
                     out_data.set_out_flag(ae::OutFlags::IExpandBuffer, true);
                     out_data.set_out_flag(ae::OutFlags::SendUpdateParamsUi, true);
                     out_data.set_out_flag(ae::OutFlags::NonParamVary, true);
+                    out_data.set_out_flag(ae::OutFlags::SequenceDataNeedsFlattening, true);
                     out_data.set_out_flag2(ae::OutFlags2::ParamGroupStartCollapsedFlag, true);
                     out_data.set_out_flag2(ae::OutFlags2::IUse3DCamera, true);
                     out_data.set_out_flag2(ae::OutFlags2::SupportsSmartRender, true);
+                    out_data.set_out_flag2(ae::OutFlags2::SupportsGetFlattenedSequenceData, true);
                     Ok(())
                 }
 
-                ae::Command::Render {
-                    in_layer,
-                    mut out_layer,
-                } => render_particles(params, &in_data, &in_layer, &mut out_layer),
+                ae::Command::Render { .. } => Ok(()),
 
-                ae::Command::SmartPreRender { mut extra } => {
-                    let req = extra.output_request();
-                    let cb = extra.callbacks();
-                    let in_result = cb.checkout_layer(
-                        0,
-                        0,
-                        &req,
-                        in_data.current_time(),
-                        in_data.time_step(),
-                        in_data.time_scale(),
-                    )?;
-
-                    let in_rect: ae::Rect = in_result.result_rect.into();
-                    let in_max: ae::Rect = in_result.max_result_rect.into();
-                    let margin = estimate_render_margin(params)?;
-                    let expanded_input = ae::Rect {
-                        left: in_rect.left.saturating_sub(margin),
-                        top: in_rect.top.saturating_sub(margin),
-                        right: in_rect.right.saturating_add(margin),
-                        bottom: in_rect.bottom.saturating_add(margin),
-                    };
-                    let expanded_max = ae::Rect {
-                        left: in_max.left.saturating_sub(margin),
-                        top: in_max.top.saturating_sub(margin),
-                        right: in_max.right.saturating_add(margin),
-                        bottom: in_max.bottom.saturating_add(margin),
-                    };
-                    let emitter_rect = estimated_emitter_bounds(params, margin)?;
-                    let expanded = clamp_rect_to_pixel_budget(
-                        union_rect(expanded_input, emitter_rect),
-                        MAX_OUTPUT_PIXELS,
-                    );
-                    let max_expanded = clamp_rect_to_pixel_budget(
-                        union_rect(expanded_max, emitter_rect),
-                        MAX_OUTPUT_PIXELS,
-                    );
-                    extra.set_result_rect(expanded);
-                    extra.set_max_result_rect(max_expanded);
-                    extra.set_returns_extra_pixels(true);
-
-                    // Collect ALL data on the PreRender thread (safe for AE API calls).
-                    // SmartRender will NOT call any AE param/camera APIs.
-                    let mode = get_plugin_mode(params)?;
-                    let (mut emitter, physics, appearance, child, mut render_cfg, seed) =
-                        extract_configs(params)?;
-                    populate_layer_alpha_emitter(params, &in_data, &mut emitter)?;
-                    populate_path_emitter(params, &in_data, &mut emitter)?;
-                    populate_image_sprite(params, &in_data, &mut render_cfg)?;
-                    let camera_projection = try_get_camera_projection(&in_data);
-                    let t = current_time_sec(&in_data);
-                    let dt = time_step_sec(&in_data);
-
-                    let plexus_cfg = if mode == 2 || mode == 3 {
-                        extract_plexus_configs(params)?
-                    } else {
-                        PlexusConfig::default()
-                    };
-
-                    let expected_output_w = (expanded.right - expanded.left).max(1) as usize;
-                    let expected_output_h = (expanded.bottom - expanded.top).max(1) as usize;
-                    let expected_origin_x = expanded.left;
-                    let expected_origin_y = expanded.top;
-                    extra.set_pre_render_data(SmartRenderData {
-                        mode,
-                        emitter,
-                        physics,
-                        appearance,
-                        child,
-                        render_cfg,
-                        seed,
-                        camera_projection,
-                        t,
-                        dt,
-                        plexus_cfg,
-                        expected_output_w,
-                        expected_output_h,
-                        expected_origin_x,
-                        expected_origin_y,
-                    });
-
-                    debug_info(format!(
-                        "SmartPreRender in_rect left={} top={} right={} bottom={} expanded_margin={} expanded_rect=({}, {}, {}, {})",
-                        in_rect.left, in_rect.top, in_rect.right, in_rect.bottom,
-                        margin, expanded.left, expanded.top, expanded.right, expanded.bottom
-                    ));
-                    Ok(())
-                }
+                ae::Command::SmartPreRender { .. } => Ok(()),
 
                 ae::Command::SmartRender { extra } => {
                     let render_start = Instant::now();
                     match smart_render_particles(render_start, &in_data, &extra) {
                         Ok(()) => Ok(()),
-                        // Any error path — cancellation OR a real failure —
-                        // must be surfaced to AE as `InterruptCancel`.
+                        // Any error path  Ecancellation OR a real failure  E                        // must be surfaced to AE as `InterruptCancel`.
                         //
                         // Background: AE's SmartFX contract is "if you return
                         // Ok(()) you promised to have populated the output
@@ -2352,7 +2197,7 @@ impl AdobePluginGlobal for Plugin {
                         }
                         Err(e) => {
                             debug_error(format!(
-                                "SmartRender error: {:?} — signalling InterruptCancel to avoid cache poisoning",
+                                "SmartRender error: {:?}  Esignalling InterruptCancel to avoid cache poisoning",
                                 e
                             ));
                             Err(ae::Error::InterruptCancel)
@@ -2396,7 +2241,7 @@ impl AdobePluginGlobal for Plugin {
                         invalidate_image_cache();
                     }
                     if changed == Params::RefreshImageCache {
-                        out_data.set_return_msg("ParticleLab image cache refreshed.");
+                        out_data.set_return_msg("Particle Kit image cache refreshed.");
                         debug_info("RefreshImageCache button pressed");
                     }
 
@@ -2408,7 +2253,7 @@ impl AdobePluginGlobal for Plugin {
                 }
 
                 ae::Command::UpdateParamsUi => {
-                    update_shape_dependent_ui(params)?;
+                    update_shape_dependent_ui(params, None)?;
                     Ok(())
                 }
 
@@ -2437,6 +2282,69 @@ impl AdobePluginGlobal for Plugin {
     }
 }
 
+impl AdobePluginInstance for ParticleLabProjectState {
+    fn flatten(&self) -> Result<(u16, Vec<u8>), ae::Error> {
+        self.flatten_bytes()
+            .map(|bytes| (PROJECT_STATE_VERSION, bytes))
+            .map_err(|_| ae::Error::Generic)
+    }
+
+    fn unflatten(version: u16, serialized: &[u8]) -> Result<Self, ae::Error> {
+        ParticleLabProjectState::unflatten_bytes(version, serialized)
+            .map_err(|_| ae::Error::Generic)
+    }
+
+    fn render(
+        &self,
+        plugin: &mut PluginState,
+        in_layer: &ae::Layer,
+        out_layer: &mut ae::Layer,
+    ) -> Result<(), ae::Error> {
+        render_particles(plugin.params, self, &plugin.in_data, in_layer, out_layer)
+    }
+
+    fn handle_command(
+        &mut self,
+        plugin: &mut PluginState,
+        command: ae::Command,
+    ) -> Result<(), ae::Error> {
+        match command {
+            ae::Command::SmartPreRender { mut extra } => {
+                smart_pre_render_particles(plugin.params, self, &plugin.in_data, &mut extra)
+            }
+            ae::Command::SmartRender { extra } => {
+                let render_start = Instant::now();
+                match smart_render_particles(render_start, &plugin.in_data, &extra) {
+                    Ok(()) => Ok(()),
+                    Err(ae::Error::InterruptCancel) => {
+                        debug_info("SmartRender interrupted (cancel)");
+                        Err(ae::Error::InterruptCancel)
+                    }
+                    Err(err) => {
+                        debug_error(format!(
+                            "SmartRender error: {:?} - signalling InterruptCancel to avoid cache poisoning",
+                            err
+                        ));
+                        Err(ae::Error::InterruptCancel)
+                    }
+                }
+            }
+            ae::Command::SmartRenderGpu { .. } => {
+                debug_error("SmartRenderGpu requested but GPU render path is not implemented");
+                Err(ae::Error::Generic)
+            }
+            ae::Command::UserChangedParam { param_index } => {
+                handle_user_changed_param(param_index, plugin.params, self, &mut plugin.out_data)
+            }
+            ae::Command::UpdateParamsUi => {
+                update_shape_dependent_ui(plugin.params, Some(self))?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 // ---- Extract all parameters into configs ----
 
 #[cfg(windows)]
@@ -2444,12 +2352,103 @@ fn preset_root_dir() -> Result<PathBuf, ae::Error> {
     let userprofile = std::env::var("USERPROFILE").map_err(|_| ae::Error::Generic)?;
     Ok(PathBuf::from(userprofile)
         .join("Documents")
-        .join("ParticleLab")
+        .join("Particle Kit")
         .join("presets"))
 }
 
 #[cfg(not(windows))]
 fn preset_root_dir() -> Result<std::path::PathBuf, ae::Error> {
+    Err(ae::Error::Generic)
+}
+
+#[cfg(windows)]
+fn node_graph_state_root_dir() -> Result<PathBuf, ae::Error> {
+    let userprofile = std::env::var("USERPROFILE").map_err(|_| ae::Error::Generic)?;
+    Ok(PathBuf::from(userprofile)
+        .join("Documents")
+        .join("Particle Kit")
+        .join("node-graphs"))
+}
+
+#[cfg(not(windows))]
+fn node_graph_state_root_dir() -> Result<std::path::PathBuf, ae::Error> {
+    Err(ae::Error::Generic)
+}
+
+fn node_ui_shell_assets() -> [(&'static str, &'static str); 4] {
+    [
+        ("index.html", NODE_UI_SHELL_INDEX_HTML),
+        ("app.js", NODE_UI_SHELL_APP_JS),
+        ("styles.css", NODE_UI_SHELL_STYLES_CSS),
+        ("startup-payload.js", NODE_UI_SHELL_STARTUP_JS),
+    ]
+}
+
+fn node_ui_shell_startup_payload_js(
+    project_state: &ParticleLabProjectState,
+) -> Result<String, ae::Error> {
+    let payload = project_state.node_ui_bootstrap_payload();
+    let json = serde_json::to_string_pretty(&payload).map_err(|_| ae::Error::Generic)?;
+    Ok(format!(
+        "window.PARTICLELAB_NODE_UI_BOOTSTRAP = {};\nwindow.PARTICLELAB_NODE_UI_BOOTSTRAP_SOURCE = \"AE sidecar startup payload\";\n",
+        json
+    ))
+}
+
+#[cfg(windows)]
+fn node_ui_shell_root_dir() -> Result<PathBuf, ae::Error> {
+    let userprofile = std::env::var("USERPROFILE").map_err(|_| ae::Error::Generic)?;
+    Ok(PathBuf::from(userprofile)
+        .join("Documents")
+        .join("Particle Kit")
+        .join("node-ui-shell"))
+}
+
+#[cfg(not(windows))]
+fn node_ui_shell_root_dir() -> Result<std::path::PathBuf, ae::Error> {
+    Err(ae::Error::Generic)
+}
+
+#[cfg(windows)]
+fn install_node_ui_shell_assets(
+    project_state: &ParticleLabProjectState,
+) -> Result<PathBuf, ae::Error> {
+    let dir = node_ui_shell_root_dir()?;
+    fs::create_dir_all(&dir).map_err(|_| ae::Error::Generic)?;
+    for (filename, contents) in node_ui_shell_assets() {
+        fs::write(dir.join(filename), contents).map_err(|_| ae::Error::Generic)?;
+    }
+    fs::write(
+        dir.join("startup-payload.js"),
+        node_ui_shell_startup_payload_js(project_state)?,
+    )
+    .map_err(|_| ae::Error::Generic)?;
+    Ok(dir.join("index.html"))
+}
+
+#[cfg(not(windows))]
+fn install_node_ui_shell_assets(
+    _project_state: &ParticleLabProjectState,
+) -> Result<std::path::PathBuf, ae::Error> {
+    Err(ae::Error::Generic)
+}
+
+#[cfg(windows)]
+fn open_node_ui_shell_sidecar(
+    project_state: &ParticleLabProjectState,
+) -> Result<PathBuf, ae::Error> {
+    let index_path = install_node_ui_shell_assets(project_state)?;
+    std::process::Command::new("explorer.exe")
+        .arg(index_path.as_os_str())
+        .spawn()
+        .map_err(|_| ae::Error::Generic)?;
+    Ok(index_path)
+}
+
+#[cfg(not(windows))]
+fn open_node_ui_shell_sidecar(
+    _project_state: &ParticleLabProjectState,
+) -> Result<std::path::PathBuf, ae::Error> {
     Err(ae::Error::Generic)
 }
 
@@ -2466,6 +2465,25 @@ fn epoch_days_to_date(days: i64) -> (i64, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+fn timestamped_json_name(prefix: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let days = now / 86400;
+    let tod = now % 86400;
+    let (y, m, d) = epoch_days_to_date(days as i64);
+    format!(
+        "{}_{:04}{:02}{:02}_{:02}{:02}{:02}.json",
+        prefix,
+        y,
+        m,
+        d,
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
 }
 
 #[cfg(windows)]
@@ -2536,7 +2554,8 @@ fn handle_preset_command(
 
             if let Some(path) = file_dialog::open_file_dialog(&dir_str, "Load Preset") {
                 let contents = fs::read_to_string(&path).map_err(|_| ae::Error::Generic)?;
-                let snapshot = load_preset_snapshot(&contents)?;
+                let snapshot = load_preset_snapshot(&contents).map_err(|_| ae::Error::Generic)?;
+                let _ = snapshot.to_engine_config();
                 apply_preset(params, &snapshot)?;
                 invalidate_image_cache();
                 let label = path
@@ -2570,6 +2589,245 @@ fn handle_preset_command(
     Ok(())
 }
 
+fn handle_preset_command_with_project_state(
+    changed: Params,
+    params: &ae::Parameters<Params>,
+    project_state: &mut ParticleLabProjectState,
+    out_data: &mut ae::OutData,
+) -> Result<(), ae::Error> {
+    match changed {
+        Params::SavePreset => {
+            let dir = preset_root_dir()?;
+            fs::create_dir_all(&dir).map_err(|_| ae::Error::Generic)?;
+            let dir_str = dir.to_string_lossy().to_string();
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let days = now / 86400;
+            let tod = now % 86400;
+            let (y, m, d) = epoch_days_to_date(days as i64);
+            let default_name = format!(
+                "preset_{:04}{:02}{:02}_{:02}{:02}{:02}.json",
+                y,
+                m,
+                d,
+                tod / 3600,
+                (tod % 3600) / 60,
+                tod % 60
+            );
+
+            if let Some(path) =
+                file_dialog::save_file_dialog(&dir_str, "Save Preset", &default_name)
+            {
+                let mut snapshot = capture_preset(params)?;
+                snapshot.name = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                snapshot.graph_document = project_state.graph.document.clone();
+                if snapshot.graph_document.is_some() {
+                    snapshot.graph_published_values = project_state.graph.published_values.clone();
+                }
+                let json =
+                    serde_json::to_string_pretty(&snapshot).map_err(|_| ae::Error::Generic)?;
+                fs::write(&path, json).map_err(|_| ae::Error::Generic)?;
+                out_data.set_return_msg(&format!(
+                    "Preset saved: {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+        Params::LoadPreset => {
+            let dir = preset_root_dir()?;
+            fs::create_dir_all(&dir).map_err(|_| ae::Error::Generic)?;
+            let dir_str = dir.to_string_lossy().to_string();
+
+            if let Some(path) = file_dialog::open_file_dialog(&dir_str, "Load Preset") {
+                let contents = fs::read_to_string(&path).map_err(|_| ae::Error::Generic)?;
+                let snapshot = load_preset_snapshot(&contents).map_err(|_| ae::Error::Generic)?;
+                let _ = snapshot.to_engine_config();
+                apply_preset(params, &snapshot)?;
+                project_state.replace_graph_document(snapshot.graph_document.clone());
+                if snapshot.graph_document.is_some() {
+                    project_state.graph.published_values = snapshot.graph_published_values.clone();
+                }
+                invalidate_image_cache();
+                let label = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                out_data.set_return_msg(&format!("Preset loaded: {}", label));
+            }
+        }
+        Params::DeletePreset | Params::OpenPresetFolder => {
+            handle_preset_command(changed, params, out_data)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_node_graph_tool_command(
+    changed: Params,
+    params: &ae::Parameters<Params>,
+    project_state: &mut ParticleLabProjectState,
+    out_data: &mut ae::OutData,
+) -> Result<(), ae::Error> {
+    match changed {
+        Params::ExportNodeGraphState => {
+            let dir = node_graph_state_root_dir()?;
+            fs::create_dir_all(&dir).map_err(|_| ae::Error::Generic)?;
+            let dir_str = dir.to_string_lossy().to_string();
+            let default_name = timestamped_json_name("node_graph");
+            if let Some(path) =
+                file_dialog::save_file_dialog(&dir_str, "Export Node Graph", &default_name)
+            {
+                let payload = project_state.node_ui_bootstrap_payload();
+                let json =
+                    serde_json::to_string_pretty(&payload).map_err(|_| ae::Error::Generic)?;
+                fs::write(&path, json).map_err(|_| ae::Error::Generic)?;
+                out_data.set_return_msg(&format!(
+                    "Node graph exported: {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+        }
+        Params::ImportNodeGraphState => {
+            let dir = node_graph_state_root_dir()?;
+            fs::create_dir_all(&dir).map_err(|_| ae::Error::Generic)?;
+            let dir_str = dir.to_string_lossy().to_string();
+            if let Some(path) = file_dialog::open_file_dialog(&dir_str, "Import Node Graph") {
+                let contents = fs::read_to_string(&path).map_err(|_| ae::Error::Generic)?;
+                let snapshot = match NodeUiGraphStateSnapshot::from_node_ui_json(&contents) {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        debug_error(format!("Node graph import JSON error: {:?}", err));
+                        out_data.set_return_msg("Node graph import failed: invalid JSON.");
+                        return Ok(());
+                    }
+                };
+                if let Err(err) = project_state.commit_node_ui_graph_state_snapshot(snapshot) {
+                    debug_error(format!("Node graph import rejected: {:?}", err));
+                    out_data.set_return_msg("Node graph import failed: incompatible graph.");
+                    return Ok(());
+                }
+                let label = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                update_shape_dependent_ui(params, Some(project_state))?;
+                out_data.set_return_msg(&format!("Node graph imported: {}", label));
+                out_data.set_out_flag(ae::OutFlags::RefreshUi, true);
+                invalidate_image_cache();
+            }
+        }
+        Params::SeedNodeGraphFromParams => {
+            let config = extract_engine_config(params)?.normalized_for_render();
+            project_state.replace_graph_from_engine_config(&config);
+            update_shape_dependent_ui(params, Some(project_state))?;
+            out_data.set_return_msg("Node graph seeded from current ParticleLab params.");
+            out_data.set_out_flag(ae::OutFlags::RefreshUi, true);
+            invalidate_image_cache();
+        }
+        Params::DisableNodeGraph => {
+            project_state.set_graph_enabled(false);
+            update_shape_dependent_ui(params, Some(project_state))?;
+            out_data.set_return_msg("Node graph disabled; classic ParticleLab params are active.");
+            out_data.set_out_flag(ae::OutFlags::RefreshUi, true);
+            invalidate_image_cache();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_node_ui_sidecar_command(
+    changed: Params,
+    project_state: &ParticleLabProjectState,
+    out_data: &mut ae::OutData,
+) -> Result<(), ae::Error> {
+    match changed {
+        Params::OpenNodeUiShell => match open_node_ui_shell_sidecar(project_state) {
+            Ok(path) => {
+                out_data.set_return_msg(&format!(
+                    "Node UI shell opened: {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+            Err(err) => {
+                debug_error(format!("Node UI shell open failed: {:?}", err));
+                out_data.set_return_msg("Node UI shell open failed.");
+                return Err(err);
+            }
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_user_changed_param(
+    param_index: usize,
+    params: &ae::Parameters<Params>,
+    project_state: &mut ParticleLabProjectState,
+    out_data: &mut ae::OutData,
+) -> Result<(), ae::Error> {
+    let changed = params.type_at(param_index);
+    if matches!(
+        changed,
+        Params::SavePreset | Params::LoadPreset | Params::DeletePreset | Params::OpenPresetFolder
+    ) {
+        handle_preset_command_with_project_state(changed, params, project_state, out_data)?;
+        if changed == Params::LoadPreset {
+            update_shape_dependent_ui(params, Some(project_state))?;
+        }
+    }
+    if matches!(
+        changed,
+        Params::ExportNodeGraphState
+            | Params::ImportNodeGraphState
+            | Params::SeedNodeGraphFromParams
+            | Params::DisableNodeGraph
+    ) {
+        handle_node_graph_tool_command(changed, params, project_state, out_data)?;
+    }
+    if matches!(changed, Params::OpenNodeUiShell) {
+        handle_node_ui_sidecar_command(changed, project_state, out_data)?;
+    }
+    if matches!(
+        changed,
+        Params::EmitterSizeX
+            | Params::EmitterSizeY
+            | Params::EmitterSizeZ
+            | Params::EmitterSizeLinked
+    ) {
+        sync_box_size_axes(params, changed)?;
+    }
+    if changed == Params::OpacityCurvePreset {
+        apply_opacity_preset(params)?;
+    }
+    if changed == Params::SizeCurvePreset {
+        apply_size_preset(params)?;
+    }
+    out_data.set_force_rerender();
+    if should_invalidate_source_cache(changed) {
+        invalidate_image_cache();
+    }
+    if changed == Params::RefreshImageCache {
+        out_data.set_return_msg("Particle Kit image cache refreshed.");
+        debug_info("RefreshImageCache button pressed");
+    }
+
+    if should_refresh_ui(changed) {
+        out_data.set_out_flag(ae::OutFlags::RefreshUi, true);
+    }
+    debug_info(format!("UserChangedParam index={}", param_index));
+    Ok(())
+}
+
 fn capture_preset(params: &ae::Parameters<Params>) -> Result<PresetSnapshot, ae::Error> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2589,6 +2847,8 @@ fn capture_preset(params: &ae::Parameters<Params>) -> Result<PresetSnapshot, ae:
     Ok(PresetSnapshot {
         version: PRESET_VERSION,
         name,
+        graph_document: None,
+        graph_published_values: Vec::new(),
         emitter_type: params.get(Params::EmitterType)?.as_popup()?.value(),
         emit_mode: params.get(Params::EmitMode)?.as_popup()?.value(),
         position_point: params.get(Params::PositionPoint)?.as_point()?.value(),
@@ -2703,70 +2963,6 @@ fn capture_preset(params: &ae::Parameters<Params>) -> Result<PresetSnapshot, ae:
             .as_float_slider()?
             .value(),
         seed: params.get(Params::Seed)?.as_slider()?.value(),
-        // ---- Plexus ----
-        plugin_mode: params.get(Params::PluginMode)?.as_popup()?.value(),
-        point_a_enabled: params.get(Params::PointAEnabled)?.as_checkbox()?.value(),
-        point_a_source_type: params.get(Params::PointASourceType)?.as_popup()?.value(),
-        point_a_grid_res_x: params.get(Params::PointAGridResX)?.as_slider()?.value(),
-        point_a_grid_res_y: params.get(Params::PointAGridResY)?.as_slider()?.value(),
-        point_a_grid_res_z: params.get(Params::PointAGridResZ)?.as_slider()?.value(),
-        point_a_grid_spacing: params
-            .get(Params::PointAGridSpacing)?
-            .as_float_slider()?
-            .value(),
-        point_a_max_points: params.get(Params::PointAMaxPoints)?.as_slider()?.value(),
-        point_b_enabled: params.get(Params::PointBEnabled)?.as_checkbox()?.value(),
-        point_b_source_type: params.get(Params::PointBSourceType)?.as_popup()?.value(),
-        point_b_grid_res_x: params.get(Params::PointBGridResX)?.as_slider()?.value(),
-        point_b_grid_res_y: params.get(Params::PointBGridResY)?.as_slider()?.value(),
-        point_b_grid_spacing: params
-            .get(Params::PointBGridSpacing)?
-            .as_float_slider()?
-            .value(),
-        noise_enabled: params.get(Params::NoiseEnabled)?.as_checkbox()?.value(),
-        noise_amplitude: params
-            .get(Params::NoiseAmplitude)?
-            .as_float_slider()?
-            .value(),
-        noise_frequency: params
-            .get(Params::NoiseFrequency)?
-            .as_float_slider()?
-            .value(),
-        noise_speed: params.get(Params::NoiseSpeed)?.as_float_slider()?.value(),
-        noise_octaves: params.get(Params::NoiseOctaves)?.as_slider()?.value(),
-        noise_axis_scale: params.get(Params::NoiseAxisScale)?.as_popup()?.value(),
-        lines_enabled: params.get(Params::LinesEnabled)?.as_checkbox()?.value(),
-        lines_max_distance: params
-            .get(Params::LinesMaxDistance)?
-            .as_float_slider()?
-            .value(),
-        lines_width: params.get(Params::LinesWidth)?.as_float_slider()?.value(),
-        lines_opacity_falloff: params
-            .get(Params::LinesOpacityFalloff)?
-            .as_float_slider()?
-            .value(),
-        lines_color: params.get(Params::LinesColor)?.as_color()?.value().into(),
-        mesh_enabled: params.get(Params::MeshEnabled)?.as_checkbox()?.value(),
-        mesh_max_edge: params.get(Params::MeshMaxEdge)?.as_float_slider()?.value(),
-        mesh_opacity: params.get(Params::MeshOpacity)?.as_float_slider()?.value(),
-        mesh_color: params.get(Params::MeshColor)?.as_color()?.value().into(),
-        beams_enabled: params.get(Params::BeamsEnabled)?.as_checkbox()?.value(),
-        beams_source_group: params.get(Params::BeamsSourceGroup)?.as_popup()?.value(),
-        beams_max_distance: params
-            .get(Params::BeamsMaxDistance)?
-            .as_float_slider()?
-            .value(),
-        beams_width: params.get(Params::BeamsWidth)?.as_float_slider()?.value(),
-        beams_color: params.get(Params::BeamsColor)?.as_color()?.value().into(),
-        plexus_point_size: params
-            .get(Params::PlexusPointSize)?
-            .as_float_slider()?
-            .value(),
-        plexus_point_color: params
-            .get(Params::PlexusPointColor)?
-            .as_color()?
-            .value()
-            .into(),
     })
 }
 
@@ -3043,449 +3239,8 @@ fn apply_preset(params: &ae::Parameters<Params>, preset: &PresetSnapshot) -> Res
     set_slider_param(&mut params_copy, Params::GridResY, preset.grid_res_y)?;
     set_slider_param(&mut params_copy, Params::GridResZ, preset.grid_res_z)?;
 
-    // ---- Plexus ----
-    set_popup_param(&mut params_copy, Params::PluginMode, preset.plugin_mode)?;
-    set_checkbox_param(
-        &mut params_copy,
-        Params::PointAEnabled,
-        preset.point_a_enabled,
-    )?;
-    set_popup_param(
-        &mut params_copy,
-        Params::PointASourceType,
-        preset.point_a_source_type,
-    )?;
-    set_slider_param(
-        &mut params_copy,
-        Params::PointAGridResX,
-        preset.point_a_grid_res_x,
-    )?;
-    set_slider_param(
-        &mut params_copy,
-        Params::PointAGridResY,
-        preset.point_a_grid_res_y,
-    )?;
-    set_slider_param(
-        &mut params_copy,
-        Params::PointAGridResZ,
-        preset.point_a_grid_res_z,
-    )?;
-    set_float_param(
-        &mut params_copy,
-        Params::PointAGridSpacing,
-        preset.point_a_grid_spacing,
-    )?;
-    set_slider_param(
-        &mut params_copy,
-        Params::PointAMaxPoints,
-        preset.point_a_max_points,
-    )?;
-    set_checkbox_param(
-        &mut params_copy,
-        Params::PointBEnabled,
-        preset.point_b_enabled,
-    )?;
-    set_popup_param(
-        &mut params_copy,
-        Params::PointBSourceType,
-        preset.point_b_source_type,
-    )?;
-    set_slider_param(
-        &mut params_copy,
-        Params::PointBGridResX,
-        preset.point_b_grid_res_x,
-    )?;
-    set_slider_param(
-        &mut params_copy,
-        Params::PointBGridResY,
-        preset.point_b_grid_res_y,
-    )?;
-    set_float_param(
-        &mut params_copy,
-        Params::PointBGridSpacing,
-        preset.point_b_grid_spacing,
-    )?;
-    set_checkbox_param(&mut params_copy, Params::NoiseEnabled, preset.noise_enabled)?;
-    set_float_param(
-        &mut params_copy,
-        Params::NoiseAmplitude,
-        preset.noise_amplitude,
-    )?;
-    set_float_param(
-        &mut params_copy,
-        Params::NoiseFrequency,
-        preset.noise_frequency,
-    )?;
-    set_float_param(&mut params_copy, Params::NoiseSpeed, preset.noise_speed)?;
-    set_slider_param(&mut params_copy, Params::NoiseOctaves, preset.noise_octaves)?;
-    set_popup_param(
-        &mut params_copy,
-        Params::NoiseAxisScale,
-        preset.noise_axis_scale,
-    )?;
-    set_checkbox_param(&mut params_copy, Params::LinesEnabled, preset.lines_enabled)?;
-    set_float_param(
-        &mut params_copy,
-        Params::LinesMaxDistance,
-        preset.lines_max_distance,
-    )?;
-    set_float_param(&mut params_copy, Params::LinesWidth, preset.lines_width)?;
-    set_float_param(
-        &mut params_copy,
-        Params::LinesOpacityFalloff,
-        preset.lines_opacity_falloff,
-    )?;
-    set_color_param(&mut params_copy, Params::LinesColor, preset.lines_color)?;
-    set_checkbox_param(&mut params_copy, Params::MeshEnabled, preset.mesh_enabled)?;
-    set_float_param(&mut params_copy, Params::MeshMaxEdge, preset.mesh_max_edge)?;
-    set_float_param(&mut params_copy, Params::MeshOpacity, preset.mesh_opacity)?;
-    set_color_param(&mut params_copy, Params::MeshColor, preset.mesh_color)?;
-    set_checkbox_param(&mut params_copy, Params::BeamsEnabled, preset.beams_enabled)?;
-    set_popup_param(
-        &mut params_copy,
-        Params::BeamsSourceGroup,
-        preset.beams_source_group,
-    )?;
-    set_float_param(
-        &mut params_copy,
-        Params::BeamsMaxDistance,
-        preset.beams_max_distance,
-    )?;
-    set_float_param(&mut params_copy, Params::BeamsWidth, preset.beams_width)?;
-    set_color_param(&mut params_copy, Params::BeamsColor, preset.beams_color)?;
-    set_float_param(
-        &mut params_copy,
-        Params::PlexusPointSize,
-        preset.plexus_point_size,
-    )?;
-    set_color_param(
-        &mut params_copy,
-        Params::PlexusPointColor,
-        preset.plexus_point_color,
-    )?;
-
-    update_shape_dependent_ui(&params_copy)?;
+    update_shape_dependent_ui(&params_copy, None)?;
     Ok(())
-}
-
-fn extract_configs(
-    params: &ae::Parameters<Params>,
-) -> Result<
-    (
-        EmitterConfig,
-        PhysicsConfig,
-        AppearanceConfig,
-        ChildConfig,
-        RenderConfig,
-        u64,
-    ),
-    ae::Error,
-> {
-    let emitter_type_val = params.get(Params::EmitterType)?.as_popup()?.value();
-    let emitter_type = match emitter_type_val {
-        1 => EmitterType::Point,
-        2 => EmitterType::Box,
-        3 => EmitterType::Sphere,
-        4 => EmitterType::Grid,
-        5 => EmitterType::LayerAlpha,
-        6 => EmitterType::Path,
-        _ => EmitterType::Point,
-    };
-
-    let (pos_x, pos_y) = params.get(Params::PositionPoint)?.as_point()?.value();
-    let pos_z = params.get(Params::PositionZ)?.as_float_slider()?.value() as f32;
-    let size_linked = params
-        .get(Params::EmitterSizeLinked)?
-        .as_checkbox()?
-        .value();
-    let emitter_size_x = params.get(Params::EmitterSizeX)?.as_float_slider()?.value() as f32;
-    let emitter_size_y = if size_linked {
-        emitter_size_x
-    } else {
-        params.get(Params::EmitterSizeY)?.as_float_slider()?.value() as f32
-    };
-    let emitter_size_z = if size_linked {
-        emitter_size_x
-    } else {
-        params.get(Params::EmitterSizeZ)?.as_float_slider()?.value() as f32
-    };
-    let spread_deg = params.get(Params::Spread)?.as_float_slider()?.value() as f32;
-    let dir_x = params.get(Params::DirectionX)?.as_float_slider()?.value() as f32;
-    let dir_y = params.get(Params::DirectionY)?.as_float_slider()?.value() as f32;
-    let dir_z = params.get(Params::DirectionZ)?.as_float_slider()?.value() as f32;
-
-    let sprite_time_sampling_val = params.get(Params::SpriteTimeSampling)?.as_popup()?.value();
-    let sprite_frame_count = params
-        .get(Params::SpriteFrameCount)?
-        .as_slider()?
-        .value()
-        .max(1) as u16;
-
-    let emitter = EmitterConfig {
-        emitter_type,
-        position: glam::Vec3::new(pos_x, pos_y, pos_z),
-        size: glam::Vec3::new(emitter_size_x, emitter_size_y, emitter_size_z),
-        source_points: None,
-        birth_rate: params.get(Params::BirthRate)?.as_float_slider()?.value() as f32,
-        lifespan: params.get(Params::Lifespan)?.as_float_slider()?.value() as f32,
-        lifespan_variation: params.get(Params::LifespanVar)?.as_float_slider()?.value() as f32,
-        initial_speed: params.get(Params::Speed)?.as_float_slider()?.value() as f32,
-        speed_variation: params.get(Params::SpeedVar)?.as_float_slider()?.value() as f32,
-        initial_direction: glam::Vec3::new(dir_x, dir_y, dir_z).normalize_or_zero(),
-        spread: spread_deg.to_radians(),
-        initial_size: params.get(Params::InitialSize)?.as_float_slider()?.value() as f32,
-        size_variation: params.get(Params::SizeVar)?.as_float_slider()?.value() as f32,
-        initial_rotation: params.get(Params::Rotation)?.as_float_slider()?.value() as f32,
-        rotation_variation: params.get(Params::RotationVar)?.as_float_slider()?.value() as f32,
-        rotation_speed: params
-            .get(Params::RotationSpeed)?
-            .as_float_slider()?
-            .value() as f32,
-        sprite_frame_count,
-        sprite_time_sampling: (sprite_time_sampling_val - 1).max(0) as u8,
-        opacity_variation: params.get(Params::OpacityVar)?.as_float_slider()?.value() as f32,
-        grid_res_x: params.get(Params::GridResX)?.as_slider()?.value().max(1) as u32,
-        grid_res_y: params.get(Params::GridResY)?.as_slider()?.value().max(1) as u32,
-        grid_res_z: params.get(Params::GridResZ)?.as_slider()?.value().max(1) as u32,
-        emit_all_at_start: params.get(Params::EmitMode)?.as_popup()?.value() == 2,
-    };
-
-    let physics = PhysicsConfig {
-        gravity: glam::Vec3::new(
-            0.0,
-            params
-                .get(Params::GravityStrength)?
-                .as_float_slider()?
-                .value() as f32,
-            0.0,
-        ),
-        wind: glam::Vec3::new(
-            params.get(Params::WindX)?.as_float_slider()?.value() as f32,
-            params.get(Params::WindY)?.as_float_slider()?.value() as f32,
-            0.0,
-        ),
-        air_resistance: params
-            .get(Params::AirResistance)?
-            .as_float_slider()?
-            .value() as f32,
-        turbulence_strength: params.get(Params::TurbStrength)?.as_float_slider()?.value() as f32,
-        turbulence_scale: params.get(Params::TurbScale)?.as_float_slider()?.value() as f32,
-        turbulence_speed: params.get(Params::TurbSpeed)?.as_float_slider()?.value() as f32,
-        bounce_floor_y: 10000.0, // effectively off unless positioned
-        bounce_enabled: params.get(Params::BounceEnabled)?.as_checkbox()?.value(),
-        bounce_damping: params
-            .get(Params::BounceDamping)?
-            .as_float_slider()?
-            .value() as f32,
-    };
-
-    let color_start_pix = params.get(Params::ColorStart)?.as_color()?.value();
-    let color_mode = params.get(Params::ColorMode)?.as_popup()?.value();
-    let color_end_pix = if color_mode == 1 {
-        color_start_pix
-    } else {
-        params.get(Params::ColorEnd)?.as_color()?.value()
-    };
-    let opacity_start = params.get(Params::OpacityStart)?.as_float_slider()?.value() as f32 / 100.0;
-    let opacity_mid_a = params.get(Params::OpacityMidA)?.as_float_slider()?.value() as f32 / 100.0;
-    let opacity_mid_b = params.get(Params::OpacityMidB)?.as_float_slider()?.value() as f32 / 100.0;
-    let opacity_end = params.get(Params::OpacityEnd)?.as_float_slider()?.value() as f32 / 100.0;
-    let size_life_start = params
-        .get(Params::SizeLifeStart)?
-        .as_float_slider()?
-        .value() as f32;
-    let size_life_mid_a = params.get(Params::SizeLifeMidA)?.as_float_slider()?.value() as f32;
-    let size_life_mid_b = params.get(Params::SizeLifeMidB)?.as_float_slider()?.value() as f32;
-    let size_life_end = params.get(Params::SizeLifeEnd)?.as_float_slider()?.value() as f32;
-
-    let appearance = AppearanceConfig {
-        color_start: [
-            color_start_pix.red as f32 / 255.0,
-            color_start_pix.green as f32 / 255.0,
-            color_start_pix.blue as f32 / 255.0,
-            opacity_start,
-        ],
-        color_end: [
-            color_end_pix.red as f32 / 255.0,
-            color_end_pix.green as f32 / 255.0,
-            color_end_pix.blue as f32 / 255.0,
-            opacity_end,
-        ],
-        size_over_life: [
-            size_life_start,
-            size_life_mid_a,
-            size_life_mid_b,
-            size_life_end,
-        ],
-        opacity_over_life: [opacity_start, opacity_mid_a, opacity_mid_b, opacity_end],
-    };
-
-    let child = ChildConfig {
-        enabled: params.get(Params::ChildEnabled)?.as_checkbox()?.value(),
-        count: params.get(Params::ChildCount)?.as_slider()?.value() as u32,
-        inherit_velocity: params
-            .get(Params::ChildInheritVel)?
-            .as_float_slider()?
-            .value() as f32,
-        lifespan: params
-            .get(Params::ChildLifespan)?
-            .as_float_slider()?
-            .value() as f32,
-        initial_speed: params.get(Params::ChildSpeed)?.as_float_slider()?.value() as f32,
-        spread: params
-            .get(Params::ChildSpread)?
-            .as_float_slider()?
-            .value()
-            .to_radians() as f32,
-        size_scale: params
-            .get(Params::ChildSizeScale)?
-            .as_float_slider()?
-            .value() as f32,
-    };
-
-    let shape_val = params.get(Params::Shape)?.as_popup()?.value();
-    let shape = match shape_val {
-        1 => ParticleShape::Circle,
-        2 => ParticleShape::Square,
-        3 => ParticleShape::Triangle,
-        4 => ParticleShape::Star,
-        5 => ParticleShape::Line,
-        6 => ParticleShape::Image,
-        _ => ParticleShape::Circle,
-    };
-
-    let blend_val = params.get(Params::BlendModeParam)?.as_popup()?.value();
-    let blend_mode = match blend_val {
-        1 => BlendMode::Normal,
-        2 => BlendMode::Add,
-        3 => BlendMode::Screen,
-        _ => BlendMode::Normal,
-    };
-
-    let render = RenderConfig {
-        width: 0, // filled at render time
-        height: 0,
-        row_stride: 0, // filled at render time
-        origin_x: 0.0,
-        origin_y: 0.0,
-        frame_dt: 1.0 / 30.0,
-        shape,
-        blend_mode,
-        motion_blur: params.get(Params::MotionBlur)?.as_float_slider()?.value() as f32,
-        edge_softness: params.get(Params::EdgeSoftness)?.as_float_slider()?.value() as f32,
-        dof_enabled: params.get(Params::DOFEnabled)?.as_checkbox()?.value(),
-        dof_focal_distance: params.get(Params::DOFFocalDist)?.as_float_slider()?.value() as f32,
-        dof_aperture: params.get(Params::DOFAperture)?.as_float_slider()?.value() as f32,
-        composite_on_original: params.get(Params::CompositeOnOrig)?.as_checkbox()?.value(),
-        apply_mode: match params.get(Params::ApplyMode)?.as_popup()?.value() {
-            2 => ApplyMode::Normal,
-            3 => ApplyMode::Add,
-            4 => ApplyMode::Screen,
-            _ => ApplyMode::OnTransparent,
-        },
-        size_multiplier: params
-            .get(Params::SizeMultiplier)?
-            .as_float_slider()?
-            .value() as f32,
-        sprite_images: Vec::new(),
-        time_sampling: match sprite_time_sampling_val {
-            2 => TimeSamplingMode::BirthTime,
-            3 => TimeSamplingMode::RandomStill,
-            4 => TimeSamplingMode::RandomPlay,
-            5 => TimeSamplingMode::Cycle,
-            _ => TimeSamplingMode::CurrentTime,
-        },
-        image_color_mode: match params.get(Params::ImageColorMode)?.as_popup()?.value() {
-            2 => ImageColorMode::Source,
-            _ => ImageColorMode::Tint,
-        },
-        image_fit_mode: match params.get(Params::ImageFitMode)?.as_popup()?.value() {
-            2 => ImageFitMode::Stretch,
-            _ => ImageFitMode::Contain,
-        },
-        image_sampling: ImageSamplingConfig {
-            use_source_alpha: params.get(Params::UseSourceAlpha)?.as_checkbox()?.value(),
-            source_premultiplied: params
-                .get(Params::SourcePremultiplied)?
-                .as_checkbox()?
-                .value(),
-            alpha_clip: params
-                .get(Params::ImageAlphaClip)?
-                .as_float_slider()?
-                .value() as f32,
-        },
-        camera_projection: None,
-    };
-
-    let seed = params.get(Params::Seed)?.as_slider()?.value() as u64;
-
-    Ok((emitter, physics, appearance, child, render, seed))
-}
-
-fn get_plugin_mode(params: &ae::Parameters<Params>) -> Result<i32, ae::Error> {
-    Ok(params.get(Params::PluginMode)?.as_popup()?.value())
-}
-
-fn extract_plexus_configs(params: &ae::Parameters<Params>) -> Result<PlexusConfig, ae::Error> {
-    let point_a_source_val = params.get(Params::PointASourceType)?.as_popup()?.value();
-    let point_a = PointGroupConfig {
-        enabled: params.get(Params::PointAEnabled)?.as_checkbox()?.value(),
-        source_type: match point_a_source_val {
-            1 => PointSourceType::Grid,
-            2 => PointSourceType::Layer,
-            3 => PointSourceType::ObjFile,
-            4 => PointSourceType::AELights,
-            5 => PointSourceType::Particles,
-            _ => PointSourceType::Grid,
-        },
-        grid_res_x: params.get(Params::PointAGridResX)?.as_slider()?.value() as u32,
-        grid_res_y: params.get(Params::PointAGridResY)?.as_slider()?.value() as u32,
-        grid_res_z: params.get(Params::PointAGridResZ)?.as_slider()?.value() as u32,
-        grid_spacing: params
-            .get(Params::PointAGridSpacing)?
-            .as_float_slider()?
-            .value() as f32,
-        max_points: params.get(Params::PointAMaxPoints)?.as_slider()?.value() as usize,
-        source_points: None,
-    };
-
-    let point_b_source_val = params.get(Params::PointBSourceType)?.as_popup()?.value();
-    let point_b = PointGroupConfig {
-        enabled: params.get(Params::PointBEnabled)?.as_checkbox()?.value(),
-        source_type: match point_b_source_val {
-            1 => PointSourceType::Grid,
-            2 => PointSourceType::Layer,
-            3 => PointSourceType::ObjFile,
-            4 => PointSourceType::AELights,
-            _ => PointSourceType::Grid,
-        },
-        grid_res_x: params.get(Params::PointBGridResX)?.as_slider()?.value() as u32,
-        grid_res_y: params.get(Params::PointBGridResY)?.as_slider()?.value() as u32,
-        grid_res_z: 1,
-        grid_spacing: params
-            .get(Params::PointBGridSpacing)?
-            .as_float_slider()?
-            .value() as f32,
-        max_points: 5000,
-        source_points: None,
-    };
-
-    let point_color_pix = params.get(Params::PlexusPointColor)?.as_color()?.value();
-
-    Ok(PlexusConfig {
-        point_a,
-        point_b,
-        point_size: params
-            .get(Params::PlexusPointSize)?
-            .as_float_slider()?
-            .value() as f32,
-        point_color: [
-            point_color_pix.red as f32 / 255.0,
-            point_color_pix.green as f32 / 255.0,
-            point_color_pix.blue as f32 / 255.0,
-            1.0,
-        ],
-    })
 }
 
 // ---- Compute current time in seconds ----
@@ -3511,119 +3266,135 @@ fn time_step_sec(in_data: &ae::InData) -> f32 {
 }
 
 fn checked_rgba_len(width: usize, height: usize) -> Result<usize, ae::Error> {
-    let len = width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or(ae::Error::OutOfMemory)?;
-    if len > MAX_RENDER_BYTES {
+    let surface = RenderSurface::argb8(width, height).map_err(|err| {
+        debug_error(format!(
+            "Invalid render surface: {}x{} ({:?})",
+            width, height, err
+        ));
+        ae::Error::OutOfMemory
+    })?;
+    if surface.len_bytes > MAX_RENDER_BYTES {
         debug_error(format!(
             "Refusing oversized render buffer: {}x{} ({} bytes)",
-            width, height, len
+            width, height, surface.len_bytes
         ));
         return Err(ae::Error::OutOfMemory);
     }
-    Ok(len)
+    Ok(surface.len_bytes)
 }
 
-fn estimate_render_margin(params: &ae::Parameters<Params>) -> Result<i32, ae::Error> {
-    let lifespan = params.get(Params::Lifespan)?.as_float_slider()?.value() as f32;
-    let lifespan_var = params.get(Params::LifespanVar)?.as_float_slider()?.value() as f32;
-    let speed = params.get(Params::Speed)?.as_float_slider()?.value() as f32;
-    let speed_var = params.get(Params::SpeedVar)?.as_float_slider()?.value() as f32;
-    let gravity = params
-        .get(Params::GravityStrength)?
-        .as_float_slider()?
-        .value()
-        .abs() as f32;
-    let wind_x = params.get(Params::WindX)?.as_float_slider()?.value().abs() as f32;
-    let wind_y = params.get(Params::WindY)?.as_float_slider()?.value().abs() as f32;
-    let turb = params
-        .get(Params::TurbStrength)?
-        .as_float_slider()?
-        .value()
-        .abs() as f32;
-    let size = params.get(Params::InitialSize)?.as_float_slider()?.value() as f32;
-    let size_var = params.get(Params::SizeVar)?.as_float_slider()?.value() as f32;
-    let size_multiplier = params
-        .get(Params::SizeMultiplier)?
-        .as_float_slider()?
-        .value() as f32;
-    let motion_blur = params.get(Params::MotionBlur)?.as_float_slider()?.value() as f32;
-    let child_enabled = params.get(Params::ChildEnabled)?.as_checkbox()?.value();
-    let child_lifespan = if child_enabled {
-        params
-            .get(Params::ChildLifespan)?
-            .as_float_slider()?
-            .value() as f32
+fn extract_runtime_engine_config(
+    params: &ae::Parameters<Params>,
+    project_state: &ParticleLabProjectState,
+) -> Result<(ParticleEngineConfig, EngineConfigSource), ae::Error> {
+    let host_values = collect_published_host_float_values(params, project_state)?;
+    let graph_engine = if host_values.is_empty() {
+        project_state.engine_config_override()
+    } else {
+        project_state.engine_config_override_with_host_values(&host_values)
+    };
+    if let Some((engine, source)) = graph_engine {
+        Ok((engine.normalized_for_render(), source))
+    } else {
+        Ok((
+            extract_engine_config(params)?.normalized_for_render(),
+            EngineConfigSource::ClassicParams,
+        ))
+    }
+}
+
+fn collect_published_host_float_values(
+    params: &ae::Parameters<Params>,
+    project_state: &ParticleLabProjectState,
+) -> Result<Vec<GraphPublishedValueOverride>, ae::Error> {
+    let mut values = Vec::new();
+    for binding in &project_state.graph.host_float_bindings {
+        let Some(param_id) = published_host_float_param(binding.slot) else {
+            continue;
+        };
+        let value = params.get(param_id)?.as_float_slider()?.value() as f32;
+        values.push(GraphPublishedValueOverride {
+            stable_id: binding.stable_id.clone(),
+            value: GraphPublishedValue::Float(value),
+        });
+    }
+    Ok(values)
+}
+
+fn estimate_render_margin_from_engine(engine: &ParticleEngineConfig) -> i32 {
+    let emitter = &engine.emitter;
+    let physics = &engine.physics;
+    let render = &engine.render;
+    let child_lifespan = if engine.child.enabled {
+        engine.child.lifespan
     } else {
         0.0
     };
 
-    let air_res = params
-        .get(Params::AirResistance)?
-        .as_float_slider()?
-        .value()
-        .abs() as f32;
-
-    let max_life = (lifespan * (1.0 + lifespan_var.clamp(0.0, 1.0)))
+    let max_life = (emitter.lifespan * (1.0 + emitter.lifespan_variation.clamp(0.0, 1.0)))
         .max(child_lifespan)
         .max(0.01);
-    let peak_speed = speed.max(0.0) * (1.0 + speed_var.clamp(0.0, 1.0));
-    let accel = gravity.max(wind_x.max(wind_y)) + turb;
+    let parent_peak_speed =
+        emitter.initial_speed.max(0.0) * (1.0 + emitter.speed_variation.clamp(0.0, 1.0));
+    let child_peak_speed = if engine.child.enabled {
+        engine.child.initial_speed.max(0.0)
+    } else {
+        0.0
+    };
+    let peak_speed = parent_peak_speed.max(child_peak_speed);
+    let accel = physics
+        .gravity
+        .length()
+        .max(physics.wind.length())
+        .max(physics.turbulence_strength.abs());
     // Air resistance reduces effective travel distance
-    let drag_factor = if air_res > 0.01 {
-        (1.0 / air_res).min(max_life)
+    let drag_factor = if physics.air_resistance.abs() > 0.01 {
+        (1.0 / physics.air_resistance.abs()).min(max_life)
     } else {
         max_life
     };
     let travel = peak_speed * drag_factor + 0.5 * accel * max_life * max_life;
-    let radius = size.max(0.0)
-        * (1.0 + size_var.clamp(0.0, 1.0))
-        * size_multiplier.max(0.01)
-        * (1.0 + motion_blur.clamp(0.0, 1.0) * 0.5);
+    let radius = emitter.initial_size.max(0.0)
+        * (1.0 + emitter.size_variation.clamp(0.0, 1.0))
+        * render.size_multiplier.max(0.01)
+        * (1.0 + render.motion_blur.clamp(0.0, 1.0) * 0.5);
 
-    Ok((travel + radius + 64.0).ceil().clamp(
+    (travel + radius + 64.0).ceil().clamp(
         MIN_SMART_PRE_RENDER_MARGIN as f32,
         MAX_SMART_PRE_RENDER_MARGIN as f32,
-    ) as i32)
+    ) as i32
 }
 
-fn estimated_emitter_bounds(
-    params: &ae::Parameters<Params>,
-    margin: i32,
-) -> Result<ae::Rect, ae::Error> {
-    let (pos_x, pos_y) = params.get(Params::PositionPoint)?.as_point()?.value();
-    let emitter_type = params.get(Params::EmitterType)?.as_popup()?.value();
-    let size_linked = params
-        .get(Params::EmitterSizeLinked)?
-        .as_checkbox()?
-        .value();
-    let size_x = params.get(Params::EmitterSizeX)?.as_float_slider()?.value() as f32;
-    let size_y = if size_linked {
-        size_x
-    } else {
-        params.get(Params::EmitterSizeY)?.as_float_slider()?.value() as f32
-    };
+fn estimated_emitter_bounds_from_engine(engine: &ParticleEngineConfig, margin: i32) -> ae::Rect {
+    let emitter = &engine.emitter;
+    let size_x = emitter.size.x.abs();
+    let size_y = emitter.size.y.abs();
     let max_emitter_half = MAX_SMART_PRE_RENDER_MARGIN as f32;
-    let half_w = if matches!(emitter_type, 2 | 3 | 4) {
+    let half_w = if matches!(
+        emitter.emitter_type,
+        EmitterType::Box | EmitterType::Sphere | EmitterType::Grid
+    ) {
         (size_x * 0.5).min(max_emitter_half).ceil() as i32
     } else {
         0
     };
-    let half_h = if matches!(emitter_type, 2 | 3 | 4) {
+    let half_h = if matches!(
+        emitter.emitter_type,
+        EmitterType::Box | EmitterType::Sphere | EmitterType::Grid
+    ) {
         (size_y * 0.5).min(max_emitter_half).ceil() as i32
     } else {
         0
     };
-    let center_x = pos_x.round() as i32;
-    let center_y = pos_y.round() as i32;
+    let center_x = emitter.position.x.round() as i32;
+    let center_y = emitter.position.y.round() as i32;
 
-    Ok(ae::Rect {
+    ae::Rect {
         left: center_x.saturating_sub(half_w).saturating_sub(margin),
         top: center_y.saturating_sub(half_h).saturating_sub(margin),
         right: center_x.saturating_add(half_w).saturating_add(margin),
         bottom: center_y.saturating_add(half_h).saturating_add(margin),
-    })
+    }
 }
 
 fn union_rect(a: ae::Rect, b: ae::Rect) -> ae::Rect {
@@ -3722,17 +3493,17 @@ fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
     let buf = layer.buffer_mut();
     match depth {
         16 => {
-            // 8-bit ARGB → 16-bit ARGB (AE 16bpc: 0-32768 range, where 32768 = 1.0)
+            // 8-bit ARGB ↁE16-bit ARGB (AE 16bpc: 0-32768 range, where 32768 = 1.0)
             for y in 0..h {
                 let src_row = y * w * 4;
                 let dst_row = y * stride;
                 for x in 0..w {
                     let si = src_row + x * 4;
-                    let di = dst_row + x * 8; // 4 channels × 2 bytes
+                    let di = dst_row + x * 8; // 4 channels ÁE2 bytes
                     if si + 3 < flat.len() && di + 7 < buf.len() {
                         for ch in 0..4usize {
                             let v8 = flat[si + ch] as u16;
-                            // AE 16bpc: max value is 32768 (not 32767). 255 → 32768.
+                            // AE 16bpc: max value is 32768 (not 32767). 255 ↁE32768.
                             let v16 = ((v8 as u32 * 32768 + 127) / 255) as u16;
                             let bytes = v16.to_ne_bytes();
                             buf[di + ch * 2] = bytes[0];
@@ -3743,13 +3514,13 @@ fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
             }
         }
         32 => {
-            // 8-bit ARGB → 32-bit float ARGB (0.0 - 1.0)
+            // 8-bit ARGB ↁE32-bit float ARGB (0.0 - 1.0)
             for y in 0..h {
                 let src_row = y * w * 4;
                 let dst_row = y * stride;
                 for x in 0..w {
                     let si = src_row + x * 4;
-                    let di = dst_row + x * 16; // 4 channels × 4 bytes
+                    let di = dst_row + x * 16; // 4 channels ÁE4 bytes
                     if si + 3 < flat.len() && di + 15 < buf.len() {
                         for ch in 0..4usize {
                             let v = flat[si + ch] as f32 / 255.0;
@@ -3778,77 +3549,891 @@ fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
     }
 }
 
-fn apply_final_composite(
-    original: &[u8],
-    input_w: usize,
-    input_h: usize,
-    input_origin_x: i32,
-    input_origin_y: i32,
-    output: &mut Vec<u8>,
-    out_w: usize,
-    out_h: usize,
-    out_origin_x: i32,
-    out_origin_y: i32,
-    mode: ApplyMode,
-) {
-    if original.is_empty() || matches!(mode, ApplyMode::OnTransparent) {
-        return;
-    }
-
-    let mut composited = vec![0u8; output.len()];
-    renderer::composite_apply(
-        original,
-        input_w,
-        input_h,
-        input_origin_x,
-        input_origin_y,
-        output,
-        out_w,
-        out_h,
-        out_origin_x,
-        out_origin_y,
-        &mut composited,
-        out_w,
-        out_h,
-        out_origin_x,
-        out_origin_y,
-        mode,
-    );
-    *output = composited;
-}
-
-fn load_preset_snapshot(contents: &str) -> Result<PresetSnapshot, ae::Error> {
-    let mut value: Value = serde_json::from_str(contents).map_err(|_| ae::Error::Generic)?;
-    if let Some(obj) = value.as_object_mut() {
-        if !obj.contains_key("apply_mode") {
-            let composite_on_orig = obj
-                .get("composite_on_orig")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            obj.insert(
-                "apply_mode".to_string(),
-                Value::from(if composite_on_orig { 2 } else { 1 }),
-            );
-        }
-        if !obj.contains_key("version") {
-            obj.insert("version".to_string(), Value::from(PRESET_VERSION));
-        }
-    }
-    serde_json::from_value(value).map_err(|_| ae::Error::Generic)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::renderer::{BlendMode, ImageColorMode, ImageFitMode};
+
+    macro_rules! params {
+        ($($param:ident),+ $(,)?) => {
+            &[$(Params::$param),+]
+        };
+    }
+
+    const PARAM_ENUM_ABI_ORDER: &[Params] = params![
+        PresetGroupStart,
+        SavePreset,
+        LoadPreset,
+        DeletePreset,
+        OpenPresetFolder,
+        PresetGroupEnd,
+        EmitterGroupStart,
+        EmitterType,
+        PositionPoint,
+        PositionZ,
+        ImageSourceLayer,
+        ImageProxyScale,
+        RefreshImageCache,
+        EmitterSizeLinked,
+        EmitterSizeX,
+        EmitterSizeY,
+        EmitterSizeZ,
+        BirthRate,
+        Lifespan,
+        LifespanVar,
+        EmitterGroupEnd,
+        MotionGroupStart,
+        Speed,
+        SpeedVar,
+        DirectionX,
+        DirectionY,
+        DirectionZ,
+        Spread,
+        InitialSize,
+        SizeVar,
+        Rotation,
+        RotationSpeed,
+        MotionGroupEnd,
+        PhysicsGroupStart,
+        GravityStrength,
+        WindX,
+        WindY,
+        TurbStrength,
+        TurbScale,
+        TurbSpeed,
+        AirResistance,
+        BounceEnabled,
+        BounceDamping,
+        PhysicsGroupEnd,
+        AppearanceGroupStart,
+        ColorMode,
+        ColorStart,
+        ColorEnd,
+        OpacityCurvePreset,
+        OpacityStart,
+        OpacityMidA,
+        OpacityMidB,
+        OpacityEnd,
+        SizeCurvePreset,
+        SizeLifeStart,
+        SizeLifeMidA,
+        SizeLifeMidB,
+        SizeLifeEnd,
+        AppearanceGroupEnd,
+        RenderingGroupStart,
+        Shape,
+        ImageColorMode,
+        ImageFitMode,
+        UseSourceAlpha,
+        SourcePremultiplied,
+        ImageAlphaClip,
+        BlendModeParam,
+        MotionBlur,
+        EdgeSoftness,
+        DOFEnabled,
+        DOFFocalDist,
+        DOFAperture,
+        SizeMultiplier,
+        CompositeOnOrig,
+        RenderingGroupEnd,
+        ChildGroupStart,
+        ChildEnabled,
+        ChildCount,
+        ChildInheritVel,
+        ChildLifespan,
+        ChildSpeed,
+        ChildSpread,
+        ChildSizeScale,
+        ChildGroupEnd,
+        SystemGroupStart,
+        Seed,
+        SystemGroupEnd,
+        PluginMode,
+        PlexusGroupStart,
+        PlexusGroupEnd,
+        PointGroupAStart,
+        PointGroupAEnd,
+        PointAEnabled,
+        PointASourceType,
+        PointASourceLayer,
+        PointAGridResX,
+        PointAGridResY,
+        PointAGridResZ,
+        PointAGridSpacing,
+        PointAMaxPoints,
+        PointGroupBStart,
+        PointGroupBEnd,
+        PointBEnabled,
+        PointBSourceType,
+        PointBSourceLayer,
+        PointBGridResX,
+        PointBGridResY,
+        PointBGridSpacing,
+        NoiseGroupStart,
+        NoiseGroupEnd,
+        NoiseEnabled,
+        NoiseAmplitude,
+        NoiseFrequency,
+        NoiseSpeed,
+        NoiseOctaves,
+        NoiseAxisScale,
+        LinesGroupStart,
+        LinesGroupEnd,
+        LinesEnabled,
+        LinesMaxDistance,
+        LinesWidth,
+        LinesOpacityFalloff,
+        LinesColor,
+        MeshGroupStart,
+        MeshGroupEnd,
+        MeshEnabled,
+        MeshMaxEdge,
+        MeshOpacity,
+        MeshColor,
+        BeamsGroupStart,
+        BeamsGroupEnd,
+        BeamsEnabled,
+        BeamsSourceGroup,
+        BeamsMaxDistance,
+        BeamsWidth,
+        BeamsColor,
+        PlexusRenderGroupStart,
+        PlexusRenderGroupEnd,
+        PlexusPointSize,
+        PlexusPointColor,
+        SpriteSourceLayer,
+        PathSampleDensity,
+        SpriteTimeSampling,
+        SpriteFrameCount,
+        GridResX,
+        GridResY,
+        GridResZ,
+        EmitMode,
+        RotationVar,
+        ApplyMode,
+        OpacityVar,
+        PublishedControlsGroupStart,
+        PublishedFloat1,
+        PublishedFloat2,
+        PublishedFloat3,
+        PublishedFloat4,
+        PublishedControlsGroupEnd,
+        NodeGraphGroupStart,
+        ExportNodeGraphState,
+        ImportNodeGraphState,
+        SeedNodeGraphFromParams,
+        DisableNodeGraph,
+        NodeGraphGroupEnd,
+        NodeUiSidecarGroupStart,
+        OpenNodeUiShell,
+        NodeUiSidecarGroupEnd,
+    ];
+
+    const PARAM_SETUP_ABI_ORDER: &[Params] = params![
+        PresetGroupStart,
+        SavePreset,
+        LoadPreset,
+        DeletePreset,
+        OpenPresetFolder,
+        PresetGroupEnd,
+        EmitterGroupStart,
+        EmitterType,
+        EmitMode,
+        PositionPoint,
+        PositionZ,
+        ImageSourceLayer,
+        RefreshImageCache,
+        PathSampleDensity,
+        EmitterSizeLinked,
+        EmitterSizeX,
+        EmitterSizeY,
+        EmitterSizeZ,
+        GridResX,
+        GridResY,
+        GridResZ,
+        BirthRate,
+        Lifespan,
+        LifespanVar,
+        EmitterGroupEnd,
+        MotionGroupStart,
+        Speed,
+        SpeedVar,
+        DirectionX,
+        DirectionY,
+        DirectionZ,
+        Spread,
+        InitialSize,
+        SizeVar,
+        Rotation,
+        RotationSpeed,
+        RotationVar,
+        MotionGroupEnd,
+        PhysicsGroupStart,
+        GravityStrength,
+        WindX,
+        WindY,
+        TurbStrength,
+        TurbScale,
+        TurbSpeed,
+        AirResistance,
+        BounceEnabled,
+        BounceDamping,
+        PhysicsGroupEnd,
+        AppearanceGroupStart,
+        ColorMode,
+        ColorStart,
+        ColorEnd,
+        OpacityVar,
+        OpacityCurvePreset,
+        OpacityStart,
+        OpacityMidA,
+        OpacityMidB,
+        OpacityEnd,
+        SizeCurvePreset,
+        SizeLifeStart,
+        SizeLifeMidA,
+        SizeLifeMidB,
+        SizeLifeEnd,
+        AppearanceGroupEnd,
+        RenderingGroupStart,
+        Shape,
+        SpriteSourceLayer,
+        SpriteTimeSampling,
+        SpriteFrameCount,
+        ImageProxyScale,
+        EdgeSoftness,
+        ImageColorMode,
+        ImageFitMode,
+        UseSourceAlpha,
+        SourcePremultiplied,
+        ImageAlphaClip,
+        BlendModeParam,
+        MotionBlur,
+        DOFEnabled,
+        DOFFocalDist,
+        DOFAperture,
+        SizeMultiplier,
+        CompositeOnOrig,
+        ApplyMode,
+        RenderingGroupEnd,
+        ChildGroupStart,
+        ChildEnabled,
+        ChildCount,
+        ChildInheritVel,
+        ChildLifespan,
+        ChildSpeed,
+        ChildSpread,
+        ChildSizeScale,
+        ChildGroupEnd,
+        SystemGroupStart,
+        Seed,
+        SystemGroupEnd,
+        PluginMode,
+        PlexusGroupStart,
+        PointGroupAStart,
+        PointAEnabled,
+        PointASourceType,
+        PointASourceLayer,
+        PointAGridResX,
+        PointAGridResY,
+        PointAGridResZ,
+        PointAGridSpacing,
+        PointAMaxPoints,
+        PointGroupAEnd,
+        PointGroupBStart,
+        PointBEnabled,
+        PointBSourceType,
+        PointBSourceLayer,
+        PointBGridResX,
+        PointBGridResY,
+        PointBGridSpacing,
+        PointGroupBEnd,
+        NoiseGroupStart,
+        NoiseEnabled,
+        NoiseAmplitude,
+        NoiseFrequency,
+        NoiseSpeed,
+        NoiseOctaves,
+        NoiseAxisScale,
+        NoiseGroupEnd,
+        LinesGroupStart,
+        LinesEnabled,
+        LinesMaxDistance,
+        LinesWidth,
+        LinesOpacityFalloff,
+        LinesColor,
+        LinesGroupEnd,
+        MeshGroupStart,
+        MeshEnabled,
+        MeshMaxEdge,
+        MeshOpacity,
+        MeshColor,
+        MeshGroupEnd,
+        BeamsGroupStart,
+        BeamsEnabled,
+        BeamsSourceGroup,
+        BeamsMaxDistance,
+        BeamsWidth,
+        BeamsColor,
+        BeamsGroupEnd,
+        PlexusRenderGroupStart,
+        PlexusPointSize,
+        PlexusPointColor,
+        PlexusRenderGroupEnd,
+        PlexusGroupEnd,
+        PublishedControlsGroupStart,
+        PublishedFloat1,
+        PublishedFloat2,
+        PublishedFloat3,
+        PublishedFloat4,
+        PublishedControlsGroupEnd,
+        NodeGraphGroupStart,
+        ExportNodeGraphState,
+        ImportNodeGraphState,
+        SeedNodeGraphFromParams,
+        DisableNodeGraph,
+        NodeGraphGroupEnd,
+        NodeUiSidecarGroupStart,
+        OpenNodeUiShell,
+        NodeUiSidecarGroupEnd,
+    ];
+
+    fn assert_unique_params(label: &str, params: &[Params]) -> std::collections::HashSet<Params> {
+        let mut seen = std::collections::HashSet::new();
+        for &param in params {
+            assert!(seen.insert(param), "duplicate {label} param: {param:?}");
+        }
+        seen
+    }
+
+    fn assert_close(label: &str, actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.0001,
+            "{label}: {actual} != {expected}"
+        );
+    }
+
+    fn assert_vec3_close(label: &str, actual: glam::Vec3, expected: glam::Vec3) {
+        assert!(
+            (actual - expected).length() < 0.0001,
+            "{label}: {actual:?} != {expected:?}"
+        );
+    }
+
+    fn assert_color_close(label: &str, actual: [f32; 4], expected: [f32; 4]) {
+        for (index, (&actual, &expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_close(&format!("{label}[{index}]"), actual, expected);
+        }
+    }
+
+    fn assert_preset_engine_matches_classic_default(config: &ParticleEngineConfig) {
+        let expected = ParticleEngineConfig::classic_default();
+
+        assert!(matches!(config.emitter.emitter_type, EmitterType::Point));
+        assert_vec3_close(
+            "emitter.position",
+            config.emitter.position,
+            expected.emitter.position,
+        );
+        assert_vec3_close("emitter.size", config.emitter.size, expected.emitter.size);
+        assert_close(
+            "emitter.birth_rate",
+            config.emitter.birth_rate,
+            expected.emitter.birth_rate,
+        );
+        assert_close(
+            "emitter.lifespan",
+            config.emitter.lifespan,
+            expected.emitter.lifespan,
+        );
+        assert_close(
+            "emitter.lifespan_variation",
+            config.emitter.lifespan_variation,
+            expected.emitter.lifespan_variation,
+        );
+        assert_close(
+            "emitter.initial_speed",
+            config.emitter.initial_speed,
+            expected.emitter.initial_speed,
+        );
+        assert_close(
+            "emitter.speed_variation",
+            config.emitter.speed_variation,
+            expected.emitter.speed_variation,
+        );
+        assert_vec3_close(
+            "emitter.initial_direction",
+            config.emitter.initial_direction,
+            expected.emitter.initial_direction,
+        );
+        assert_close(
+            "emitter.spread",
+            config.emitter.spread,
+            expected.emitter.spread,
+        );
+        assert_close(
+            "emitter.initial_size",
+            config.emitter.initial_size,
+            expected.emitter.initial_size,
+        );
+        assert_close(
+            "emitter.size_variation",
+            config.emitter.size_variation,
+            expected.emitter.size_variation,
+        );
+        assert_close(
+            "emitter.rotation_speed",
+            config.emitter.rotation_speed,
+            expected.emitter.rotation_speed,
+        );
+        assert_eq!(
+            config.emitter.sprite_frame_count,
+            expected.emitter.sprite_frame_count
+        );
+        assert_eq!(
+            config.emitter.sprite_time_sampling,
+            expected.emitter.sprite_time_sampling
+        );
+        assert_eq!(config.emitter.grid_res_x, expected.emitter.grid_res_x);
+        assert_eq!(config.emitter.grid_res_y, expected.emitter.grid_res_y);
+        assert_eq!(config.emitter.grid_res_z, expected.emitter.grid_res_z);
+        assert_eq!(
+            config.emitter.emit_all_at_start,
+            expected.emitter.emit_all_at_start
+        );
+
+        assert_vec3_close(
+            "physics.gravity",
+            config.physics.gravity,
+            expected.physics.gravity,
+        );
+        assert_vec3_close("physics.wind", config.physics.wind, expected.physics.wind);
+        assert_close(
+            "physics.air_resistance",
+            config.physics.air_resistance,
+            expected.physics.air_resistance,
+        );
+        assert_close(
+            "physics.turbulence_strength",
+            config.physics.turbulence_strength,
+            expected.physics.turbulence_strength,
+        );
+        assert_close(
+            "physics.turbulence_scale",
+            config.physics.turbulence_scale,
+            expected.physics.turbulence_scale,
+        );
+        assert_close(
+            "physics.turbulence_speed",
+            config.physics.turbulence_speed,
+            expected.physics.turbulence_speed,
+        );
+        assert_eq!(
+            config.physics.bounce_enabled,
+            expected.physics.bounce_enabled
+        );
+        assert_close(
+            "physics.bounce_damping",
+            config.physics.bounce_damping,
+            expected.physics.bounce_damping,
+        );
+
+        assert_color_close(
+            "appearance.color_start",
+            config.appearance.color_start,
+            expected.appearance.color_start,
+        );
+        assert_color_close(
+            "appearance.color_end",
+            config.appearance.color_end,
+            expected.appearance.color_end,
+        );
+        assert_color_close(
+            "appearance.size_over_life",
+            config.appearance.size_over_life,
+            expected.appearance.size_over_life,
+        );
+        assert_color_close(
+            "appearance.opacity_over_life",
+            config.appearance.opacity_over_life,
+            expected.appearance.opacity_over_life,
+        );
+
+        assert_eq!(config.child.enabled, expected.child.enabled);
+        assert_eq!(config.child.count, expected.child.count);
+        assert_close(
+            "child.inherit_velocity",
+            config.child.inherit_velocity,
+            expected.child.inherit_velocity,
+        );
+        assert_close(
+            "child.lifespan",
+            config.child.lifespan,
+            expected.child.lifespan,
+        );
+        assert_close(
+            "child.initial_speed",
+            config.child.initial_speed,
+            expected.child.initial_speed,
+        );
+        assert_close("child.spread", config.child.spread, expected.child.spread);
+        assert_close(
+            "child.size_scale",
+            config.child.size_scale,
+            expected.child.size_scale,
+        );
+
+        assert!(matches!(config.render.shape, ParticleShape::Circle));
+        assert!(matches!(config.render.blend_mode, BlendMode::Normal));
+        assert!(matches!(config.render.apply_mode, ApplyMode::Normal));
+        assert_close(
+            "render.motion_blur",
+            config.render.motion_blur,
+            expected.render.motion_blur,
+        );
+        assert_close(
+            "render.edge_softness",
+            config.render.edge_softness,
+            expected.render.edge_softness,
+        );
+        assert_eq!(config.render.dof_enabled, expected.render.dof_enabled);
+        assert_close(
+            "render.dof_focal_distance",
+            config.render.dof_focal_distance,
+            expected.render.dof_focal_distance,
+        );
+        assert_close(
+            "render.dof_aperture",
+            config.render.dof_aperture,
+            expected.render.dof_aperture,
+        );
+        assert_eq!(
+            config.render.composite_on_original,
+            expected.render.composite_on_original
+        );
+        assert_close(
+            "render.size_multiplier",
+            config.render.size_multiplier,
+            expected.render.size_multiplier,
+        );
+        assert!(matches!(
+            config.render.time_sampling,
+            TimeSamplingMode::CurrentTime
+        ));
+        assert!(matches!(
+            config.render.image_color_mode,
+            ImageColorMode::Tint
+        ));
+        assert!(matches!(
+            config.render.image_fit_mode,
+            ImageFitMode::Contain
+        ));
+        assert_eq!(
+            config.render.image_sampling.use_source_alpha,
+            expected.render.image_sampling.use_source_alpha
+        );
+        assert_eq!(
+            config.render.image_sampling.source_premultiplied,
+            expected.render.image_sampling.source_premultiplied
+        );
+        assert_close(
+            "render.image_sampling.alpha_clip",
+            config.render.image_sampling.alpha_clip,
+            expected.render.image_sampling.alpha_clip,
+        );
+        assert_eq!(config.seed, expected.seed);
+    }
+
+    #[test]
+    fn params_enum_order_is_append_only_abi() {
+        assert_eq!(PARAM_ENUM_ABI_ORDER.len(), 166);
+        assert_eq!(
+            PARAM_ENUM_ABI_ORDER.len(),
+            Params::NodeUiSidecarGroupEnd as usize + 1
+        );
+
+        for (index, &param) in PARAM_ENUM_ABI_ORDER.iter().enumerate() {
+            assert_eq!(
+                param as u16, index as u16,
+                "Params::{param:?} moved from ABI slot {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn params_setup_order_covers_each_abi_slot_once() {
+        let enum_set = assert_unique_params("enum ABI", PARAM_ENUM_ABI_ORDER);
+        let setup_set = assert_unique_params("setup ABI", PARAM_SETUP_ABI_ORDER);
+
+        assert_eq!(setup_set, enum_set);
+        assert_eq!(PARAM_SETUP_ABI_ORDER.len(), PARAM_ENUM_ABI_ORDER.len());
+    }
 
     #[test]
     fn load_preset_snapshot_migrates_apply_mode_from_composite_flag() {
         let snapshot = load_preset_snapshot(r#"{"composite_on_orig":false}"#).unwrap();
         assert_eq!(snapshot.version, PRESET_VERSION);
         assert_eq!(snapshot.apply_mode, 1);
+        assert!(matches!(
+            snapshot.to_engine_config().render.apply_mode,
+            ApplyMode::OnTransparent
+        ));
 
         let snapshot = load_preset_snapshot(r#"{"composite_on_orig":true}"#).unwrap();
         assert_eq!(snapshot.apply_mode, 2);
+        assert!(matches!(
+            snapshot.to_engine_config().render.apply_mode,
+            ApplyMode::Normal
+        ));
+    }
+
+    #[test]
+    fn legacy_plexus_slots_stay_registered_for_project_compatibility() {
+        assert_eq!(LEGACY_PLEXUS_PARAMS.len(), 53);
+        assert_eq!(LEGACY_PLEXUS_PARAMS[0], Params::PluginMode);
+        assert_eq!(
+            LEGACY_PLEXUS_PARAMS[LEGACY_PLEXUS_PARAMS.len() - 1],
+            Params::PlexusGroupEnd
+        );
+        let legacy_start = PARAM_SETUP_ABI_ORDER
+            .windows(LEGACY_PLEXUS_PARAMS.len())
+            .position(|window| window == LEGACY_PLEXUS_PARAMS)
+            .expect("legacy Plexus setup slots must remain contiguous");
+        assert_eq!(
+            &PARAM_SETUP_ABI_ORDER[legacy_start..legacy_start + LEGACY_PLEXUS_PARAMS.len()],
+            LEGACY_PLEXUS_PARAMS
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        for &param in LEGACY_PLEXUS_PARAMS {
+            assert!(seen.insert(param), "duplicate legacy param: {:?}", param);
+        }
+    }
+
+    #[test]
+    fn published_host_float_slots_stay_before_node_graph_and_sidecar_tail_params() {
+        let published_params = params![
+            PublishedControlsGroupStart,
+            PublishedFloat1,
+            PublishedFloat2,
+            PublishedFloat3,
+            PublishedFloat4,
+            PublishedControlsGroupEnd,
+        ];
+
+        let node_graph_params = params![
+            NodeGraphGroupStart,
+            ExportNodeGraphState,
+            ImportNodeGraphState,
+            SeedNodeGraphFromParams,
+            DisableNodeGraph,
+            NodeGraphGroupEnd,
+        ];
+        let node_ui_sidecar_params = params![
+            NodeUiSidecarGroupStart,
+            OpenNodeUiShell,
+            NodeUiSidecarGroupEnd,
+        ];
+        let published_start = PARAM_SETUP_ABI_ORDER
+            .windows(published_params.len())
+            .position(|window| window == published_params)
+            .expect("published host params must remain contiguous");
+        let node_graph_start = PARAM_SETUP_ABI_ORDER
+            .windows(node_graph_params.len())
+            .position(|window| window == node_graph_params)
+            .expect("node graph tool params must remain contiguous");
+        let node_ui_sidecar_start = PARAM_SETUP_ABI_ORDER
+            .windows(node_ui_sidecar_params.len())
+            .position(|window| window == node_ui_sidecar_params)
+            .expect("node UI sidecar params must remain contiguous");
+
+        assert_eq!(
+            &PARAM_SETUP_ABI_ORDER[published_start..published_start + published_params.len()],
+            published_params
+        );
+        assert_eq!(
+            &PARAM_ENUM_ABI_ORDER[published_start..published_start + published_params.len()],
+            published_params
+        );
+        assert_eq!(
+            &PARAM_SETUP_ABI_ORDER[node_graph_start..node_graph_start + node_graph_params.len()],
+            node_graph_params
+        );
+        assert_eq!(
+            &PARAM_ENUM_ABI_ORDER[node_graph_start..node_graph_start + node_graph_params.len()],
+            node_graph_params
+        );
+        assert_eq!(
+            &PARAM_SETUP_ABI_ORDER[PARAM_SETUP_ABI_ORDER.len() - node_ui_sidecar_params.len()..],
+            node_ui_sidecar_params
+        );
+        assert_eq!(
+            &PARAM_ENUM_ABI_ORDER[PARAM_ENUM_ABI_ORDER.len() - node_ui_sidecar_params.len()..],
+            node_ui_sidecar_params
+        );
+        assert_eq!(
+            node_graph_start,
+            published_start + published_params.len(),
+            "node graph tools must be appended after published host controls"
+        );
+        assert_eq!(
+            node_ui_sidecar_start,
+            node_graph_start + node_graph_params.len(),
+            "node UI sidecar must be appended after node graph tools"
+        );
+        assert_eq!(PUBLISHED_HOST_FLOAT_SLOT_COUNT, 4);
+        assert_eq!(published_host_float_param(0), None);
+        assert_eq!(published_host_float_param(1), Some(Params::PublishedFloat1));
+        assert_eq!(published_host_float_param(4), Some(Params::PublishedFloat4));
+        assert_eq!(published_host_float_param(5), None);
+    }
+
+    #[test]
+    fn node_ui_sidecar_assets_are_embedded_for_host_launch() {
+        let assets = node_ui_shell_assets();
+        assert_eq!(assets.len(), 4);
+        assert!(assets
+            .iter()
+            .any(|(filename, contents)| *filename == "index.html"
+                && contents.contains("Node UI Shell")
+                && contents.contains("startup-payload.js")
+                && contents.contains("app.js")));
+        assert!(assets.iter().any(|(filename, contents)| {
+            *filename == "app.js"
+                && contents.contains("createParticleDemoPayload")
+                && contents.contains("createLatticeDemoPayload")
+                && contents.contains("PARTICLELAB_NODE_UI_BOOTSTRAP")
+                && contents.contains("canSaveCurrentPayload")
+        }));
+        assert!(assets.iter().any(|(filename, contents)| {
+            *filename == "styles.css" && contents.contains(".graph-canvas")
+        }));
+        assert!(assets.iter().any(|(filename, contents)| {
+            *filename == "startup-payload.js"
+                && contents.contains("PARTICLELAB_NODE_UI_BOOTSTRAP")
+                && contents.contains("PARTICLELAB_NODE_UI_BOOTSTRAP_SOURCE")
+        }));
+    }
+
+    #[test]
+    fn node_ui_sidecar_startup_payload_carries_current_project_state() {
+        let mut state = ParticleLabProjectState::default();
+        state
+            .commit_node_graph_document(graph::GraphDocument::from_engine_config(
+                &ParticleEngineConfig::classic_default(),
+            ))
+            .unwrap();
+
+        let startup = node_ui_shell_startup_payload_js(&state).unwrap();
+        assert!(startup.starts_with("window.PARTICLELAB_NODE_UI_BOOTSTRAP = {"));
+        assert!(startup.contains("\"product_id\": \"particlelab\""));
+        assert!(startup.contains("\"enabled\": true"));
+        assert!(startup.contains("\"document\""));
+        assert!(startup.contains("AE sidecar startup payload"));
+    }
+
+    #[test]
+    fn published_host_float_display_names_follow_graph_bindings() {
+        let mut document =
+            graph::GraphDocument::from_engine_config(&ParticleEngineConfig::classic_default());
+        document.published_params.push(graph::GraphPublishedParam {
+            stable_id: "birth_rate".to_string(),
+            label: "Birth Rate".to_string(),
+            target: graph::GraphSocket {
+                node: graph::NodeId(2),
+                socket: "birth_rate".to_string(),
+            },
+            value_type: graph::GraphPublishedValueType::Float,
+            default_value: GraphPublishedValue::Float(180.0),
+        });
+        let mut state = ParticleLabProjectState::default();
+        state
+            .commit_node_ui_graph_state_snapshot(NodeUiGraphStateSnapshot {
+                version: project_state::NODE_UI_GRAPH_STATE_VERSION,
+                enabled: true,
+                document: Some(document),
+                published_values: Vec::new(),
+                host_float_bindings: vec![project_state::GraphPublishedHostFloatBinding {
+                    stable_id: "birth_rate".to_string(),
+                    slot: 1,
+                }],
+            })
+            .unwrap();
+
+        assert_eq!(
+            published_host_float_display_name(1, Some(&state)),
+            "F1: Birth Rate"
+        );
+        assert_eq!(
+            published_host_float_binding_label(Some(&state), 1),
+            Some("Birth Rate")
+        );
+        assert_eq!(
+            published_host_float_display_name(2, Some(&state)),
+            "Published Float 2"
+        );
+        assert_eq!(published_host_float_binding_label(Some(&state), 2), None);
+        assert_eq!(
+            truncate_ae_param_name("12345678901234567890123456789012345"),
+            "1234567890123456789012345678901"
+        );
+    }
+
+    #[test]
+    fn load_preset_snapshot_ignores_retired_plexus_fields() {
+        let snapshot = load_preset_snapshot(
+            r#"{
+                "plugin_mode": 2,
+                "point_a_enabled": false,
+                "lines_max_distance": 42.0
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.version, PRESET_VERSION);
+        assert_eq!(
+            snapshot.emitter_type,
+            PresetSnapshot::default().emitter_type
+        );
+    }
+
+    #[test]
+    fn preset_default_compiles_to_classic_engine_default() {
+        let config = PresetSnapshot::default().to_engine_config();
+        assert_preset_engine_matches_classic_default(&config);
+    }
+
+    #[test]
+    fn missing_preset_fields_compile_to_classic_engine_default() {
+        let snapshot = load_preset_snapshot("{}").unwrap();
+        let config = snapshot.to_engine_config();
+        assert_preset_engine_matches_classic_default(&config);
+    }
+
+    #[test]
+    fn preset_single_color_mode_uses_start_color_for_engine_end_color() {
+        let mut snapshot = PresetSnapshot::default();
+        snapshot.color_mode = 1;
+        snapshot.color_start = PresetColor {
+            alpha: 255,
+            red: 128,
+            green: 64,
+            blue: 32,
+        };
+        snapshot.color_end = PresetColor {
+            alpha: 255,
+            red: 1,
+            green: 2,
+            blue: 3,
+        };
+        snapshot.opacity_end = 25.0;
+
+        let config = snapshot.to_engine_config();
+        assert_color_close(
+            "single color end",
+            config.appearance.color_end,
+            [128.0 / 255.0, 64.0 / 255.0, 32.0 / 255.0, 0.25],
+        );
     }
 
     #[test]
@@ -3880,18 +4465,304 @@ mod tests {
         assert_eq!(output[2], 64);
         assert_eq!(output[3], 0);
     }
+
+    #[test]
+    fn renderer_final_composite_normal_preserves_argb_order() {
+        let original = [128u8, 64, 0, 0];
+        let mut particles = vec![128u8, 0, 64, 0];
+
+        renderer::apply_final_composite(
+            &original,
+            1,
+            1,
+            0,
+            0,
+            &mut particles,
+            1,
+            1,
+            0,
+            0,
+            ApplyMode::Normal,
+        );
+
+        assert_eq!(particles, vec![192, 32, 64, 0]);
+    }
+
+    #[test]
+    fn renderer_blit_argb_into_respects_origins() {
+        let source = [1u8, 10, 11, 12, 2, 20, 21, 22, 3, 30, 31, 32, 4, 40, 41, 42];
+        let mut output = vec![0u8; 3 * 3 * 4];
+
+        renderer::blit_argb_into(&source, 2, 2, 10, 10, &mut output, 3, 3, 9, 9);
+
+        let center = (1 * 3 + 1) * 4;
+        assert_eq!(&output[center..center + 4], &[1, 10, 11, 12]);
+        let bottom_right = (2 * 3 + 2) * 4;
+        assert_eq!(&output[bottom_right..bottom_right + 4], &[4, 40, 41, 42]);
+    }
+
+    #[test]
+    fn sprite_timing_params_do_not_force_source_cache_invalidations() {
+        assert!(!should_invalidate_source_cache(Params::SpriteTimeSampling));
+        assert!(!should_invalidate_source_cache(Params::SpriteFrameCount));
+        assert!(should_invalidate_source_cache(Params::ImageSourceLayer));
+        assert!(should_invalidate_source_cache(Params::ImageProxyScale));
+    }
+
+    fn make_test_sprite(w: usize, h: usize, pixels: Vec<u8>) -> SpriteImage {
+        finish_sprite(w, h, pixels)
+    }
+
+    fn make_straight_test_sprite(w: usize, h: usize, pixels: Vec<u8>) -> SpriteImage {
+        finish_sprite_with_alpha_mode(w, h, pixels, false)
+    }
+
+    #[test]
+    fn mip_chain_opaque_preserves_colors() {
+        let w = 8;
+        let h = 8;
+        let mut pixels = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                pixels[i] = 255;
+                pixels[i + 1] = 128;
+                pixels[i + 2] = 64;
+                pixels[i + 3] = 32;
+            }
+        }
+        let sprite = make_test_sprite(w, h, pixels);
+        assert_eq!(sprite.width, 8);
+        assert_eq!(sprite.height, 8);
+        assert!(sprite.mips.len() >= 2);
+        let mip0 = &sprite.mips[0];
+        assert_eq!(mip0.width, 4);
+        assert_eq!(mip0.height, 4);
+        assert_eq!(mip0.pixels[0], 255);
+        assert_eq!(mip0.pixels[1], 128);
+        assert_eq!(mip0.pixels[2], 64);
+        assert_eq!(mip0.pixels[3], 32);
+    }
+
+    #[test]
+    fn mip_chain_fully_transparent_produces_black_alpha_zero() {
+        let w = 4;
+        let h = 4;
+        let mut pixels = vec![0u8; w * h * 4];
+        for i in (0..pixels.len()).step_by(4) {
+            pixels[i] = 0;
+            pixels[i + 1] = 255;
+            pixels[i + 2] = 128;
+            pixels[i + 3] = 64;
+        }
+        let sprite = make_test_sprite(w, h, pixels);
+        assert!(sprite.mips.len() >= 1);
+        let mip0 = &sprite.mips[0];
+        assert_eq!(mip0.width, 2);
+        assert_eq!(mip0.pixels[0], 0);
+        assert_eq!(mip0.pixels[1], 0);
+        assert_eq!(mip0.pixels[2], 0);
+        assert_eq!(mip0.pixels[3], 0);
+    }
+
+    #[test]
+    fn mip_chain_transparent_pixel_keeps_premultiplied_average() {
+        let w = 4;
+        let h = 4;
+        let mut pixels = vec![0u8; w * h * 4];
+
+        for j in 0..h {
+            for i in 0..w {
+                let off = (j * w + i) * 4;
+                if i == 2 && j == 2 {
+                    pixels[off] = 0;
+                    pixels[off + 1] = 0;
+                    pixels[off + 2] = 255;
+                    pixels[off + 3] = 0;
+                } else {
+                    pixels[off] = 255;
+                    pixels[off + 1] = 128;
+                    pixels[off + 2] = 128;
+                    pixels[off + 3] = 128;
+                }
+            }
+        }
+
+        let sprite = make_test_sprite(w, h, pixels);
+        assert!(sprite.mips.len() >= 1);
+        let mip0 = &sprite.mips[0];
+        assert_eq!(mip0.width, 2);
+        assert_eq!(mip0.height, 2);
+
+        let idx = (1 * mip0.width + 1) * 4;
+        assert_eq!(mip0.pixels[idx], 191);
+        assert_eq!(mip0.pixels[idx + 1], 96);
+        assert_eq!(mip0.pixels[idx + 2], 96);
+        assert_eq!(mip0.pixels[idx + 3], 96);
+    }
+
+    #[test]
+    fn mip_chain_partial_alpha_uses_premultiplied_area_average() {
+        // Premultiplied ARGB should be area-averaged without converting to straight RGB.
+        let w = 4;
+        let h = 4;
+        let mut pixels = vec![0u8; w * h * 4];
+        for j in 0..h {
+            for i in 0..w {
+                let off = (j * w + i) * 4;
+                if i < 2 && j < 2 {
+                    pixels[off] = 255;
+                    pixels[off + 1] = 0;
+                    pixels[off + 2] = 0;
+                    pixels[off + 3] = 255;
+                } else if i >= 2 && j < 2 {
+                    pixels[off] = 1;
+                    pixels[off + 1] = 1;
+                    pixels[off + 2] = 1;
+                    pixels[off + 3] = 1;
+                } else if i < 2 && j >= 2 {
+                    pixels[off] = 255;
+                    pixels[off + 1] = 255;
+                    pixels[off + 2] = 0;
+                    pixels[off + 3] = 0;
+                } else {
+                    pixels[off] = 2;
+                    pixels[off + 1] = 2;
+                    pixels[off + 2] = 2;
+                    pixels[off + 3] = 2;
+                }
+            }
+        }
+
+        let sprite = make_test_sprite(w, h, pixels);
+        assert!(sprite.mips.len() >= 1);
+        let mip0 = &sprite.mips[0];
+        assert_eq!(mip0.width, 2);
+        assert_eq!(mip0.height, 2);
+
+        // Quadrant at (0,0): opaque blue.
+        let idx00 = 0;
+        assert_eq!(mip0.pixels[idx00], 255);
+        assert_eq!(mip0.pixels[idx00 + 1], 0);
+        assert_eq!(mip0.pixels[idx00 + 2], 0);
+        assert_eq!(mip0.pixels[idx00 + 3], 255);
+
+        // Quadrant at (1,0): near-transparent white stays premultiplied.
+        let idx10 = 4;
+        assert_eq!(mip0.pixels[idx10], 1);
+        assert_eq!(mip0.pixels[idx10 + 1], 1);
+        assert_eq!(mip0.pixels[idx10 + 2], 1);
+        assert_eq!(mip0.pixels[idx10 + 3], 1);
+
+        // Quadrant at (0,1): opaque red.
+        let idx01 = 8;
+        assert_eq!(mip0.pixels[idx01], 255);
+        assert_eq!(mip0.pixels[idx01 + 1], 255);
+        assert_eq!(mip0.pixels[idx01 + 2], 0);
+        assert_eq!(mip0.pixels[idx01 + 3], 0);
+    }
+
+    #[test]
+    fn straight_alpha_mip_preserves_color_without_transparent_bleed() {
+        let w = 4;
+        let h = 4;
+        let mut pixels = vec![0u8; w * h * 4];
+        for j in 0..h {
+            for i in 0..w {
+                let off = (j * w + i) * 4;
+                if i < 2 && j < 2 {
+                    pixels[off] = 255;
+                    pixels[off + 1] = 0;
+                    pixels[off + 2] = 128;
+                    pixels[off + 3] = 255;
+                } else {
+                    pixels[off] = 0;
+                    pixels[off + 1] = 255;
+                    pixels[off + 2] = 0;
+                    pixels[off + 3] = 0;
+                }
+            }
+        }
+
+        let sprite = make_straight_test_sprite(w, h, pixels);
+        let mip0 = &sprite.mips[0];
+        assert_eq!(mip0.pixels[0], 255);
+        assert_eq!(mip0.pixels[1], 0);
+        assert_eq!(mip0.pixels[2], 128);
+        assert_eq!(mip0.pixels[3], 255);
+        assert_eq!(mip0.pixels[4], 0);
+        assert_eq!(mip0.pixels[5], 0);
+        assert_eq!(mip0.pixels[6], 0);
+        assert_eq!(mip0.pixels[7], 0);
+    }
+
+    #[test]
+    fn cache_invalidation_sets_populated_flags_false() {
+        let k = ImageCacheKey {
+            instance_id: 1,
+            time: 0,
+            time_step: 1,
+            time_scale: 30,
+            proxy_divisor: 1,
+            source_width: 100,
+            source_height: 100,
+            source_origin_x: 0,
+            source_origin_y: 0,
+            source_signature: 0,
+            generation: 1,
+        };
+        {
+            let mut cache = image_cache().write().unwrap();
+            cache.insert(k, Arc::new(vec![]));
+            IMAGE_CACHE_POPULATED.store(true, Ordering::Release);
+        }
+        assert!(image_cache_has_entries());
+        invalidate_image_cache();
+        assert!(!image_cache_has_entries());
+        assert!(!emitter_cache_has_entries());
+        {
+            let cache = image_cache().read().unwrap();
+            assert!(cache.is_empty());
+        }
+    }
+
+    #[test]
+    fn finish_sprite_empty_input_produces_small_valid_sprite() {
+        let sprite = finish_sprite(0, 0, vec![]);
+        assert_eq!(sprite.width, 0);
+        assert_eq!(sprite.height, 0);
+        assert!(sprite.pixels.is_empty());
+        assert!(sprite.mips.is_empty());
+    }
+
+    #[test]
+    fn generate_mip_chain_1x1_no_mips() {
+        let pixels = vec![255u8, 128, 64, 32];
+        let mips = generate_mip_chain(1, 1, &pixels);
+        assert!(mips.is_empty());
+    }
 }
 
 fn image_cache() -> &'static RwLock<SpriteCacheMap> {
-    IMAGE_CACHE.get_or_init(|| RwLock::new(SpriteCacheMap::new()))
+    IMAGE_CACHE.get_or_init(|| RwLock::new(SpriteCacheMap::default()))
 }
 
 fn emitter_cache() -> &'static RwLock<EmitterPointCacheMap> {
-    EMITTER_CACHE.get_or_init(|| RwLock::new(EmitterPointCacheMap::new()))
+    EMITTER_CACHE.get_or_init(|| RwLock::new(EmitterPointCacheMap::default()))
+}
+
+fn image_cache_has_entries() -> bool {
+    IMAGE_CACHE_POPULATED.load(Ordering::Acquire)
+}
+
+fn emitter_cache_has_entries() -> bool {
+    EMITTER_CACHE_POPULATED.load(Ordering::Acquire)
 }
 
 fn invalidate_image_cache() {
     IMAGE_CACHE_GENERATION.fetch_add(1, Ordering::Relaxed);
+    IMAGE_CACHE_POPULATED.store(false, Ordering::Release);
+    EMITTER_CACHE_POPULATED.store(false, Ordering::Release);
     if let Ok(mut cache) = image_cache().write() {
         cache.clear();
     }
@@ -3965,7 +4836,10 @@ fn source_cache_key(
     }
 }
 
-fn update_shape_dependent_ui(params: &ae::Parameters<Params>) -> Result<(), ae::Error> {
+fn update_shape_dependent_ui(
+    params: &ae::Parameters<Params>,
+    project_state: Option<&ParticleLabProjectState>,
+) -> Result<(), ae::Error> {
     let is_image_shape = params.get(Params::Shape)?.as_popup()?.value() == 6;
     let emitter_type_val = params.get(Params::EmitterType)?.as_popup()?.value();
     let is_layer_alpha_emitter = emitter_type_val == 5;
@@ -3987,7 +4861,7 @@ fn update_shape_dependent_ui(params: &ae::Parameters<Params>) -> Result<(), ae::
         param.update_param_ui()?;
     }
 
-    // Refresh Image Cache + Image Proxy — active if either emitter source OR
+    // Refresh Image Cache + Image Proxy  Eactive if either emitter source OR
     // sprite image is in use (the proxy divisor applies to both).
     for param_id in [Params::ImageProxyScale, Params::RefreshImageCache] {
         let mut param = params_copy.get_mut(param_id)?;
@@ -4089,7 +4963,72 @@ fn update_shape_dependent_ui(params: &ae::Parameters<Params>) -> Result<(), ae::
         param.update_param_ui()?;
     }
 
+    for &param_id in LEGACY_PLEXUS_PARAMS {
+        let mut param = params_copy.get_mut(param_id)?;
+        param.set_ui_flag(ae::ParamUIFlags::INVISIBLE, true);
+        param.set_ui_flag(ae::ParamUIFlags::NO_ECW_UI, true);
+        param.update_param_ui()?;
+    }
+
+    update_published_host_float_ui(&mut params_copy, project_state)?;
+
     Ok(())
+}
+
+fn update_published_host_float_ui(
+    params: &mut ae::Parameters<Params>,
+    project_state: Option<&ParticleLabProjectState>,
+) -> Result<(), ae::Error> {
+    for slot in 1..=PUBLISHED_HOST_FLOAT_SLOT_COUNT {
+        let Some(param_id) = published_host_float_param(slot) else {
+            continue;
+        };
+        let display_name = published_host_float_display_name(slot, project_state);
+        let enabled = published_host_float_binding_label(project_state, slot).is_some();
+        let mut param = params.get_mut(param_id)?;
+        param.set_name(&display_name)?;
+        param.set_ui_flag(ae::ParamUIFlags::DISABLED, !enabled);
+        param.update_param_ui()?;
+    }
+    Ok(())
+}
+
+fn published_host_float_binding_label(
+    project_state: Option<&ParticleLabProjectState>,
+    slot: u8,
+) -> Option<&str> {
+    let project_state = project_state?;
+    let binding = project_state
+        .graph
+        .host_float_bindings
+        .iter()
+        .find(|binding| binding.slot == slot)?;
+    let document = project_state.graph.document.as_ref()?;
+    let published = document
+        .published_params
+        .iter()
+        .find(|published| published.stable_id == binding.stable_id)?;
+    let label = published.label.trim();
+    if label.is_empty() {
+        Some(binding.stable_id.as_str())
+    } else {
+        Some(label)
+    }
+}
+
+fn published_host_float_display_name(
+    slot: u8,
+    project_state: Option<&ParticleLabProjectState>,
+) -> String {
+    if let Some(label) = published_host_float_binding_label(project_state, slot) {
+        truncate_ae_param_name(&format!("F{}: {}", slot, label))
+    } else {
+        format!("Published Float {}", slot)
+    }
+}
+
+fn truncate_ae_param_name(name: &str) -> String {
+    name.chars().take(AE_PARAM_DYNAMIC_NAME_MAX_CHARS).collect()
 }
 
 fn sync_box_size_axes(params: &ae::Parameters<Params>, changed: Params) -> Result<(), ae::Error> {
@@ -4182,32 +5121,36 @@ fn apply_size_preset(params: &ae::Parameters<Params>) -> Result<(), ae::Error> {
 fn populate_layer_alpha_emitter(
     params: &ae::Parameters<Params>,
     in_data: &ae::InData,
-    emitter: &mut EmitterConfig,
-) -> Result<(), ae::Error> {
+    emitter: &EmitterConfig,
+) -> Result<Option<Arc<Vec<glam::Vec3>>>, ae::Error> {
     if !matches!(emitter.emitter_type, EmitterType::LayerAlpha) {
-        return Ok(());
+        return Ok(None);
     }
 
     let checked_out = params.checkout(Params::ImageSourceLayer)?;
     let Some(source_layer) = checked_out.as_layer()?.value() else {
-        return Ok(());
+        return Ok(None);
     };
 
-    let key = source_cache_key(in_data, proxy_divisor(params)?, &source_layer);
+    let mut key = source_cache_key(in_data, proxy_divisor(params)?, &source_layer);
+    // Pin time to 0 — emitter point sampling is time-independent; source_signature
+    // already captures content changes.
+    key.time = 0;
 
-    if let Ok(cache) = emitter_cache().read() {
-        if let Some(points) = cache.get(&key) {
-            emitter.source_points = Some(points.clone());
-            return Ok(());
+    if emitter_cache_has_entries() {
+        if let Ok(cache) = emitter_cache().read() {
+            if let Some(points) = cache.get(&key) {
+                return Ok(Some(points.clone()));
+            }
         }
     }
 
     let points = Arc::new(build_emitter_points(&source_layer, key.proxy_divisor));
     if let Ok(mut cache) = emitter_cache().write() {
         cache.insert(key, points.clone());
+        EMITTER_CACHE_POPULATED.store(true, Ordering::Release);
     }
-    emitter.source_points = Some(points);
-    Ok(())
+    Ok(Some(points))
 }
 
 fn build_emitter_points(layer: &ae::Layer, proxy_divisor: u8) -> Vec<glam::Vec3> {
@@ -4262,10 +5205,10 @@ fn build_emitter_points(layer: &ae::Layer, proxy_divisor: u8) -> Vec<glam::Vec3>
 fn populate_path_emitter(
     params: &ae::Parameters<Params>,
     in_data: &ae::InData,
-    emitter: &mut EmitterConfig,
-) -> Result<(), ae::Error> {
+    emitter: &EmitterConfig,
+) -> Result<Option<Arc<Vec<glam::Vec3>>>, ae::Error> {
     if !matches!(emitter.emitter_type, EmitterType::Path) {
-        return Ok(());
+        return Ok(None);
     }
 
     let density = params
@@ -4276,13 +5219,13 @@ fn populate_path_emitter(
 
     let path_query = match ae::pf::suites::PathQuery::new() {
         Ok(s) => s,
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(None),
     };
 
     let effect_ref = in_data.effect_ref();
     let num_paths = path_query.num_paths(&effect_ref)?;
     if num_paths <= 0 {
-        return Ok(());
+        return Ok(None);
     }
 
     let mut points = Vec::new();
@@ -4365,8 +5308,7 @@ fn populate_path_emitter(
         points = points.into_iter().step_by(stride).collect();
     }
 
-    emitter.source_points = Some(Arc::new(points));
-    Ok(())
+    Ok(Some(Arc::new(points)))
 }
 
 fn cubic_bezier(
@@ -4385,10 +5327,10 @@ fn cubic_bezier(
 fn populate_image_sprite(
     params: &ae::Parameters<Params>,
     in_data: &ae::InData,
-    render_cfg: &mut RenderConfig,
-) -> Result<(), ae::Error> {
+    render_cfg: &RenderConfig,
+) -> Result<Vec<SpriteImage>, ae::Error> {
     if !matches!(render_cfg.shape, ParticleShape::Image) {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let frame_count = params
@@ -4398,41 +5340,52 @@ fn populate_image_sprite(
         .max(1) as u16;
     let is_multi_frame =
         frame_count > 1 && render_cfg.time_sampling != TimeSamplingMode::CurrentTime;
+    let pdiv = proxy_divisor(params)?;
+    let checked_out = params.checkout(Params::SpriteSourceLayer)?;
+    let Some(source_layer) = checked_out.as_layer()?.value() else {
+        return Ok(Vec::new());
+    };
+    let mut key = source_cache_key(in_data, pdiv, &source_layer);
+    // Pin time to 0 for cache stability — source layer content is captured by
+    // source_signature and doesn't change with composition time.
+    key.time = 0;
+    if render_cfg.image_sampling.source_premultiplied {
+        key.source_signature ^= 0xA8D7_EF31_5B2C_49D0;
+    }
+    if is_multi_frame {
+        key.source_signature ^= (frame_count as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    if image_cache_has_entries() {
+        if let Ok(cache) = image_cache().read() {
+            if let Some(sprites) = cache.get(&key) {
+                return Ok((**sprites).clone());
+            }
+        }
+    }
 
     if !is_multi_frame {
-        let checked_out = params.checkout(Params::SpriteSourceLayer)?;
-        let Some(source_layer) = checked_out.as_layer()?.value() else {
-            return Ok(());
-        };
-        let sprite = build_sprite_image(&source_layer, proxy_divisor(params)?);
-        render_cfg.sprite_images = vec![sprite];
-        return Ok(());
+        let sprite = build_sprite_image(
+            &source_layer,
+            pdiv,
+            render_cfg.image_sampling.source_premultiplied,
+        );
+        let sprites = Arc::new(vec![sprite]);
+        if let Ok(mut cache) = image_cache().write() {
+            cache.insert(key, sprites.clone());
+            IMAGE_CACHE_POPULATED.store(true, Ordering::Release);
+        }
+        return Ok((*sprites).clone());
     }
 
     // Multi-frame: checkout source layer at different times
-    let pdiv = proxy_divisor(params)?;
     let time_step = in_data.time_step();
     let time_scale = in_data.time_scale();
-
-    // Build cache key for multi-frame set (use time=0 sentinel)
-    let checked_out_first = params.checkout(Params::SpriteSourceLayer)?;
-    let Some(first_layer) = checked_out_first.as_layer()?.value() else {
-        return Ok(());
-    };
-    let mut key = source_cache_key(in_data, pdiv, &first_layer);
-    key.time = 0;
-    key.source_signature ^= (frame_count as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-
-    if let Ok(cache) = image_cache().read() {
-        if let Some(sprites) = cache.get(&key) {
-            render_cfg.sprite_images = (**sprites).clone();
-            return Ok(());
-        }
-    }
-    drop(checked_out_first);
+    drop(checked_out);
 
     let mut sprites = Vec::with_capacity(frame_count as usize);
     for i in 0..frame_count {
+        check_render_abort(in_data)?;
         let frame_time = (i as i32) * time_step;
         match params.checkout_at(
             Params::SpriteSourceLayer,
@@ -4443,14 +5396,21 @@ fn populate_image_sprite(
             Ok(checked) => {
                 if let Ok(layer_ref) = checked.as_layer() {
                     if let Some(layer) = layer_ref.value() {
-                        sprites.push(build_sprite_image(&layer, pdiv));
+                        sprites.push(build_sprite_image(
+                            &layer,
+                            pdiv,
+                            render_cfg.image_sampling.source_premultiplied,
+                        ));
+                        check_render_abort(in_data)?;
                         continue;
                     }
                 }
                 sprites.push(finish_sprite(1, 1, vec![255, 255, 255, 255]));
+                check_render_abort(in_data)?;
             }
             Err(_) => {
                 sprites.push(finish_sprite(1, 1, vec![255, 255, 255, 255]));
+                check_render_abort(in_data)?;
             }
         }
     }
@@ -4458,12 +5418,118 @@ fn populate_image_sprite(
     let sprites = Arc::new(sprites);
     if let Ok(mut cache) = image_cache().write() {
         cache.insert(key, sprites.clone());
+        IMAGE_CACHE_POPULATED.store(true, Ordering::Release);
     }
-    render_cfg.sprite_images = (*sprites).clone();
-    Ok(())
+    Ok((*sprites).clone())
 }
 
-fn generate_mip_chain(base_w: usize, base_h: usize, base_pixels: &[u8]) -> Vec<renderer::MipLevel> {
+fn collect_particle_runtime_inputs(
+    params: &ae::Parameters<Params>,
+    in_data: &ae::InData,
+    engine: &ParticleEngineConfig,
+    output_width: usize,
+    output_height: usize,
+    origin_x: i32,
+    origin_y: i32,
+) -> Result<ParticleRuntimeInputs, ae::Error> {
+    let mut runtime = ParticleRuntimeInputs::new(
+        output_width,
+        output_height,
+        origin_x,
+        origin_y,
+        current_time_sec(in_data),
+        time_step_sec(in_data),
+    )
+    .map_err(|err| {
+        debug_error(format!(
+            "Invalid particle runtime surface: {}x{} ({:?})",
+            output_width, output_height, err
+        ));
+        ae::Error::OutOfMemory
+    })?;
+
+    runtime.source_points = populate_layer_alpha_emitter(params, in_data, &engine.emitter)?;
+    if runtime.source_points.is_none() {
+        runtime.source_points = populate_path_emitter(params, in_data, &engine.emitter)?;
+    }
+    runtime.sprite_images = populate_image_sprite(params, in_data, &engine.render)?;
+    runtime.camera_projection = try_get_camera_projection(in_data);
+
+    Ok(runtime)
+}
+
+fn downsample_argb_block(
+    pixels: &[u8],
+    width: usize,
+    x0: usize,
+    y0: usize,
+    x1: usize,
+    y1: usize,
+    source_premultiplied: bool,
+) -> [u8; 4] {
+    let count = ((x1 - x0) * (y1 - y0)) as u32;
+    if count == 0 {
+        return [0; 4];
+    }
+
+    let mut sum_a = 0u32;
+    let mut sum_r = 0u32;
+    let mut sum_g = 0u32;
+    let mut sum_b = 0u32;
+    let mut weighted_r = 0u32;
+    let mut weighted_g = 0u32;
+    let mut weighted_b = 0u32;
+
+    for sy in y0..y1 {
+        for sx in x0..x1 {
+            let i = (sy * width + sx) * 4;
+            if i + 3 >= pixels.len() {
+                continue;
+            }
+            let a = pixels[i] as u32;
+            let r = pixels[i + 1] as u32;
+            let g = pixels[i + 2] as u32;
+            let b = pixels[i + 3] as u32;
+            sum_a += a;
+            if source_premultiplied {
+                if a > 0 {
+                    sum_r += r;
+                    sum_g += g;
+                    sum_b += b;
+                }
+            } else if a > 0 {
+                weighted_r += r * a;
+                weighted_g += g * a;
+                weighted_b += b * a;
+            }
+        }
+    }
+
+    if source_premultiplied {
+        [
+            (sum_a / count) as u8,
+            (sum_r / count) as u8,
+            (sum_g / count) as u8,
+            (sum_b / count) as u8,
+        ]
+    } else if sum_a > 0 {
+        [
+            (sum_a / count) as u8,
+            (weighted_r / sum_a).min(255) as u8,
+            (weighted_g / sum_a).min(255) as u8,
+            (weighted_b / sum_a).min(255) as u8,
+        ]
+    } else {
+        [0; 4]
+    }
+}
+
+fn generate_mip_chain_with_alpha_mode(
+    base_w: usize,
+    base_h: usize,
+    base_pixels: &[u8],
+    source_premultiplied: bool,
+) -> Vec<renderer::MipLevel> {
     let mut mips = Vec::new();
     let mut src_w = base_w;
     let mut src_h = base_h;
@@ -4478,23 +5544,12 @@ fn generate_mip_chain(base_w: usize, base_h: usize, base_pixels: &[u8]) -> Vec<r
                 let y0 = oy * 2;
                 let x1 = (x0 + 2).min(src_w);
                 let y1 = (y0 + 2).min(src_h);
-                let mut sum = [0u32; 4];
-                let mut count = 0u32;
-                for sy in y0..y1 {
-                    for sx in x0..x1 {
-                        let i = (sy * src_w + sx) * 4;
-                        sum[0] += src[i] as u32;
-                        sum[1] += src[i + 1] as u32;
-                        sum[2] += src[i + 2] as u32;
-                        sum[3] += src[i + 3] as u32;
-                        count += 1;
-                    }
-                }
+                let px = downsample_argb_block(&src, src_w, x0, y0, x1, y1, source_premultiplied);
                 let di = (oy * nw + ox) * 4;
-                dst[di] = (sum[0] / count) as u8;
-                dst[di + 1] = (sum[1] / count) as u8;
-                dst[di + 2] = (sum[2] / count) as u8;
-                dst[di + 3] = (sum[3] / count) as u8;
+                dst[di] = px[0];
+                dst[di + 1] = px[1];
+                dst[di + 2] = px[2];
+                dst[di + 3] = px[3];
             }
         }
         mips.push(renderer::MipLevel {
@@ -4509,8 +5564,22 @@ fn generate_mip_chain(base_w: usize, base_h: usize, base_pixels: &[u8]) -> Vec<r
     mips
 }
 
+#[cfg(test)]
+fn generate_mip_chain(base_w: usize, base_h: usize, base_pixels: &[u8]) -> Vec<renderer::MipLevel> {
+    generate_mip_chain_with_alpha_mode(base_w, base_h, base_pixels, true)
+}
+
 fn finish_sprite(width: usize, height: usize, pixels: Vec<u8>) -> SpriteImage {
-    let mips = generate_mip_chain(width, height, &pixels);
+    finish_sprite_with_alpha_mode(width, height, pixels, true)
+}
+
+fn finish_sprite_with_alpha_mode(
+    width: usize,
+    height: usize,
+    pixels: Vec<u8>,
+    source_premultiplied: bool,
+) -> SpriteImage {
+    let mips = generate_mip_chain_with_alpha_mode(width, height, &pixels, source_premultiplied);
     SpriteImage {
         width,
         height,
@@ -4519,7 +5588,11 @@ fn finish_sprite(width: usize, height: usize, pixels: Vec<u8>) -> SpriteImage {
     }
 }
 
-fn build_sprite_image(layer: &ae::Layer, proxy_divisor: u8) -> SpriteImage {
+fn build_sprite_image(
+    layer: &ae::Layer,
+    proxy_divisor: u8,
+    source_premultiplied: bool,
+) -> SpriteImage {
     let (flat, width, height) = layer_to_flat(layer);
     if width == 0 || height == 0 || flat.is_empty() {
         return finish_sprite(1, 1, vec![255, 255, 255, 255]);
@@ -4527,7 +5600,7 @@ fn build_sprite_image(layer: &ae::Layer, proxy_divisor: u8) -> SpriteImage {
 
     let step = proxy_divisor.max(1) as usize;
     if step <= 1 {
-        return finish_sprite(width, height, flat);
+        return finish_sprite_with_alpha_mode(width, height, flat, source_premultiplied);
     }
 
     let out_w = width.div_ceil(step).max(1);
@@ -4540,30 +5613,18 @@ fn build_sprite_image(layer: &ae::Layer, proxy_divisor: u8) -> SpriteImage {
             let y0 = oy * step;
             let x1 = (x0 + step).min(width);
             let y1 = (y0 + step).min(height);
-            let count = ((x1 - x0) * (y1 - y0)) as u32;
-            let mut sum = [0u32; 4];
-            for sy in y0..y1 {
-                for sx in x0..x1 {
-                    let idx = (sy * width + sx) * 4;
-                    if idx + 3 < flat.len() {
-                        sum[0] += flat[idx] as u32;
-                        sum[1] += flat[idx + 1] as u32;
-                        sum[2] += flat[idx + 2] as u32;
-                        sum[3] += flat[idx + 3] as u32;
-                    }
-                }
-            }
+            let px = downsample_argb_block(&flat, width, x0, y0, x1, y1, source_premultiplied);
             let dst_idx = (oy * out_w + ox) * 4;
             if dst_idx + 3 < pixels.len() {
-                pixels[dst_idx] = (sum[0] / count) as u8;
-                pixels[dst_idx + 1] = (sum[1] / count) as u8;
-                pixels[dst_idx + 2] = (sum[2] / count) as u8;
-                pixels[dst_idx + 3] = (sum[3] / count) as u8;
+                pixels[dst_idx] = px[0];
+                pixels[dst_idx + 1] = px[1];
+                pixels[dst_idx + 2] = px[2];
+                pixels[dst_idx + 3] = px[3];
             }
         }
     }
 
-    finish_sprite(out_w, out_h, pixels)
+    finish_sprite_with_alpha_mode(out_w, out_h, pixels, source_premultiplied)
 }
 
 // ---- Camera matrix helper ----
@@ -4700,37 +5761,29 @@ fn try_get_camera_projection(in_data: &ae::InData) -> Option<CameraProjection> {
 
 fn render_particles(
     params: &ae::Parameters<Params>,
+    project_state: &ParticleLabProjectState,
     in_data: &ae::InData,
     in_layer: &ae::Layer,
     out_layer: &mut ae::Layer,
 ) -> Result<(), ae::Error> {
-    let mode = get_plugin_mode(params)?;
-    let (mut emitter, physics, appearance, child, mut render_cfg, seed) = extract_configs(params)?;
-    populate_layer_alpha_emitter(params, in_data, &mut emitter)?;
-    populate_path_emitter(params, in_data, &mut emitter)?;
-    populate_image_sprite(params, in_data, &mut render_cfg)?;
+    let (engine, source) = extract_runtime_engine_config(params, project_state)?;
 
     let out_w = out_layer.width() as usize;
     let out_h = out_layer.height() as usize;
     let out_origin = out_layer.origin();
-    render_cfg.width = out_w;
-    render_cfg.height = out_h;
-    render_cfg.row_stride = 0;
-    render_cfg.origin_x = out_origin.h as f32;
-    render_cfg.origin_y = out_origin.v as f32;
+    let runtime = collect_particle_runtime_inputs(
+        params,
+        in_data,
+        &engine,
+        out_w,
+        out_h,
+        out_origin.h,
+        out_origin.v,
+    )?;
+    let plan = ParticleRenderPlan::new(&engine, runtime);
+    let composite_on_original = engine.render.composite_on_original;
 
-    let t = current_time_sec(in_data);
-    let dt = time_step_sec(in_data);
-    render_cfg.frame_dt = dt.max(1.0 / 240.0);
-    render_cfg.camera_projection = try_get_camera_projection(in_data);
-
-    let final_apply_mode = if render_cfg.apply_mode != ApplyMode::OnTransparent {
-        Some(render_cfg.apply_mode)
-    } else if render_cfg.composite_on_original {
-        Some(ApplyMode::Normal)
-    } else {
-        None
-    };
+    let final_apply_mode = plan.final_apply_mode;
     let (original, in_w, in_h) = if final_apply_mode.is_some() {
         layer_to_flat(in_layer)
     } else {
@@ -4738,43 +5791,9 @@ fn render_particles(
     };
     let output_len = checked_rgba_len(out_w, out_h)?;
     let mut output = vec![0u8; output_len];
-
-    let mut particle_count = 0;
-    if mode == 1 || mode == 3 {
-        let mut system = ParticleSystem::new(emitter, physics, appearance, child, seed);
-        system.simulate_to_time(t, dt);
-        particle_count = system.get_particles().len();
-        renderer::render_particles_8bit(system.get_particles(), &render_cfg, &mut output, None);
-    }
-
-    if mode == 2 || mode == 3 {
-        let plexus_cfg = extract_plexus_configs(params)?;
-        let center_x = out_w as f32 * 0.5 + render_cfg.origin_x;
-        let center_y = out_h as f32 * 0.5 + render_cfg.origin_y;
-        let cloud = plexus::generate_points(&plexus_cfg, center_x, center_y);
-
-        let plexus_render_cfg = plexus_render::PlexusRenderConfig {
-            width: out_w,
-            height: out_h,
-            row_stride: 0,
-            origin_x: render_cfg.origin_x,
-            origin_y: render_cfg.origin_y,
-            point_size: plexus_cfg.point_size,
-            point_color: plexus_cfg.point_color,
-            blend_mode: render_cfg.blend_mode,
-            camera_projection: render_cfg.camera_projection,
-        };
-
-        for group in &cloud.groups {
-            if !group.is_empty() {
-                plexus_render::render_plexus_points_8bit(group, &plexus_render_cfg, &mut output);
-            }
-        }
-    }
-
-    if let Some(mode) = final_apply_mode {
+    if matches!(final_apply_mode, Some(ApplyMode::Normal)) {
         let in_origin = in_layer.origin();
-        apply_final_composite(
+        renderer::blit_argb_into(
             &original,
             in_w,
             in_h,
@@ -4785,18 +5804,129 @@ fn render_particles(
             out_h,
             out_origin.h,
             out_origin.v,
-            mode,
         );
+    }
+
+    let particle_count =
+        render_particle_engine_8bit(engine, plan.clone(), &mut output, None, || {
+            Ok::<(), ae::Error>(())
+        })?;
+
+    if let Some(mode) = final_apply_mode {
+        if !matches!(mode, ApplyMode::Normal) {
+            let in_origin = in_layer.origin();
+            renderer::apply_final_composite(
+                &original,
+                in_w,
+                in_h,
+                in_origin.h,
+                in_origin.v,
+                &mut output,
+                out_w,
+                out_h,
+                out_origin.h,
+                out_origin.v,
+                mode,
+            );
+        }
     }
 
     flat_to_layer(&output, out_layer, out_w, out_h);
 
     debug_info(format!(
-        "Render frame time={:.3}s dt={:.3}s size={}x{} particles={} mode={} composite={} origin=({}, {})",
-        t, dt, out_w, out_h, particle_count, mode,
-        render_cfg.composite_on_original, render_cfg.origin_x, render_cfg.origin_y
+        "Render frame time={:.3}s dt={:.3}s size={}x{} particles={} source={:?} composite={} origin=({}, {})",
+        plan.runtime.frame.time,
+        plan.runtime.frame.dt,
+        out_w,
+        out_h,
+        particle_count,
+        source,
+        composite_on_original,
+        plan.runtime.frame.origin_x,
+        plan.runtime.frame.origin_y
     ));
 
+    Ok(())
+}
+
+fn smart_pre_render_particles(
+    params: &ae::Parameters<Params>,
+    project_state: &ParticleLabProjectState,
+    in_data: &ae::InData,
+    extra: &mut ae::pf::PreRenderExtra,
+) -> Result<(), ae::Error> {
+    let (engine, source) = extract_runtime_engine_config(params, project_state)?;
+
+    let req = extra.output_request();
+    let cb = extra.callbacks();
+    let in_result = cb.checkout_layer(
+        0,
+        0,
+        &req,
+        in_data.current_time(),
+        in_data.time_step(),
+        in_data.time_scale(),
+    )?;
+
+    let in_rect: ae::Rect = in_result.result_rect.into();
+    let in_max: ae::Rect = in_result.max_result_rect.into();
+    let margin = estimate_render_margin_from_engine(&engine);
+    let expanded_input = ae::Rect {
+        left: in_rect.left.saturating_sub(margin),
+        top: in_rect.top.saturating_sub(margin),
+        right: in_rect.right.saturating_add(margin),
+        bottom: in_rect.bottom.saturating_add(margin),
+    };
+    let expanded_max = ae::Rect {
+        left: in_max.left.saturating_sub(margin),
+        top: in_max.top.saturating_sub(margin),
+        right: in_max.right.saturating_add(margin),
+        bottom: in_max.bottom.saturating_add(margin),
+    };
+    let emitter_rect = estimated_emitter_bounds_from_engine(&engine, margin);
+    let expanded =
+        clamp_rect_to_pixel_budget(union_rect(expanded_input, emitter_rect), MAX_OUTPUT_PIXELS);
+    let max_expanded =
+        clamp_rect_to_pixel_budget(union_rect(expanded_max, emitter_rect), MAX_OUTPUT_PIXELS);
+    extra.set_result_rect(expanded);
+    extra.set_max_result_rect(max_expanded);
+    extra.set_returns_extra_pixels(true);
+
+    let expected_output_w = (expanded.right - expanded.left).max(1) as usize;
+    let expected_output_h = (expanded.bottom - expanded.top).max(1) as usize;
+    let expected_origin_x = expanded.left;
+    let expected_origin_y = expanded.top;
+    // Collect all runtime data on the PreRender thread; SmartRender does not
+    // call AE param, layer-source, path, or camera APIs.
+    let runtime = collect_particle_runtime_inputs(
+        params,
+        in_data,
+        &engine,
+        expected_output_w,
+        expected_output_h,
+        expected_origin_x,
+        expected_origin_y,
+    )?;
+    let plan = ParticleRenderPlan::new(&engine, runtime);
+    extra.set_pre_render_data(SmartRenderData {
+        engine,
+        plan,
+        source,
+    });
+
+    debug_info(format!(
+        "SmartPreRender source={:?} in_rect left={} top={} right={} bottom={} expanded_margin={} expanded_rect=({}, {}, {}, {})",
+        source,
+        in_rect.left,
+        in_rect.top,
+        in_rect.right,
+        in_rect.bottom,
+        margin,
+        expanded.left,
+        expanded.top,
+        expanded.right,
+        expanded.bottom
+    ));
     Ok(())
 }
 
@@ -4820,21 +5950,13 @@ fn smart_render_particles(
     in_data: &ae::InData,
     extra: &ae::pf::SmartRenderExtra,
 ) -> Result<(), ae::Error> {
-    // Retrieve data collected in SmartPreRender — no AE API calls on render thread.
+    // Retrieve data collected in SmartPreRender  Eno AE API calls on render thread.
     let data = extra
         .pre_render_data::<SmartRenderData>()
         .ok_or(ae::Error::Generic)?;
-    let mode = data.mode;
-    let emitter = data.emitter.clone();
-    let physics = data.physics;
-    let appearance = data.appearance;
-    let child = data.child;
-    let mut render_cfg = data.render_cfg.clone();
-    let seed = data.seed;
-    let t = data.t;
-    let dt = data.dt;
-    let plexus_cfg = data.plexus_cfg.clone();
-    render_cfg.camera_projection = data.camera_projection;
+    let engine = data.engine.clone();
+    let plan = data.plan.clone();
+    let source = data.source;
 
     let cb = extra.callbacks();
 
@@ -4842,13 +5964,7 @@ fn smart_render_particles(
     // Keep input checked out so AE's "input before output" requirement is met for Phase 3.
     let input_world = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
     let input_origin = input_world.origin();
-    let final_apply_mode = if render_cfg.apply_mode != ApplyMode::OnTransparent {
-        Some(render_cfg.apply_mode)
-    } else if render_cfg.composite_on_original {
-        Some(ApplyMode::Normal)
-    } else {
-        None
-    };
+    let final_apply_mode = plan.final_apply_mode;
     let need_original = final_apply_mode.is_some();
     let (original, input_w, input_h) = if need_original {
         layer_to_flat(&input_world)
@@ -4856,86 +5972,26 @@ fn smart_render_particles(
         (Vec::new(), 0, 0)
     };
 
-    let output_w = data.expected_output_w;
-    let output_h = data.expected_output_h;
+    let output_w = plan.runtime.frame.surface.width;
+    let output_h = plan.runtime.frame.surface.height;
+    let apply_mode = engine.render.apply_mode;
+    let camera_projection_enabled = plan.runtime.camera_projection.is_some();
 
     debug_info(format!(
-        "SmartRender V10 START output={}x{} apply={:?} elapsed={}ms",
+        "SmartRender V10 START output={}x{} source={:?} apply={:?} elapsed={}ms",
         output_w,
         output_h,
-        render_cfg.apply_mode,
+        source,
+        apply_mode,
         render_start.elapsed().as_millis()
     ));
 
-    render_cfg.row_stride = 0;
-    render_cfg.width = output_w;
-    render_cfg.height = output_h;
-    render_cfg.origin_x = data.expected_origin_x as f32;
-    render_cfg.origin_y = data.expected_origin_y as f32;
-    render_cfg.frame_dt = dt.max(1.0 / 240.0);
-
     let output_len = checked_rgba_len(output_w, output_h)?;
-    let origin_x = data.expected_origin_x;
-    let origin_y = data.expected_origin_y;
+    let origin_x = plan.runtime.frame.origin_x;
+    let origin_y = plan.runtime.frame.origin_y;
     let mut output = vec![0u8; output_len];
-
-    // Particles
-    let mut particle_count = 0;
-    if mode == 1 || mode == 3 {
-        check_render_abort(in_data)?;
-        let mut system = ParticleSystem::new(emitter, physics, appearance, child, seed);
-        system.simulate_to_time(t, dt);
-        let particles = system.get_particles();
-        particle_count = particles.len();
-        debug_info(format!(
-            "SmartRender V9 STEP:sim particles={} elapsed={}ms",
-            particle_count,
-            render_start.elapsed().as_millis()
-        ));
-        check_render_abort(in_data)?;
-        let deadline = Instant::checked_add(
-            &render_start,
-            std::time::Duration::from_millis(RENDER_TIME_BUDGET_MS as u64),
-        );
-        renderer::render_particles_8bit(particles, &render_cfg, &mut output, deadline);
-        debug_info(format!(
-            "SmartRender V9 STEP:draw elapsed={}ms",
-            render_start.elapsed().as_millis()
-        ));
-    }
-
-    // Plexus
-    if mode == 2 || mode == 3 {
-        check_render_abort(in_data)?;
-        let center_x = output_w as f32 * 0.5 + render_cfg.origin_x;
-        let center_y = output_h as f32 * 0.5 + render_cfg.origin_y;
-        let cloud = plexus::generate_points(&plexus_cfg, center_x, center_y);
-
-        let plexus_render_cfg = plexus_render::PlexusRenderConfig {
-            width: output_w,
-            height: output_h,
-            row_stride: 0,
-            origin_x: render_cfg.origin_x,
-            origin_y: render_cfg.origin_y,
-            point_size: plexus_cfg.point_size,
-            point_color: plexus_cfg.point_color,
-            blend_mode: render_cfg.blend_mode,
-            camera_projection: render_cfg.camera_projection,
-        };
-
-        for group in &cloud.groups {
-            if !group.is_empty() {
-                plexus_render::render_plexus_points_8bit(group, &plexus_render_cfg, &mut output);
-            }
-        }
-        debug_info(format!(
-            "SmartRender V9 STEP:plexus elapsed={}ms",
-            render_start.elapsed().as_millis()
-        ));
-    }
-
-    if let Some(mode) = final_apply_mode {
-        apply_final_composite(
+    if matches!(final_apply_mode, Some(ApplyMode::Normal)) {
+        renderer::blit_argb_into(
             &original,
             input_w,
             input_h,
@@ -4946,8 +6002,40 @@ fn smart_render_particles(
             output_h,
             origin_x,
             origin_y,
-            mode,
         );
+    }
+
+    check_render_abort(in_data)?;
+    let deadline = Instant::checked_add(
+        &render_start,
+        std::time::Duration::from_millis(RENDER_TIME_BUDGET_MS as u64),
+    );
+    let particle_count =
+        render_particle_engine_8bit(engine, plan.clone(), &mut output, deadline, || {
+            check_render_abort(in_data)
+        })?;
+    debug_info(format!(
+        "SmartRender V9 STEP:engine particles={} elapsed={}ms",
+        particle_count,
+        render_start.elapsed().as_millis()
+    ));
+
+    if let Some(mode) = final_apply_mode {
+        if !matches!(mode, ApplyMode::Normal) {
+            renderer::apply_final_composite(
+                &original,
+                input_w,
+                input_h,
+                input_origin.h,
+                input_origin.v,
+                &mut output,
+                output_w,
+                output_h,
+                origin_x,
+                origin_y,
+                mode,
+            );
+        }
     }
     drop(original);
 
@@ -4958,21 +6046,20 @@ fn smart_render_particles(
         render_start.elapsed().as_millis()
     ));
 
-    // === Phase 3: Checkout output and write result — hold AE buffer as briefly as possible ===
+    // === Phase 3: Checkout output and write result  Ehold AE buffer as briefly as possible ===
     let mut output_world = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
     let bit_depth = output_world.bit_depth();
     flat_to_layer(&output, &mut output_world, output_w, output_h);
     // output_world and _input_world2 drop here
 
     debug_info(format!(
-        "SmartRender V9 {}bpc time={:.3}s output={}x{} particles={} mode={} cam={}",
+        "SmartRender V9 {}bpc time={:.3}s output={}x{} particles={} cam={}",
         bit_depth,
-        t,
+        plan.runtime.frame.time,
         output_w,
         output_h,
         particle_count,
-        mode,
-        render_cfg.camera_projection.is_some()
+        camera_projection_enabled
     ));
     Ok(())
 }

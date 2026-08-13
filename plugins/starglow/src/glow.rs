@@ -121,13 +121,39 @@ pub fn process(
 
         let (cr, cg, cb) = blend::composite(sr, sg, sb, gr, gg, gb, src_a, ep.transfer_mode);
 
-        output[off] = src[off]; // alpha passthrough
+        let source_alpha = src[off] as f32 / 255.0;
+        let glow_alpha = if ep.affect_alpha {
+            gr.max(gg).max(gb).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let output_alpha = source_alpha + glow_alpha * (1.0 - source_alpha);
+        output[off] = (output_alpha * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
         output[off + 1] = (cr * 255.0).clamp(0.0, 255.0) as u8;
         output[off + 2] = (cg * 255.0).clamp(0.0, 255.0) as u8;
         output[off + 3] = (cb * 255.0).clamp(0.0, 255.0) as u8;
     }
 
     output
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn glow_alpha_extends_beyond_transparent_source() {
+        let source_alpha = 0.0f32;
+        let glow_alpha = 0.4f32;
+        let output_alpha = source_alpha + glow_alpha * (1.0 - source_alpha);
+        assert!((output_alpha - 0.4).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn glow_alpha_does_not_exceed_opaque_source() {
+        let source_alpha = 1.0f32;
+        let glow_alpha = 0.8f32;
+        let output_alpha = source_alpha + glow_alpha * (1.0 - source_alpha);
+        assert_eq!(output_alpha, 1.0);
+    }
 }
 
 fn extract_channel(src: &[u8], w: usize, h: usize, channel: i32) -> Vec<f64> {

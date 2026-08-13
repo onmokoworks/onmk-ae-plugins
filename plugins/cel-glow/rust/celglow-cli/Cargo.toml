@@ -1,0 +1,19 @@
+[package]
+name = "celglow-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "celglow-cli"
+path = "src/main.rs"
+
+[dependencies]
+celglow-core = { path = "../celglow-core" }
+clap.workspace = true
+image.workspace = true
+notify.workspace = true
+toml.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true

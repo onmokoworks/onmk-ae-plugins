@@ -29,12 +29,15 @@ classic "STMap" remap used to re-project 3D UV passes back onto 2D artwork.
    select the texture under `Other Layer`.
 2. When applying it to the texture, choose `Texture` under `Input Is` and select
    the UV map under `Other Layer`.
-3. For Blender UV passes, use 32-bpc OpenEXR footage in a 32-bpc AE project.
+3. To create a UV map for a flat layer, choose `Generate Planar UV Map`. This
+   mode does not require `Other Layer`.
+4. For Blender UV passes, use 32-bpc OpenEXR footage in a 32-bpc AE project.
 
 ## Main Features
 
 - STMap-style UV remap: project any texture layer through a UV / ST pass
 - Apply the effect to either the UV map or texture
+- Generate a pixel-center-aligned UV map for a flat layer
 - 8, 16 and 32 bpc support
 - Unpremultiplies antialiased UV-map edges before decoding coordinates
 - V-axis origin toggle: Top (After Effects / image space) or Bottom (Nuke / 3D)
@@ -101,7 +104,8 @@ Generated `.aex` / `.dll` files are not committed to Git.
 ## Parameters
 
 - `Other Layer (Texture / UV Map)`: the role opposite the applied layer.
-- `Input Is`: whether the applied layer is the UV map or the texture.
+- `Input Is`: whether the applied layer is the UV map or texture, or whether
+  UVProject should generate a planar UV map.
 - `V Origin`: `Top (After Effects)` or `Bottom (Nuke / 3D)`. Most 3D/render UV
   passes use the bottom origin (the default); image-space maps use the top.
 - `Wrap`: how texture coordinates outside 0..1 are handled — `Clamp`, `Repeat`,

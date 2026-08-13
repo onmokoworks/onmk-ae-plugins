@@ -21,6 +21,13 @@ enum Params {
     InputMode,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InputMode {
+    UvMap,
+    Texture,
+    GeneratePlanar,
+}
+
 // Added-parameter indices (AE index 0 is the implicit input layer = UV map).
 const PARAM_TEXTURE: i32 = 1;
 const TEXTURE_CHECKOUT_ID: i32 = 1;
@@ -108,6 +115,7 @@ impl AdobePluginGlobal for Plugin {
                 f.set_options(&[
                     "UV Map (Other Layer = Texture)",
                     "Texture (Other Layer = UV Map)",
+                    "Generate Planar UV Map",
                 ]);
                 f.set_default(1);
             }),
@@ -126,7 +134,7 @@ impl AdobePluginGlobal for Plugin {
         match cmd {
             ae::Command::About => {
                 out_data.set_return_msg(
-                    "UVProject v1.1\rUV-map or texture input, 8/16/32 bpc.\rWritten in Rust.",
+                    "UVProject v1.2\rUV projection and planar UV-map generation, 8/16/32 bpc.\rWritten in Rust.",
                 );
             }
             ae::Command::Render {
@@ -167,8 +175,12 @@ fn get_params(params: &ae::Parameters<Params>) -> Result<UvParams, ae::Error> {
     })
 }
 
-fn input_is_texture(params: &ae::Parameters<Params>) -> Result<bool, ae::Error> {
-    Ok(params.get(Params::InputMode)?.as_popup()?.value() == 2)
+fn input_mode(params: &ae::Parameters<Params>) -> Result<InputMode, ae::Error> {
+    Ok(match params.get(Params::InputMode)?.as_popup()?.value() {
+        2 => InputMode::Texture,
+        3 => InputMode::GeneratePlanar,
+        _ => InputMode::UvMap,
+    })
 }
 
 // ---- Layer <-> normalized float image helpers ----
@@ -255,10 +267,14 @@ fn render_cpu(
     out_layer: &mut ae::Layer,
 ) -> Result<(), ae::Error> {
     let p = get_params(params)?;
+    if input_mode(params)? == InputMode::GeneratePlanar {
+        let result = uv::generate_planar(out_layer.width(), out_layer.height(), p.v_origin_bottom);
+        return image_to_layer(&result, out_layer);
+    }
     let input = layer_to_image(in_layer)?;
     let other = get_other_layer(params, in_data);
     let result = match other {
-        Some(other) if input_is_texture(params)? => {
+        Some(other) if input_mode(params)? == InputMode::Texture => {
             uv::project(&p, &other, &input, out_layer.width(), out_layer.height())
         }
         Some(other) => uv::project(&p, &input, &other, out_layer.width(), out_layer.height()),
@@ -335,10 +351,11 @@ fn smart_render_cpu(
     let out_w = output_world.width();
     let out_h = output_world.height();
 
-    let result = if let Ok(Some(other_world)) = cb.checkout_layer_pixels(TEXTURE_CHECKOUT_ID as u32)
-    {
+    let result = if input_mode(params)? == InputMode::GeneratePlanar {
+        uv::generate_planar(out_w, out_h, p.v_origin_bottom)
+    } else if let Ok(Some(other_world)) = cb.checkout_layer_pixels(TEXTURE_CHECKOUT_ID as u32) {
         let other = layer_to_image(&other_world)?;
-        if input_is_texture(params)? {
+        if input_mode(params)? == InputMode::Texture {
             uv::project(&p, &other, &input, out_w, out_h)
         } else {
             uv::project(&p, &input, &other, out_w, out_h)

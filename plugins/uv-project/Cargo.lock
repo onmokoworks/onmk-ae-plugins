@@ -702,7 +702,7 @@ checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 
 [[package]]
 name = "uv-project"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "after-effects",
  "pipl",

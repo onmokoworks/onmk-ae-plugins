@@ -1,0 +1,33 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# models & weights (large)
+*.onnx
+*.pth
+*.safetensors
+model/weights/
+
+# build
+build/
+target/
+cmake-build-*/
+*.o
+*.obj
+
+# IDE
+.vscode/
+.idea/
+*.xcodeproj/
+*.xcworkspace/
+
+# third-party (managed manually)
+third_party/onnxruntime*/
+third_party/onnxruntime*.zip
+third_party/onnxruntime*.nupkg
+third_party/AfterEffectsSDK*/
+
+# local backups
+_backup_cpp_plugin_*/

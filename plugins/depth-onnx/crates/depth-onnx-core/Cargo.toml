@@ -1,0 +1,31 @@
+[package]
+name = "depth-onnx-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+parking_lot = "0.12"
+
+[dependencies.ort]
+version = "=2.0.0-rc.12"
+default-features = false
+features = ["std", "ndarray", "load-dynamic", "api-18"]
+
+[target.'cfg(windows)'.dependencies.ort]
+version = "=2.0.0-rc.12"
+default-features = false
+features = ["std", "ndarray", "load-dynamic", "directml", "api-18"]
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+]
+
+[dev-dependencies]
+tempfile = "3"

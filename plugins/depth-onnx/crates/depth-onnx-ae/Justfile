@@ -1,0 +1,24 @@
+PluginName := "DepthONNX"
+BundleIdentifier := "com.onmk.ae.depthonnx"
+BinaryName := "depthonnxae"
+
+import '../../AdobePlugin.just'
+
+# Embed ONNX Runtime + model packs into the macOS bundle after packaging.
+[macos]
+post-bundle profile target_dir:
+    #!/bin/bash
+    set -euo pipefail
+    REPO="{{justfile_directory()}}/../.."
+    BUNDLE="{{target_dir}}/{{profile}}/{{PluginName}}.plugin"
+    ORT="${REPO}/third_party/onnxruntime-osx-arm64/lib/libonnxruntime.1.24.4.dylib"
+    if [[ -f "${ORT}" ]]; then
+      mkdir -p "${BUNDLE}/Contents/Frameworks"
+      /usr/bin/ditto --norsrc --noextattr --noacl --noqtn "${ORT}" "${BUNDLE}/Contents/Frameworks/libonnxruntime.1.24.4.dylib"
+    fi
+    /usr/bin/xattr -cr "${BUNDLE}" || true
+
+[macos]
+release-bundle:
+    just release
+    just post-bundle release {{TargetDir}}

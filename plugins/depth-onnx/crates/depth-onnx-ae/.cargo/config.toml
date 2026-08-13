@@ -1,0 +1,11 @@
+[target.aarch64-apple-darwin]
+rustflags = [
+  "-C", "link-arg=-Wl,-install_name,@loader_path/DepthONNX",
+  "-C", "link-arg=-Wl,-rpath,@loader_path/../Frameworks",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+  "-C", "link-arg=-Wl,-install_name,@loader_path/DepthONNX",
+  "-C", "link-arg=-Wl,-rpath,@loader_path/../Frameworks",
+]

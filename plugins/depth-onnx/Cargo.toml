@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/depth-onnx-core",
+    "crates/depth-onnx-ae",
+]
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[patch.crates-io]
+after-effects = { path = "vendor/after-effects" }
+after-effects-sys = { path = "vendor/after-effects-sys" }

@@ -19,6 +19,9 @@ onmkが開発・メンテナンスするAfter Effectsプラグインのモノレ
 
 - [Rio de Janeiro Filter](./plugins/rio-de-janeiro-filter/) — Rio de Janeiroフィルター風の色調を再現するエフェクト
 - [RefractionDispersion](./plugins/refraction-dispersion/) — ガラス風の屈折、色分散、ハイライト表現を作るエフェクト
+- [FrameSlice](./plugins/frame-slice/) — 画像内にスリットスキャン風の時間差を作るエフェクト
+- [TuiImage](./plugins/tui-image/) — 画像をANSIアート／TUI風のセル表現に変換するエフェクト
+- [Depth ONNX](./plugins/depth-onnx/) — ONNX Runtimeによる単眼深度推定エフェクト
 
 ---
 
@@ -43,3 +46,6 @@ Existing plugins are being migrated incrementally while preserving their Git his
 
 - [Rio de Janeiro Filter](./plugins/rio-de-janeiro-filter/) — Recreates a look inspired by the Rio de Janeiro filter
 - [RefractionDispersion](./plugins/refraction-dispersion/) — Creates glass-like refraction, chromatic dispersion, and highlight shaping
+- [FrameSlice](./plugins/frame-slice/) — Creates slit-scan style time offsets inside image layers
+- [TuiImage](./plugins/tui-image/) — Converts images into ANSI art / TUI-style cell renderings
+- [Depth ONNX](./plugins/depth-onnx/) — Performs monocular depth estimation with ONNX Runtime

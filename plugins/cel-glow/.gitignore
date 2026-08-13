@@ -1,0 +1,22 @@
+rust/celglow/target/
+rust/target/
+*.aex
+*.dll
+*.dylib
+*.so
+*.pdb
+*.exp
+*.lib
+
+# Local CLI/AEXCompat diagnostics and rendered previews.
+rust/diag-*
+rust/probe-*
+rust/tmp-*
+rust/request-*
+rust/verify-*
+rust/aexcompat-*-request.json
+rust/cli-*.json
+rust/cli-*.png
+rust/cli-*.rgba32f-le
+rust/*.err
+rust/*.out

@@ -13,7 +13,11 @@ onmkが開発・メンテナンスするAfter Effectsプラグインのモノレ
 
 ## 現在の状況
 
-現在、リポジトリ構成を整備中です。既存のプラグインは、これまでのGit履歴を維持しながら段階的に移管する予定です。
+既存のプラグインを、これまでのGit履歴を維持しながら段階的に移管しています。
+
+## プラグイン
+
+- [Rio de Janeiro Filter](./plugins/rio-de-janeiro-filter/) — Rio de Janeiroフィルター風の色調を再現するエフェクト
 
 ---
 
@@ -32,4 +36,8 @@ Experimental and unpublished projects are developed outside this repository and 
 
 ### Status
 
-The repository structure is currently being prepared. Existing plugins will be migrated incrementally while preserving their Git history.
+Existing plugins are being migrated incrementally while preserving their Git history.
+
+### Plugins
+
+- [Rio de Janeiro Filter](./plugins/rio-de-janeiro-filter/) — Recreates a look inspired by the Rio de Janeiro filter

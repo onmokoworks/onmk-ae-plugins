@@ -3,7 +3,7 @@ use pipl::*;
 fn main() {
     pipl::plugin_build(vec![
         Property::Kind(PIPLType::AEEffect),
-        Property::Name("ONMK_ParticleLab"),
+        Property::Name("Particle Kit"),
         Property::Category("Particle"),
         #[cfg(target_os = "windows")]
         Property::CodeWin64X86("EffectMain"),
@@ -25,16 +25,18 @@ fn main() {
         },
         Property::AE_Effect_Info_Flags(0),
         Property::AE_Effect_Global_OutFlags(
-            OutFlags::IExpandBuffer |
-            OutFlags::SendUpdateParamsUI |
-            OutFlags::NonParamVary,
+            OutFlags::IExpandBuffer
+                | OutFlags::SendUpdateParamsUI
+                | OutFlags::NonParamVary
+                | OutFlags::SequenceDataNeedsFlattening,
         ),
         Property::AE_Effect_Global_OutFlags_2(
-            OutFlags2::ParamGroupStartCollapsedFlag |
-            OutFlags2::IUse3DCamera |
-            OutFlags2::SupportsSmartRender,
+            OutFlags2::ParamGroupStartCollapsedFlag
+                | OutFlags2::IUse3DCamera
+                | OutFlags2::SupportsSmartRender
+                | OutFlags2::SupportsGetFlattenedSequenceData,
         ),
-        Property::AE_Effect_Match_Name("ONMK_ParticleLab"),
+        Property::AE_Effect_Match_Name("ParticleKit"),
         Property::AE_Reserved_Info(12),
         Property::AE_Effect_Support_URL("https://github.com"),
     ]);

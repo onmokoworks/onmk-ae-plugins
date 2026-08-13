@@ -38,6 +38,8 @@ fn main() {
         ),
         Property::AE_Effect_Match_Name("ParticleKit"),
         Property::AE_Reserved_Info(12),
-        Property::AE_Effect_Support_URL("https://github.com"),
+        Property::AE_Effect_Support_URL(
+            "https://github.com/onmokoworks/onmk-ae-plugins/tree/main/plugins/particle-kit",
+        ),
     ]);
 }

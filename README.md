@@ -37,6 +37,8 @@ onmkが開発・メンテナンスするAfter Effectsプラグインのモノレ
 | [MaskTransform](./plugins/mask-transform/) | マスクパスの反転と回転 | 実験的 |
 | [MaskOffset](./plugins/mask-offset/) | マスクパスのオフセット、塗り、フェザー | 実験的 |
 | [PrismWarp](./plugins/prism-warp/) | レンズ勾配による屈折とプリズム状の色分散 | 実験的 |
+| [LumaGrain](./plugins/luma-grain/) | 輝度帯ごとに強さを調整できる軽量グレイン | 実験的・8 bpc |
+| [LumaNormal](./plugins/luma-normal/) | 輝度勾配からRGBノーマルマップを生成 | 実験的・8 bpc |
 
 ---
 
@@ -79,3 +81,5 @@ Existing plugins are being migrated incrementally while preserving their Git his
 | [MaskTransform](./plugins/mask-transform/) | Flips and rotates mask paths | Experimental |
 | [MaskOffset](./plugins/mask-offset/) | Offsets mask paths with fill and feather controls | Experimental |
 | [PrismWarp](./plugins/prism-warp/) | Lens-driven refraction and prismatic chromatic dispersion | Experimental |
+| [LumaGrain](./plugins/luma-grain/) | Lightweight grain with luminance-range weighting | Experimental / 8 bpc |
+| [LumaNormal](./plugins/luma-normal/) | Generates RGB normal maps from luminance gradients | Experimental / 8 bpc |

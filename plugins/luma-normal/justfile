@@ -1,0 +1,5 @@
+PluginName := "LumaNormal"
+BinaryName := "luma_normal"
+BundleIdentifier := "work.onmk.luma-normal"
+
+import "AdobePlugin.just"

@@ -1,0 +1,182 @@
+{
+  "version": 1,
+  "catalog": {
+    "catalog_version": 1,
+    "graph_schema_version": 1,
+    "product_id": "latticelab",
+    "product_label": "Lattice Lab",
+    "nodes": [
+      {
+        "node_type": "lattice.output",
+        "label": "Output",
+        "version": 1,
+        "input_sockets": [
+          { "socket": "points", "label": "Points" },
+          { "socket": "noise", "label": "Noise" },
+          { "socket": "links", "label": "Links" },
+          { "socket": "mesh", "label": "Mesh" },
+          { "socket": "render", "label": "Render" },
+          { "socket": "system", "label": "System" }
+        ],
+        "output_sockets": [],
+        "value_sockets": []
+      },
+      {
+        "node_type": "lattice.points.grid",
+        "label": "Grid Points",
+        "version": 1,
+        "input_sockets": [],
+        "output_sockets": [{ "socket": "out", "label": "Out" }],
+        "value_sockets": [
+          { "socket": "resolution", "label": "Resolution", "value_type": "vector3", "enum_options": [] },
+          { "socket": "spacing", "label": "Spacing", "value_type": "float", "enum_options": [] },
+          { "socket": "max_points", "label": "Max Points", "value_type": "integer", "enum_options": [] }
+        ]
+      },
+      {
+        "node_type": "lattice.noise",
+        "label": "Noise",
+        "version": 1,
+        "input_sockets": [],
+        "output_sockets": [{ "socket": "out", "label": "Out" }],
+        "value_sockets": [
+          { "socket": "enabled", "label": "Enabled", "value_type": "boolean", "enum_options": [] },
+          { "socket": "amplitude", "label": "Amplitude", "value_type": "float", "enum_options": [] },
+          { "socket": "frequency", "label": "Frequency", "value_type": "float", "enum_options": [] },
+          { "socket": "speed", "label": "Speed", "value_type": "float", "enum_options": [] },
+          { "socket": "octaves", "label": "Octaves", "value_type": "integer", "enum_options": [] },
+          { "socket": "axis_scale", "label": "Axis Scale", "value_type": "vector3", "enum_options": [] }
+        ]
+      },
+      {
+        "node_type": "lattice.links",
+        "label": "Links",
+        "version": 1,
+        "input_sockets": [],
+        "output_sockets": [{ "socket": "out", "label": "Out" }],
+        "value_sockets": [
+          { "socket": "enabled", "label": "Enabled", "value_type": "boolean", "enum_options": [] },
+          { "socket": "max_distance", "label": "Max Distance", "value_type": "float", "enum_options": [] },
+          { "socket": "width", "label": "Width", "value_type": "float", "enum_options": [] },
+          { "socket": "opacity_falloff", "label": "Opacity Falloff", "value_type": "float", "enum_options": [] },
+          { "socket": "color", "label": "Color", "value_type": "color", "enum_options": [] }
+        ]
+      },
+      {
+        "node_type": "lattice.mesh",
+        "label": "Mesh",
+        "version": 1,
+        "input_sockets": [],
+        "output_sockets": [{ "socket": "out", "label": "Out" }],
+        "value_sockets": [
+          { "socket": "enabled", "label": "Enabled", "value_type": "boolean", "enum_options": [] },
+          { "socket": "max_edge", "label": "Max Edge", "value_type": "float", "enum_options": [] },
+          { "socket": "opacity", "label": "Opacity", "value_type": "float", "enum_options": [] },
+          { "socket": "color", "label": "Color", "value_type": "color", "enum_options": [] }
+        ]
+      },
+      {
+        "node_type": "lattice.render",
+        "label": "Render",
+        "version": 1,
+        "input_sockets": [],
+        "output_sockets": [{ "socket": "out", "label": "Out" }],
+        "value_sockets": [
+          { "socket": "point_size", "label": "Point Size", "value_type": "float", "enum_options": [] },
+          { "socket": "point_color", "label": "Point Color", "value_type": "color", "enum_options": [] },
+          {
+            "socket": "blend_mode",
+            "label": "Blend Mode",
+            "value_type": "enum",
+            "enum_options": [
+              { "value": "normal", "label": "Normal" },
+              { "value": "add", "label": "Add" },
+              { "value": "screen", "label": "Screen" }
+            ]
+          }
+        ]
+      },
+      {
+        "node_type": "lattice.system",
+        "label": "System",
+        "version": 1,
+        "input_sockets": [],
+        "output_sockets": [{ "socket": "out", "label": "Out" }],
+        "value_sockets": [{ "socket": "seed", "label": "Seed", "value_type": "integer", "enum_options": [] }]
+      }
+    ]
+  },
+  "state": {
+    "version": 1,
+    "enabled": true,
+    "document": {
+      "schema_version": 1,
+      "output_node": 1,
+      "nodes": [
+        { "id": 1, "version": 1, "label": "Output", "type": "lattice.output", "data": {} },
+        {
+          "id": 2,
+          "version": 1,
+          "label": "Grid Points",
+          "type": "lattice.points.grid",
+          "data": { "resolution": [10, 10, 1], "spacing": 50, "max_points": 5000 }
+        },
+        {
+          "id": 3,
+          "version": 1,
+          "label": "Noise",
+          "type": "lattice.noise",
+          "data": {
+            "enabled": false,
+            "amplitude": 50,
+            "frequency": 0.01,
+            "speed": 1,
+            "octaves": 2,
+            "axis_scale": [1, 1, 1]
+          }
+        },
+        {
+          "id": 4,
+          "version": 1,
+          "label": "Links",
+          "type": "lattice.links",
+          "data": {
+            "enabled": true,
+            "max_distance": 120,
+            "width": 1,
+            "opacity_falloff": 0.8,
+            "color": [1, 1, 1, 1]
+          }
+        },
+        {
+          "id": 5,
+          "version": 1,
+          "label": "Mesh",
+          "type": "lattice.mesh",
+          "data": {
+            "enabled": false,
+            "max_edge": 150,
+            "opacity": 0.3,
+            "color": [0.39215687, 0.5882353, 1, 1]
+          }
+        },
+        {
+          "id": 6,
+          "version": 1,
+          "label": "Render",
+          "type": "lattice.render",
+          "data": { "point_size": 4, "point_color": [1, 1, 1, 1], "blend_mode": "normal" }
+        },
+        { "id": 7, "version": 1, "label": "System", "type": "lattice.system", "data": { "seed": 12345 } }
+      ],
+      "edges": [
+        { "from": { "node": 2, "socket": "out" }, "to": { "node": 1, "socket": "points" } },
+        { "from": { "node": 3, "socket": "out" }, "to": { "node": 1, "socket": "noise" } },
+        { "from": { "node": 4, "socket": "out" }, "to": { "node": 1, "socket": "links" } },
+        { "from": { "node": 5, "socket": "out" }, "to": { "node": 1, "socket": "mesh" } },
+        { "from": { "node": 6, "socket": "out" }, "to": { "node": 1, "socket": "render" } },
+        { "from": { "node": 7, "socket": "out" }, "to": { "node": 1, "socket": "system" } }
+      ]
+    }
+  }
+}

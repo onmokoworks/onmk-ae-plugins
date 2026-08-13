@@ -1,0 +1,351 @@
+{
+  "version": 1,
+  "catalog": {
+    "catalog_version": 1,
+    "graph_schema_version": 1,
+    "product_id": "particlelab",
+    "product_label": "ParticleLab",
+    "nodes": [
+      {
+        "node_type": "particle.output",
+        "label": "Output",
+        "version": 1,
+        "input_sockets": [
+          { "socket": "emitter", "label": "Emitter" },
+          { "socket": "motion", "label": "Motion" },
+          { "socket": "physics", "label": "Physics" },
+          { "socket": "appearance", "label": "Appearance" },
+          { "socket": "render", "label": "Render" },
+          { "socket": "child", "label": "Child" },
+          { "socket": "system", "label": "System" }
+        ],
+        "output_sockets": [],
+        "value_sockets": []
+      },
+      {
+        "node_type": "particle.emitter",
+        "label": "Emitter",
+        "version": 1,
+        "input_sockets": [],
+        "output_sockets": [{ "socket": "out", "label": "Out" }],
+        "value_sockets": [
+          {
+            "socket": "emitter_type",
+            "label": "Emitter Type",
+            "value_type": "enum",
+            "enum_options": [
+              { "value": "point", "label": "Point" },
+              { "value": "box", "label": "Box" },
+              { "value": "sphere", "label": "Sphere" },
+              { "value": "grid", "label": "Grid" },
+              { "value": "layer_alpha", "label": "Layer Alpha" },
+              { "value": "path", "label": "Path" }
+            ]
+          },
+          { "socket": "position", "label": "Position", "value_type": "vector3", "enum_options": [] },
+          { "socket": "size", "label": "Size", "value_type": "vector3", "enum_options": [] },
+          { "socket": "birth_rate", "label": "Birth Rate", "value_type": "float", "enum_options": [] },
+          { "socket": "lifespan", "label": "Lifespan", "value_type": "float", "enum_options": [] },
+          { "socket": "lifespan_variation", "label": "Lifespan Variation", "value_type": "float", "enum_options": [] },
+          { "socket": "emit_all_at_start", "label": "Emit All At Start", "value_type": "boolean", "enum_options": [] },
+          { "socket": "grid_resolution", "label": "Grid Resolution", "value_type": "vector3", "enum_options": [] }
+        ]
+      },
+      {
+        "node_type": "particle.motion",
+        "label": "Motion",
+        "version": 1,
+        "input_sockets": [],
+        "output_sockets": [{ "socket": "out", "label": "Out" }],
+        "value_sockets": [
+          { "socket": "initial_speed", "label": "Initial Speed", "value_type": "float", "enum_options": [] },
+          { "socket": "speed_variation", "label": "Speed Variation", "value_type": "float", "enum_options": [] },
+          { "socket": "initial_direction", "label": "Initial Direction", "value_type": "vector3", "enum_options": [] },
+          { "socket": "spread_degrees", "label": "Spread", "value_type": "float", "enum_options": [] },
+          { "socket": "initial_size", "label": "Initial Size", "value_type": "float", "enum_options": [] },
+          { "socket": "size_variation", "label": "Size Variation", "value_type": "float", "enum_options": [] },
+          { "socket": "initial_rotation", "label": "Initial Rotation", "value_type": "float", "enum_options": [] },
+          { "socket": "rotation_variation", "label": "Rotation Variation", "value_type": "float", "enum_options": [] },
+          { "socket": "rotation_speed", "label": "Rotation Speed", "value_type": "float", "enum_options": [] },
+          { "socket": "opacity_variation", "label": "Opacity Variation", "value_type": "float", "enum_options": [] },
+          { "socket": "sprite_frame_count", "label": "Sprite Frame Count", "value_type": "integer", "enum_options": [] },
+          { "socket": "sprite_time_sampling", "label": "Sprite Time Sampling", "value_type": "integer", "enum_options": [] }
+        ]
+      },
+      {
+        "node_type": "particle.physics",
+        "label": "Physics",
+        "version": 1,
+        "input_sockets": [],
+        "output_sockets": [{ "socket": "out", "label": "Out" }],
+        "value_sockets": [
+          { "socket": "gravity", "label": "Gravity", "value_type": "vector3", "enum_options": [] },
+          { "socket": "wind", "label": "Wind", "value_type": "vector3", "enum_options": [] },
+          { "socket": "air_resistance", "label": "Air Resistance", "value_type": "float", "enum_options": [] },
+          { "socket": "turbulence_strength", "label": "Turbulence Strength", "value_type": "float", "enum_options": [] },
+          { "socket": "turbulence_scale", "label": "Turbulence Scale", "value_type": "float", "enum_options": [] },
+          { "socket": "turbulence_speed", "label": "Turbulence Speed", "value_type": "float", "enum_options": [] },
+          { "socket": "bounce_floor_y", "label": "Bounce Floor Y", "value_type": "float", "enum_options": [] },
+          { "socket": "bounce_enabled", "label": "Bounce Enabled", "value_type": "boolean", "enum_options": [] },
+          { "socket": "bounce_damping", "label": "Bounce Damping", "value_type": "float", "enum_options": [] }
+        ]
+      },
+      {
+        "node_type": "particle.appearance",
+        "label": "Appearance",
+        "version": 1,
+        "input_sockets": [],
+        "output_sockets": [{ "socket": "out", "label": "Out" }],
+        "value_sockets": [
+          { "socket": "color_start", "label": "Color Start", "value_type": "color", "enum_options": [] },
+          { "socket": "color_end", "label": "Color End", "value_type": "color", "enum_options": [] },
+          { "socket": "size_over_life", "label": "Size Over Life", "value_type": "color", "enum_options": [] },
+          { "socket": "opacity_over_life", "label": "Opacity Over Life", "value_type": "color", "enum_options": [] }
+        ]
+      },
+      {
+        "node_type": "particle.render",
+        "label": "Render",
+        "version": 1,
+        "input_sockets": [],
+        "output_sockets": [{ "socket": "out", "label": "Out" }],
+        "value_sockets": [
+          {
+            "socket": "shape",
+            "label": "Shape",
+            "value_type": "enum",
+            "enum_options": [
+              { "value": "circle", "label": "Circle" },
+              { "value": "square", "label": "Square" },
+              { "value": "triangle", "label": "Triangle" },
+              { "value": "star", "label": "Star" },
+              { "value": "line", "label": "Line" },
+              { "value": "image", "label": "Image" }
+            ]
+          },
+          {
+            "socket": "blend_mode",
+            "label": "Blend Mode",
+            "value_type": "enum",
+            "enum_options": [
+              { "value": "normal", "label": "Normal" },
+              { "value": "add", "label": "Add" },
+              { "value": "screen", "label": "Screen" }
+            ]
+          },
+          { "socket": "motion_blur", "label": "Motion Blur", "value_type": "float", "enum_options": [] },
+          { "socket": "edge_softness", "label": "Edge Softness", "value_type": "float", "enum_options": [] },
+          { "socket": "dof_enabled", "label": "Depth Of Field", "value_type": "boolean", "enum_options": [] },
+          { "socket": "dof_focal_distance", "label": "DOF Focal Distance", "value_type": "float", "enum_options": [] },
+          { "socket": "dof_aperture", "label": "DOF Aperture", "value_type": "float", "enum_options": [] },
+          { "socket": "composite_on_original", "label": "Composite On Original", "value_type": "boolean", "enum_options": [] },
+          {
+            "socket": "apply_mode",
+            "label": "Apply Mode",
+            "value_type": "enum",
+            "enum_options": [
+              { "value": "on_transparent", "label": "On Transparent" },
+              { "value": "normal", "label": "Normal" },
+              { "value": "add", "label": "Add" },
+              { "value": "screen", "label": "Screen" }
+            ]
+          },
+          { "socket": "size_multiplier", "label": "Size Multiplier", "value_type": "float", "enum_options": [] },
+          {
+            "socket": "time_sampling",
+            "label": "Time Sampling",
+            "value_type": "enum",
+            "enum_options": [
+              { "value": "current_time", "label": "Current Time" },
+              { "value": "birth_time", "label": "Birth Time" },
+              { "value": "random_still", "label": "Random Still" },
+              { "value": "random_play", "label": "Random Play" },
+              { "value": "cycle", "label": "Cycle" }
+            ]
+          },
+          {
+            "socket": "image_color_mode",
+            "label": "Image Color Mode",
+            "value_type": "enum",
+            "enum_options": [
+              { "value": "tint", "label": "Tint" },
+              { "value": "source", "label": "Source" }
+            ]
+          },
+          {
+            "socket": "image_fit_mode",
+            "label": "Image Fit Mode",
+            "value_type": "enum",
+            "enum_options": [
+              { "value": "contain", "label": "Contain" },
+              { "value": "stretch", "label": "Stretch" }
+            ]
+          },
+          { "socket": "use_source_alpha", "label": "Use Source Alpha", "value_type": "boolean", "enum_options": [] },
+          { "socket": "source_premultiplied", "label": "Source Premultiplied", "value_type": "boolean", "enum_options": [] },
+          { "socket": "alpha_clip", "label": "Alpha Clip", "value_type": "float", "enum_options": [] }
+        ]
+      },
+      {
+        "node_type": "particle.child",
+        "label": "Child",
+        "version": 1,
+        "input_sockets": [],
+        "output_sockets": [{ "socket": "out", "label": "Out" }],
+        "value_sockets": [
+          { "socket": "enabled", "label": "Enabled", "value_type": "boolean", "enum_options": [] },
+          { "socket": "count", "label": "Count", "value_type": "integer", "enum_options": [] },
+          { "socket": "inherit_velocity", "label": "Inherit Velocity", "value_type": "float", "enum_options": [] },
+          { "socket": "lifespan", "label": "Lifespan", "value_type": "float", "enum_options": [] },
+          { "socket": "initial_speed", "label": "Initial Speed", "value_type": "float", "enum_options": [] },
+          { "socket": "spread_degrees", "label": "Spread", "value_type": "float", "enum_options": [] },
+          { "socket": "size_scale", "label": "Size Scale", "value_type": "float", "enum_options": [] }
+        ]
+      },
+      {
+        "node_type": "particle.system",
+        "label": "System",
+        "version": 1,
+        "input_sockets": [],
+        "output_sockets": [{ "socket": "out", "label": "Out" }],
+        "value_sockets": [{ "socket": "seed", "label": "Seed", "value_type": "integer", "enum_options": [] }]
+      }
+    ]
+  },
+  "state": {
+    "version": 2,
+    "enabled": true,
+    "document": {
+      "schema_version": 1,
+      "output_node": 1,
+      "nodes": [
+        { "id": 1, "version": 1, "label": "Output", "type": "particle.output", "data": {} },
+        {
+          "id": 2,
+          "version": 1,
+          "label": "Emitter",
+          "type": "particle.emitter",
+          "data": {
+            "emitter_type": "point",
+            "position": [50, 50, 0],
+            "size": [0, 0, 0],
+            "birth_rate": 180,
+            "lifespan": 1.6,
+            "lifespan_variation": 0.15,
+            "emit_all_at_start": false,
+            "grid_resolution": [8, 8, 1]
+          }
+        },
+        {
+          "id": 3,
+          "version": 1,
+          "label": "Motion",
+          "type": "particle.motion",
+          "data": {
+            "initial_speed": 240,
+            "speed_variation": 0,
+            "initial_direction": [0, -1, 0],
+            "spread_degrees": 18,
+            "initial_size": 9,
+            "size_variation": 0.2,
+            "initial_rotation": 0,
+            "rotation_variation": 0,
+            "rotation_speed": 0,
+            "opacity_variation": 0,
+            "sprite_frame_count": 1,
+            "sprite_time_sampling": 0
+          }
+        },
+        {
+          "id": 4,
+          "version": 1,
+          "label": "Physics",
+          "type": "particle.physics",
+          "data": {
+            "gravity": [0, 160, 0],
+            "wind": [0, 0, 0],
+            "air_resistance": 0.3,
+            "turbulence_strength": 12,
+            "turbulence_scale": 0.75,
+            "turbulence_speed": 1,
+            "bounce_floor_y": 10000,
+            "bounce_enabled": false,
+            "bounce_damping": 0.5
+          }
+        },
+        {
+          "id": 5,
+          "version": 1,
+          "label": "Appearance",
+          "type": "particle.appearance",
+          "data": {
+            "color_start": [1, 1, 1, 1],
+            "color_end": [1, 1, 1, 0],
+            "size_over_life": [1, 1, 0.65, 0.35],
+            "opacity_over_life": [1, 0.9, 0.45, 0]
+          }
+        },
+        {
+          "id": 6,
+          "version": 1,
+          "label": "Render",
+          "type": "particle.render",
+          "data": {
+            "shape": "circle",
+            "blend_mode": "normal",
+            "motion_blur": 0.2,
+            "edge_softness": 0,
+            "dof_enabled": false,
+            "dof_focal_distance": 0,
+            "dof_aperture": 5,
+            "composite_on_original": true,
+            "apply_mode": "normal",
+            "size_multiplier": 1.15,
+            "time_sampling": "current_time",
+            "image_color_mode": "tint",
+            "image_fit_mode": "contain",
+            "use_source_alpha": true,
+            "source_premultiplied": true,
+            "alpha_clip": 0.01
+          }
+        },
+        {
+          "id": 7,
+          "version": 1,
+          "label": "Child",
+          "type": "particle.child",
+          "data": {
+            "enabled": false,
+            "count": 3,
+            "inherit_velocity": 0.65,
+            "lifespan": 0.5,
+            "initial_speed": 80,
+            "spread_degrees": 110,
+            "size_scale": 0.4
+          }
+        },
+        { "id": 8, "version": 1, "label": "System", "type": "particle.system", "data": { "seed": 12345 } }
+      ],
+      "edges": [
+        { "from": { "node": 2, "socket": "out" }, "to": { "node": 1, "socket": "emitter" } },
+        { "from": { "node": 3, "socket": "out" }, "to": { "node": 1, "socket": "motion" } },
+        { "from": { "node": 4, "socket": "out" }, "to": { "node": 1, "socket": "physics" } },
+        { "from": { "node": 5, "socket": "out" }, "to": { "node": 1, "socket": "appearance" } },
+        { "from": { "node": 6, "socket": "out" }, "to": { "node": 1, "socket": "render" } },
+        { "from": { "node": 7, "socket": "out" }, "to": { "node": 1, "socket": "child" } },
+        { "from": { "node": 8, "socket": "out" }, "to": { "node": 1, "socket": "system" } }
+      ],
+      "published_params": [
+        {
+          "stable_id": "birth_rate",
+          "label": "Birth Rate",
+          "target": { "node": 2, "socket": "birth_rate" },
+          "value_type": "float",
+          "default_value": { "type": "float", "value": 180 }
+        }
+      ]
+    },
+    "published_values": [{ "stable_id": "birth_rate", "value": { "type": "float", "value": 180 } }],
+    "host_float_bindings": [{ "stable_id": "birth_rate", "slot": 1 }]
+  }
+}

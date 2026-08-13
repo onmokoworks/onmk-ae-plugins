@@ -1,0 +1,25 @@
+[package]
+name = "tui_image_renderer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+after-effects = { git = "https://github.com/virtualritz/after-effects.git" }
+wgpu = "26"
+pollster = "0.4"
+futures-intrusive = "0.5"
+parking_lot = "0.12"
+num_cpus = "1.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+pipl = { git = "https://github.com/virtualritz/after-effects.git" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

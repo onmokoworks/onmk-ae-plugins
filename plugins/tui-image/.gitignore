@@ -1,0 +1,22 @@
+# Rust build output
+target/
+rust/target/
+
+# After Effects build artifacts
+*.aex
+*.plugin
+*.pipl
+
+# Local environment and machine-specific notes
+.env
+.env.local
+*.local.*
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+

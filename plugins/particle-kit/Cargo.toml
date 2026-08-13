@@ -1,0 +1,29 @@
+[package]
+name = "particlekit"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+after-effects = { git = "https://github.com/virtualritz/after-effects.git" }
+rayon = "1.10"
+glam = "0.29"
+fastrand = "2.3"
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+particlelab_engine_core = { path = "crates/particlelab_engine_core" }
+
+[build-dependencies]
+pipl = { git = "https://github.com/virtualritz/after-effects.git" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+
+[workspace]
+members = ["crates/particlelab_engine_core", "crates/lattice_lab_plugin"]
+default-members = [".", "crates/particlelab_engine_core"]

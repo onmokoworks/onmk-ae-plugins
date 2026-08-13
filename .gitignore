@@ -1,0 +1,43 @@
+# Rust build output
+target/
+**/target/
+
+# After Effects build artifacts
+*.aex
+*.dll
+*.pdb
+*.lib
+*.exp
+
+# Native build directories
+build/
+**/build/
+out/
+**/out/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.local
+
+# IDE and OS files
+.idea/
+.vscode/
+.vs/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.zip
+
+# Local deployment and cache data
+cache/
+**/cache/
+deploy/
+**/deploy/
+

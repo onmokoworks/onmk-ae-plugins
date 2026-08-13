@@ -22,6 +22,7 @@ onmkが開発・メンテナンスするAfter Effectsプラグインのモノレ
 - [FrameSlice](./plugins/frame-slice/) — 画像内にスリットスキャン風の時間差を作るエフェクト
 - [TuiImage](./plugins/tui-image/) — 画像をANSIアート／TUI風のセル表現に変換するエフェクト
 - [Depth ONNX](./plugins/depth-onnx/) — ONNX Runtimeによる単眼深度推定エフェクト
+- [MinimaxMap](./plugins/minimax-map/) — 符号付きのMinimum／Maximumモルフォロジーを行うエフェクト
 
 ---
 
@@ -49,3 +50,4 @@ Existing plugins are being migrated incrementally while preserving their Git his
 - [FrameSlice](./plugins/frame-slice/) — Creates slit-scan style time offsets inside image layers
 - [TuiImage](./plugins/tui-image/) — Converts images into ANSI art / TUI-style cell renderings
 - [Depth ONNX](./plugins/depth-onnx/) — Performs monocular depth estimation with ONNX Runtime
+- [MinimaxMap](./plugins/minimax-map/) — Performs signed Minimum / Maximum morphology

@@ -1,0 +1,5 @@
+PluginName := "AdaptiveFilter"
+BinaryName := "adaptive_filter"
+BundleIdentifier := "work.onmk.AdaptiveFilter"
+
+import "AdobePlugin.just"

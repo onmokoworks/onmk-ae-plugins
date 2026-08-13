@@ -1,0 +1,20 @@
+/target/
+
+# Editor and OS noise
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+
+# Local logs and temporary output
+*.log
+*.tmp
+*.bak
+
+# Built plug-in binaries (output of `just build` / `just release`)
+*.aex
+*.dll
+*.dylib
+*.so

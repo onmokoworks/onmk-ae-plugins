@@ -1,0 +1,39 @@
+# Rust build output
+target/
+rust/target/
+
+# After Effects build artifacts
+*.aex
+*.plugin
+*.pipl
+*.dll
+*.dylib
+*.so
+*.pdb
+*.exp
+*.lib
+
+# Local environment and machine-specific notes
+.env
+.env.local
+*.local.*
+*.log
+*.tmp
+*.bak
+**/*.rs.bk
+Cargo.lock.bak
+
+# Internal docs / scratch
+_internal/
+docs/internal/
+NOTES.local.md
+SCRATCH.md
+TODO.local.md
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini

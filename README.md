@@ -32,6 +32,10 @@ onmkが開発・メンテナンスするAfter Effectsプラグインのモノレ
 | [CelGlow](./plugins/cel-glow/) | イラスト・アニメ向けの段階的なセルグロー | 実験的 |
 | [onmkGlow](./plugins/onmk-glow/) | After Glowとストリークを備えたマルチパス・グロー | 実験的 |
 | [ONMK Starglow](./plugins/starglow/) | 複数方向の光条とスペクトル色を生成するスターグロー | 実験的 |
+| [PathArray](./plugins/path-array/) | マスクパスに沿ってレイヤーの複製を配置 | 実験的 |
+| [ScatterMap](./plugins/scatter-map/) | レイヤーマップで制御できるピクセル散乱 | 実験的 |
+| [MaskTransform](./plugins/mask-transform/) | マスクパスの反転と回転 | 実験的 |
+| [MaskOffset](./plugins/mask-offset/) | マスクパスのオフセット、塗り、フェザー | 実験的 |
 
 ---
 
@@ -69,3 +73,7 @@ Existing plugins are being migrated incrementally while preserving their Git his
 | [CelGlow](./plugins/cel-glow/) | Stepped cel-glow rendering for illustration and anime compositing | Experimental |
 | [onmkGlow](./plugins/onmk-glow/) | Multi-pass glow with after-glow shaping and streaks | Experimental |
 | [ONMK Starglow](./plugins/starglow/) | Multi-direction spectral star glow | Experimental |
+| [PathArray](./plugins/path-array/) | Distributes layer copies along a mask path | Experimental |
+| [ScatterMap](./plugins/scatter-map/) | Map-controlled pixel scattering | Experimental |
+| [MaskTransform](./plugins/mask-transform/) | Flips and rotates mask paths | Experimental |
+| [MaskOffset](./plugins/mask-offset/) | Offsets mask paths with fill and feather controls | Experimental |

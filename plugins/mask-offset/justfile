@@ -1,0 +1,5 @@
+PluginName := "MaskOffset"
+BinaryName := "mask_offset"
+BundleIdentifier := "work.onmk.mask-offset"
+
+import "AdobePlugin.just"

@@ -1,0 +1,5 @@
+PluginName := "PathArray"
+BinaryName := "path_array"
+BundleIdentifier := "work.onmk.path-array"
+
+import "AdobePlugin.just"

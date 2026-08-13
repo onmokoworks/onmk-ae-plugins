@@ -1,0 +1,5 @@
+PluginName := "MaskTransform"
+BinaryName := "mask_transform"
+BundleIdentifier := "work.onmk.mask-transform"
+
+import "AdobePlugin.just"

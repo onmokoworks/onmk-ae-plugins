@@ -1,0 +1,5 @@
+﻿PluginName := "UVProject"
+BinaryName := "uv_project"
+BundleIdentifier := "com.onmk.UVProject"
+
+import "AdobePlugin.just"

@@ -1,0 +1,5 @@
+PluginName := "onmkGlow"
+BinaryName := "onmk_glow"
+BundleIdentifier := "work.onmk.glow"
+
+import "AdobePlugin.just"

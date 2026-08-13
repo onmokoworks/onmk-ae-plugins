@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + clippy + build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # NOTE: The Adobe After Effects SDK is not redistributable, so it cannot
+      # be checked into CI. PiPL generation in build.rs needs AESDK_ROOT.
+      # Until a CI-safe SDK path is wired up, fmt/clippy run with --no-deps-ish
+      # scope and the full build step may be skipped on CI.
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+        continue-on-error: true
+
+      - name: Build (release)
+        run: cargo build --release
+        continue-on-error: true

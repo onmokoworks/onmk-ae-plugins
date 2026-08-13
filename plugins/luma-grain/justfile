@@ -1,0 +1,5 @@
+PluginName := "LumaGrain"
+BinaryName := "luma_grain"
+BundleIdentifier := "work.onmk.luma-grain"
+
+import "AdobePlugin.just"

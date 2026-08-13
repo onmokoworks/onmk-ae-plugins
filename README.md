@@ -25,7 +25,8 @@ onmkが開発・メンテナンスするAfter Effectsプラグインのモノレ
 | [TuiImage](./plugins/tui-image/) | 画像をANSIアート／TUI風のセル表現に変換 | v0.1.0／開発中 |
 | [Depth ONNX](./plugins/depth-onnx/) | ONNX Runtimeによる単眼深度推定 | 開発中 |
 | [MinimaxMap](./plugins/minimax-map/) | 符号付きのMinimum／Maximumモルフォロジー | 開発中 |
-| [MedianPro](./plugins/median-pro/) | アルファ対応のMedian／Weighted Medianフィルター | 開発中 |
+| [MedianPro](./plugins/median-pro/) | アルファ対応のMedian／Weighted Medianフィルター | 実験的 |
+| [AdaptiveFilter](./plugins/adaptive-filter/) | Kuwahara／Generalized Kuwahara／Bilateralフィルター | 実験的・仮称 |
 
 ---
 
@@ -56,4 +57,5 @@ Existing plugins are being migrated incrementally while preserving their Git his
 | [TuiImage](./plugins/tui-image/) | Converts images into ANSI art / TUI-style cell renderings | v0.1.0 / In development |
 | [Depth ONNX](./plugins/depth-onnx/) | Performs monocular depth estimation with ONNX Runtime | In development |
 | [MinimaxMap](./plugins/minimax-map/) | Performs signed Minimum / Maximum morphology | In development |
-| [MedianPro](./plugins/median-pro/) | Alpha-safe Median and Weighted Median filtering | In development |
+| [MedianPro](./plugins/median-pro/) | Alpha-safe Median and Weighted Median filtering | Experimental |
+| [AdaptiveFilter](./plugins/adaptive-filter/) | Kuwahara, Generalized Kuwahara, and Bilateral filtering | Experimental / working name |

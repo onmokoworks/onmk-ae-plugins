@@ -1,7 +1,7 @@
 /// CPU filter implementations for MedianPro.
 /// All filters operate on flat &[u8] pixel slices (ARGB 8-bit, 4 bytes per pixel).
 /// When a luminance map is provided, the effective radius is scaled per-pixel:
-/// effective_radius = max(1, round(radius * luma)).
+/// effective_radius = round(radius * luma).
 
 #[inline]
 fn clamp8(v: i32) -> u8 {
@@ -36,7 +36,7 @@ fn effective_radius(base_radius: usize, luma_map: Option<&[f64]>, px_index: usiz
         None => base_radius,
         Some(map) => {
             let luma = map.get(px_index).copied().unwrap_or(1.0);
-            (base_radius as f64 * luma).round().max(1.0) as usize
+            (base_radius as f64 * luma).round().max(0.0) as usize
         }
     }
 }

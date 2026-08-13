@@ -97,10 +97,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install_medianpro_admin.ps1
 ## パラメータ
 
 - `Filter Type`: Median または Weighted Median
-- `Radius`: 基本フィルター半径
-- `Edge Preserve`: Weighted Median の空間重み強度
-- `Iterations`: フィルターの反復回数
-- `Mix with Original`: 元画像とのブレンド量
+- `Radius`: フィルター半径（`0`で無変化、最大`100`）
+- `Weight Falloff`: Weighted Median の空間重み。Median選択時は無効
+- `Iterations`: フィルターの反復回数。半径と同時に上げると処理負荷が大きくなります
+- `Mix with Original`: 元画像とのブレンド量（`0%`で無変化）
 - `Luminance Map`: 半径をピクセル単位で制御する任意レイヤー
 - `Invert Map`: 輝度マップの影響を反転
 

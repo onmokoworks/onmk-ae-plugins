@@ -24,7 +24,7 @@ fn main() {
             build: 1,
         },
         Property::AE_Effect_Info_Flags(0),
-        Property::AE_Effect_Global_OutFlags(OutFlags::None),
+        Property::AE_Effect_Global_OutFlags(OutFlags::SendUpdateParamsUI),
         Property::AE_Effect_Global_OutFlags_2(
             OutFlags2::SupportsSmartRender
                 | OutFlags2::SupportsThreadedRendering
@@ -32,6 +32,8 @@ fn main() {
         ),
         Property::AE_Effect_Match_Name("ONMK_MedianPro"),
         Property::AE_Reserved_Info(10),
-        Property::AE_Effect_Support_URL("https://github.com"),
+        Property::AE_Effect_Support_URL(
+            "https://github.com/onmokoworks/onmk-ae-plugins/tree/main/plugins/median-pro",
+        ),
     ]);
 }

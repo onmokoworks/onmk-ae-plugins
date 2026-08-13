@@ -10,7 +10,7 @@ RefractionDispersion は、マスクまたはシェイプレイヤーからガ�
 
 ## 名前
 
-- リポジトリ名: `RefractionDispersion-Ae`
+- リポジトリ: [`onmokoworks/onmk-ae-plugins`](https://github.com/onmokoworks/onmk-ae-plugins/tree/main/plugins/refraction-dispersion)
 - 表示名: `RefractionDispersion`
 - After Effects match name: `RefractionDispersion`
 - プラグインファイル名:

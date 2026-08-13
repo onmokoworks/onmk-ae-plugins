@@ -10,7 +10,7 @@ It builds a height field from a selected layer, derives pseudo surface normals, 
 
 ## Name
 
-- Repository name: `RefractionDispersion-Ae`
+- Repository: [`onmokoworks/onmk-ae-plugins`](https://github.com/onmokoworks/onmk-ae-plugins/tree/main/plugins/refraction-dispersion)
 - Display name: `RefractionDispersion`
 - After Effects match name: `RefractionDispersion`
 - Plugin file name:

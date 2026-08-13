@@ -18,6 +18,7 @@ onmkが開発・メンテナンスするAfter Effectsプラグインのモノレ
 ## プラグイン
 
 - [Rio de Janeiro Filter](./plugins/rio-de-janeiro-filter/) — Rio de Janeiroフィルター風の色調を再現するエフェクト
+- [RefractionDispersion](./plugins/refraction-dispersion/) — ガラス風の屈折、色分散、ハイライト表現を作るエフェクト
 
 ---
 
@@ -41,3 +42,4 @@ Existing plugins are being migrated incrementally while preserving their Git his
 ### Plugins
 
 - [Rio de Janeiro Filter](./plugins/rio-de-janeiro-filter/) — Recreates a look inspired by the Rio de Janeiro filter
+- [RefractionDispersion](./plugins/refraction-dispersion/) — Creates glass-like refraction, chromatic dispersion, and highlight shaping

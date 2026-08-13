@@ -1,0 +1,5 @@
+PluginName := "ScatterMap"
+BinaryName := "scatter_map"
+BundleIdentifier := "work.onmk.scatter-map"
+
+import "AdobePlugin.just"

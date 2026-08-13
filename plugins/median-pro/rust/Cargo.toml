@@ -1,0 +1,13 @@
+[package]
+name = "median_pro"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+after-effects = { git = "https://github.com/virtualritz/after-effects.git" }
+
+[build-dependencies]
+pipl = { git = "https://github.com/virtualritz/after-effects.git" }

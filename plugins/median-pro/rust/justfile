@@ -1,0 +1,5 @@
+PluginName := "MedianPro"
+BinaryName := "median_pro"
+BundleIdentifier := "work.onmk.MedianPro"
+
+import "AdobePlugin.just"

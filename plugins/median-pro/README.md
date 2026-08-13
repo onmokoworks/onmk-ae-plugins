@@ -97,10 +97,10 @@ Generated `.aex` / `.plugin` files are not committed to Git.
 ## Parameters
 
 - `Filter Type`: Median or Weighted Median
-- `Radius`: base filtering radius
-- `Edge Preserve`: spatial weighting strength for Weighted Median
-- `Iterations`: number of repeated filter passes
-- `Mix with Original`: blends the result back toward the input
+- `Radius`: filter radius (`0` is a no-op, maximum `100`)
+- `Weight Falloff`: spatial weighting for Weighted Median; disabled in Median mode
+- `Iterations`: repeated filter passes; large radii combined with multiple passes can be expensive
+- `Mix with Original`: blends the result back toward the input (`0%` is a no-op)
 - `Luminance Map`: optional layer that scales radius per pixel
 - `Invert Map`: inverts luminance-map influence
 

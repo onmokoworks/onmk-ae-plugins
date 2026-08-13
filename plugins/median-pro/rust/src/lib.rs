@@ -42,17 +42,17 @@ impl AdobePluginGlobal for Plugin {
             Params::Radius,
             "Radius",
             ae::SliderDef::setup(|f| {
-                f.set_valid_min(1);
-                f.set_valid_max(20);
-                f.set_slider_min(1);
-                f.set_slider_max(20);
+                f.set_valid_min(0);
+                f.set_valid_max(100);
+                f.set_slider_min(0);
+                f.set_slider_max(50);
                 f.set_default(3);
             }),
         )?;
 
         params.add(
             Params::EdgePreserve,
-            "Edge Preserve",
+            "Weight Falloff",
             ae::FloatSliderDef::setup(|f| {
                 f.set_valid_min(0.0);
                 f.set_valid_max(100.0);
@@ -140,6 +140,11 @@ impl AdobePluginGlobal for Plugin {
                 smart_render_cpu(&extra, params)?;
             }
 
+            ae::Command::UpdateParamsUi | ae::Command::UserChangedParam { .. } => {
+                update_filter_ui(params)?;
+                out_data.set_out_flag(ae::OutFlags::RefreshUi, true);
+            }
+
             _ => {}
         }
         Ok(())
@@ -164,7 +169,7 @@ fn get_params(params: &ae::Parameters<Params>) -> Result<FilterParams, ae::Error
             .get(Params::Radius)?
             .as_slider()?
             .value()
-            .clamp(1, 20) as usize,
+            .clamp(0, 100) as usize,
         edge_preserve: params
             .get(Params::EdgePreserve)?
             .as_float_slider()?
@@ -241,6 +246,10 @@ fn process_filters(
     h: usize,
     luma_map: Option<&[f64]>,
 ) -> Vec<u8> {
+    if fp.radius == 0 || fp.mix <= f64::EPSILON {
+        return original.to_vec();
+    }
+
     // AE effect worlds are premultiplied ARGB. Median filtering must operate
     // on straight RGB, otherwise transparent black becomes a valid color
     // sample and creates dark fringes around alpha edges.
@@ -265,6 +274,15 @@ fn process_filters(
     let mut straight_result = vec![0u8; w * h * 4];
     filters::mix_buffers(&straight_original, &buf_a, &mut straight_result, fp.mix);
     premultiply_buffer(&straight_result)
+}
+
+fn update_filter_ui(params: &ae::Parameters<Params>) -> Result<(), ae::Error> {
+    let weighted_median = params.get(Params::FilterType)?.as_popup()?.value() == 2;
+    let mut params_copy = params.cloned();
+    let mut falloff = params_copy.get_mut(Params::EdgePreserve)?;
+    falloff.set_ui_flag(ae::ParamUIFlags::DISABLED, !weighted_median);
+    falloff.update_param_ui()?;
+    Ok(())
 }
 
 #[inline]
@@ -501,5 +519,19 @@ mod tests {
         let out = process_filters(&median_params(), &src, 3, 3, None);
 
         assert!(out.chunks_exact(4).all(|pixel| pixel == [128, 128, 0, 0]));
+    }
+
+    #[test]
+    fn zero_radius_is_byte_exact() {
+        let src = [
+            255, 10, 20, 30, 128, 64, 32, 16, 0, 0, 0, 0, 255, 200, 100, 50,
+        ];
+        let mut params = median_params();
+        params.radius = 0;
+        params.iterations = 10;
+
+        let out = process_filters(&params, &src, 2, 2, None);
+
+        assert_eq!(out, src);
     }
 }

@@ -1,0 +1,16 @@
+[package]
+name = "prism-warp"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+# rlib alongside cdylib so `cargo test` can link the unit tests. The .aex bundle
+# still comes from the cdylib.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+after-effects = { git = "https://github.com/virtualritz/after-effects.git" }
+
+[build-dependencies]
+pipl = { git = "https://github.com/virtualritz/after-effects.git" }
+

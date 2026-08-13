@@ -1,0 +1,6 @@
+PluginName := "PrismWarp"
+BinaryName := "prism_warp"
+BundleIdentifier := "work.onmk.prism-warp"
+
+import "AdobePlugin.just"
+

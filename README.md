@@ -36,6 +36,7 @@ onmkが開発・メンテナンスするAfter Effectsプラグインのモノレ
 | [ScatterMap](./plugins/scatter-map/) | レイヤーマップで制御できるピクセル散乱 | 実験的 |
 | [MaskTransform](./plugins/mask-transform/) | マスクパスの反転と回転 | 実験的 |
 | [MaskOffset](./plugins/mask-offset/) | マスクパスのオフセット、塗り、フェザー | 実験的 |
+| [PrismWarp](./plugins/prism-warp/) | レンズ勾配による屈折とプリズム状の色分散 | 実験的 |
 
 ---
 
@@ -77,3 +78,4 @@ Existing plugins are being migrated incrementally while preserving their Git his
 | [ScatterMap](./plugins/scatter-map/) | Map-controlled pixel scattering | Experimental |
 | [MaskTransform](./plugins/mask-transform/) | Flips and rotates mask paths | Experimental |
 | [MaskOffset](./plugins/mask-offset/) | Offsets mask paths with fill and feather controls | Experimental |
+| [PrismWarp](./plugins/prism-warp/) | Lens-driven refraction and prismatic chromatic dispersion | Experimental |

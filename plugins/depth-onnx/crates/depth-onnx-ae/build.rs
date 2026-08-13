@@ -52,7 +52,8 @@ fn main() {
         Property::AE_Effect_Global_OutFlags_2(
             OutFlags2::SupportsSmartRender |
             OutFlags2::FloatColorAware |
-            OutFlags2::SupportsThreadedRendering
+            OutFlags2::SupportsThreadedRendering |
+            OutFlags2::SupportsGetFlattenedSequenceData
         ),
         Property::AE_Effect_Match_Name("ANTH DepthONNX"),
         Property::AE_Reserved_Info(0),

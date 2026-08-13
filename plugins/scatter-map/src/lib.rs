@@ -96,8 +96,8 @@ impl AdobePluginGlobal for Plugin {
             ae::Command::SmartRender { extra } => {
                 smart_render_cpu(&extra, params)?;
             }
-            ae::Command::SmartRenderGpu { extra } => {
-                smart_render_cpu(&extra, params)?;
+            ae::Command::SmartRenderGpu { .. } => {
+                return Err(ae::Error::BadCallbackParameter);
             }
             _ => {}
         }
@@ -297,4 +297,3 @@ fn smart_render_cpu(
     let _ = cb.checkin_layer_pixels(MAP_CHECKOUT_ID as u32);
     Ok(())
 }
-

@@ -1,6 +1,8 @@
 use pipl::*;
 
 fn main() {
+    println!("cargo:rustc-cfg=catch_panics");
+    println!("cargo:rustc-check-cfg=cfg(catch_panics)");
     // `define_effect!` embeds this at compile time. Keep it local so the
     // plugin can still be built without a release website configured.
     println!("cargo:rustc-env=PIPL_SUPPORT_URL=https://github.com/onmokoworks/onmk-ae-plugins/tree/main/plugins/cel-glow");

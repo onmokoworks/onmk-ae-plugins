@@ -1,0 +1,12 @@
+{
+  "name": "Faded Pastel",
+  "look": "Faded Pastel",
+  "stock": "Mist 400",
+  "print_contrast": 0.82,
+  "shoulder": 0.4,
+  "saturation": 0.72,
+  "crossover_enable": true,
+  "crossover": -0.25,
+  "crossover_axis": 20.0,
+  "grain_amount": 0.4
+}

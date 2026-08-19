@@ -1,0 +1,13 @@
+{
+  "name": "Neon Night",
+  "look": "Neon Night",
+  "stock": "Neon 800",
+  "exposure": 0.15,
+  "print_contrast": 1.22,
+  "shoulder": 0.35,
+  "saturation": 1.25,
+  "bloom_enable": true,
+  "bloom_strength": 0.45,
+  "halation_strength": 0.85,
+  "grain_amount": 0.7
+}

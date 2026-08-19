@@ -1,0 +1,14 @@
+[package]
+name = "onmk-film-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "wgpu compute backend for onmk Film"
+
+[dependencies]
+wgpu.workspace = true
+pollster.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+onmk-film-core = { path = "../onmk-film-core" }

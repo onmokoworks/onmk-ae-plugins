@@ -1,0 +1,13 @@
+{
+  "name": "Classic",
+  "look": "Classic",
+  "stock": "Harbor 250",
+  "print_contrast": 1.12,
+  "shoulder": 0.18,
+  "saturation": 0.92,
+  "character": 1.15,
+  "signature": 0.25,
+  "halation_enable": true,
+  "halation_strength": 0.55,
+  "grain_amount": 0.55
+}

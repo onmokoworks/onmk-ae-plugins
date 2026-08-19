@@ -17,6 +17,7 @@ onmkが開発・メンテナンスするAdobe After Effectsプラグインのモ
 
 | プラグイン | 概要 | 状態 |
 |---|---|---|
+| [onmk Film](./plugins/onmk-film/) | フィルムレスポンス、滲み、密度グレイン、光学（Metal） | 開発中・v0.5 |
 | [Rio de Janeiro Filter](./plugins/rio-de-janeiro-filter/) | Rio de Janeiroフィルター風の色調を再現 | 開発中 |
 
 ### ブラー・画像フィルター
@@ -87,6 +88,7 @@ Experimental and unpublished projects are developed outside this repository and 
 
 | Plugin | Description | Status |
 |---|---|---|
+| [onmk Film](./plugins/onmk-film/) | Film response, emulsion scatter, density grain, optics (Metal) | In development / v0.5 |
 | [Rio de Janeiro Filter](./plugins/rio-de-janeiro-filter/) | Recreates a look inspired by the Rio de Janeiro filter | In development |
 
 ### Blur and Image Filters

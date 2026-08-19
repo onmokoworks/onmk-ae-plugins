@@ -1,0 +1,12 @@
+[package]
+name = "onmk-film-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host-independent film response engine for onmk Film"
+
+[lib]
+path = "../../src/lib.rs"
+
+[dependencies]
+serde.workspace = true

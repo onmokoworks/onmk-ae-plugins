@@ -1,0 +1,8 @@
+set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+
+PluginName := "ShapePlus"
+BinaryName := "shape_plus"
+ResourceName := "shape-plus"
+BundleIdentifier := "work.onmk.shape-plus"
+
+import "AdobePlugin.just"

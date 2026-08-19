@@ -1,0 +1,13 @@
+{
+  "name": "Teal & Amber",
+  "look": "Teal & Amber",
+  "stock": "Harbor 250",
+  "print_contrast": 1.18,
+  "shoulder": 0.22,
+  "saturation": 1.05,
+  "character": 1.35,
+  "signature": 0.55,
+  "skin_hue": 6.0,
+  "halation_strength": 0.4,
+  "grain_amount": 0.45
+}

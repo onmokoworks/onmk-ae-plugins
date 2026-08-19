@@ -1,0 +1,5 @@
+PluginName := "onmkFilm"
+BinaryName := "onmk_film_ae"
+BundleIdentifier := "work.onmk.film"
+
+import "AdobePlugin.just"

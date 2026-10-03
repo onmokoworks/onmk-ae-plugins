@@ -175,6 +175,81 @@ mod cache_tests {
     use super::*;
 
     #[test]
+    #[ignore = "HDR ghost raster/blur CPU comparison at center, edge and outside"]
+    fn ghost_gpu_qualification() {
+        let gpu = GpuProcessor::new();
+        let raster = crate::ghost_gpu::GhostGpu::new(&gpu.device).expect("ghost pipeline");
+        let blur = crate::bloom_gpu::BloomGpu::new(&gpu.device).unwrap();
+        let (w, h) = (321, 181);
+        let mut exercised = 0;
+        for lens in 0..4 {
+            for angle in [0.0, 0.32, 0.7] {
+                for radius in [0.0, 0.005, 0.04] {
+                    let cfg = physical::Config {
+                        ray_grid: 12,
+                        ghost_blur: radius,
+                        ..Default::default()
+                    };
+                    let sources = [physical::BrightSource {
+                        angle_x: angle,
+                        angle_y: 0.05,
+                        rgb: [1.0, 0.7, 0.3],
+                    }];
+                    let lens = physical::bundled_lens(lens);
+                    let Some(mesh) = physical::ghost_mesh(&lens, &sources, w, h, cfg) else {
+                        continue;
+                    };
+                    let reference = physical::render(&lens, &sources, w, h, cfg);
+                    let mut encoder = gpu
+                        .device
+                        .create_command_encoder(&CommandEncoderDescriptor::default());
+                    let output = raster.encode(&gpu.device, &mut encoder, &mesh, w, h, cfg, &blur);
+                    let readback = gpu.device.create_buffer(&BufferDescriptor {
+                        label: None,
+                        size: (w * h * 16) as u64,
+                        usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, (w * h * 16) as u64);
+                    gpu.queue.submit(Some(encoder.finish()));
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let slice = readback.slice(..);
+                    slice.map_async(MapMode::Read, move |r| {
+                        tx.send(r).unwrap();
+                    });
+                    gpu.device.poll(PollType::Wait).unwrap();
+                    rx.recv().unwrap().unwrap();
+                    let mapped = slice.get_mapped_range();
+                    let mut max_error = 0.0_f32;
+                    for (i, expected) in reference.iter().enumerate() {
+                        for c in 0..3 {
+                            let actual = f32::from_le_bytes(
+                                mapped[i * 16 + c * 4..i * 16 + c * 4 + 4]
+                                    .try_into()
+                                    .unwrap(),
+                            );
+                            let error = (actual - expected[c]).abs();
+                            max_error = max_error.max(error);
+                            assert!(actual.is_finite() && error<=1e-6+expected[c].abs()*1e-4,"{} angle={angle} blur={radius} pixel={i} ch={c} CPU={} GPU={actual} error={error}",lens.name,expected[c]);
+                        }
+                    }
+                    drop(mapped);
+                    readback.unmap();
+                    exercised += 1;
+                    eprintln!(
+                        "ghost HDR {} angle={angle} blur={radius} max={max_error}",
+                        lens.name
+                    );
+                }
+            }
+        }
+        assert!(
+            exercised >= 24,
+            "must exercise actual GPU output, not only fallbacks"
+        );
+    }
+
+    #[test]
     #[ignore = "GPU resident pipeline: full-frame A/B, cache, fallback and timing"]
     fn resident_gpu_qualification() {
         use std::sync::atomic::Ordering::Relaxed;
@@ -184,6 +259,12 @@ mod cache_tests {
         gpu.resident_gpu = None;
         let mut stage =
             Some(crate::resident_gpu::ResidentGpu::new(&gpu.device).expect("resident pipeline"));
+        if std::env::var("ONMK_GPU_GHOSTS").as_deref() == Ok("1") {
+            assert!(
+                stage.as_ref().unwrap().ghosts.is_some(),
+                "requested ghost pipeline must initialize"
+            );
+        }
         let mut ep = EffectParams {
             light_x: 715.5,
             light_y: 465.0,
@@ -239,6 +320,12 @@ mod cache_tests {
                 cpu_times.push(start.elapsed());
                 gpu.resident_gpu = stage.take();
                 let count = gpu.resident_gpu.as_ref().unwrap().frames.load(Relaxed);
+                let ghost_count = gpu
+                    .resident_gpu
+                    .as_ref()
+                    .unwrap()
+                    .ghost_frames
+                    .load(Relaxed);
                 let reads = gpu
                     .resident_gpu
                     .as_ref()
@@ -253,6 +340,17 @@ mod cache_tests {
                     gpu.resident_gpu.as_ref().unwrap().frames.load(Relaxed),
                     "must not silently fall back"
                 );
+                if lens < 2 && gpu.resident_gpu.as_ref().unwrap().ghosts.is_some() {
+                    assert_eq!(
+                        ghost_count + 1,
+                        gpu.resident_gpu
+                            .as_ref()
+                            .unwrap()
+                            .ghost_frames
+                            .load(Relaxed),
+                        "ghost stage must execute on GPU"
+                    );
+                }
                 assert_eq!(
                     reads + 4,
                     gpu.resident_gpu

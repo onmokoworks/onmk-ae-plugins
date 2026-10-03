@@ -1,14 +1,17 @@
-//! GPU-resident optical layers. CPU ghost/ocular uploads remain, but no HDR
-//! intermediate image is read back or uploaded again after GPU generation.
+//! GPU-resident optical layers. Optional ghost raster/blur stays resident too;
+//! f64 ray tracing and ocular generation remain on CPU.
 use crate::{bloom_gpu::BloomGpu, physical, source_gpu::SourceGpu, EffectParams};
 use wgpu::{util::DeviceExt, *};
 
 pub struct ResidentGpu {
+    pub ghosts: Option<crate::ghost_gpu::GhostGpu>,
     source: SourceGpu,
     bloom: BloomGpu,
     combine: ComputePipeline,
     #[cfg(test)]
     pub frames: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub ghost_frames: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub status_readback_bytes: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -18,6 +21,11 @@ impl ResidentGpu {
     pub fn new(device: &Device) -> Option<Self> {
         let source = SourceGpu::new(device)?;
         let bloom = BloomGpu::new(device)?;
+        let ghosts = if std::env::var("ONMK_GPU_GHOSTS").as_deref() == Ok("1") {
+            crate::ghost_gpu::GhostGpu::new(device)
+        } else {
+            None
+        };
         device.push_error_scope(ErrorFilter::Validation);
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("resident optical combination"),
@@ -35,11 +43,14 @@ impl ResidentGpu {
             return None;
         }
         Some(Self {
+            ghosts,
             source,
             bloom,
             combine,
             #[cfg(test)]
             frames: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            ghost_frames: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             status_readback_bytes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -63,10 +74,15 @@ impl ResidentGpu {
         let n = w.checked_mul(h)?;
         let bytes = n.checked_mul(16)? as u64;
         let limits = device.limits();
-        // At most seven temporary full-frame GPU buffers, beyond the existing
-        // destination/frame cache. Guard before any allocations or CPU work.
+        // Budget seven full-frame buffers, or ten with GPU ghost raster/blur,
+        // beyond destination/frame cache and bounded mesh buffers. Guard early.
         if n == 0
-            || bytes > 256 * 1024 * 1024 / 7
+            || bytes
+                > if self.ghosts.is_some() {
+                    384 * 1024 * 1024 / 10
+                } else {
+                    256 * 1024 * 1024 / 7
+                }
             || bytes > limits.max_storage_buffer_binding_size as u64
             || bytes > limits.max_buffer_size
             || w.div_ceil(16) > limits.max_compute_workgroups_per_dimension as usize
@@ -75,6 +91,8 @@ impl ResidentGpu {
             || !cfg.bloom_strength.is_finite()
             || cfg.bloom_passes > 16
             || !ep.ghost_intensity.is_finite()
+            || (self.ghosts.is_some()
+                && (!cfg.ghost_blur.is_finite() || cfg.ghost_blur_passes > 16))
             || sources.iter().any(|s| {
                 s.rgb
                     .iter()
@@ -88,12 +106,22 @@ impl ResidentGpu {
         let timer = std::time::Instant::now();
         device.push_error_scope(ErrorFilter::OutOfMemory);
         device.push_error_scope(ErrorFilter::Validation);
+        enum GhostResult {
+            Cpu(Vec<[f32; 3]>),
+            Mesh(physical::GhostMesh),
+        }
         let (source, bloom, ghosts, ocular) = std::thread::scope(|scope| {
             let ghost_job = scope.spawn(|| {
                 if ep.physical_enabled {
-                    physical::render(&physical::bundled_lens(ep.lens_preset), sources, w, h, cfg)
+                    let lens = physical::bundled_lens(ep.lens_preset);
+                    if self.ghosts.is_some() {
+                        if let Some(mesh) = physical::ghost_mesh(&lens, sources, w, h, cfg) {
+                            return GhostResult::Mesh(mesh);
+                        }
+                    }
+                    GhostResult::Cpu(physical::render(&lens, sources, w, h, cfg))
                 } else {
-                    Vec::new()
+                    GhostResult::Cpu(Vec::new())
                 }
             });
             let ocular_job = scope.spawn(|| {
@@ -155,7 +183,24 @@ impl ResidentGpu {
         });
         #[cfg(test)]
         let jobs_time = timer.elapsed();
-        let ghosts = upload(device, &ghosts, BufferUsages::STORAGE);
+        let (ghosts, ghost_stride) = match ghosts {
+            GhostResult::Cpu(pixels) => (upload(device, &pixels, BufferUsages::STORAGE), 3),
+            GhostResult::Mesh(mesh) => {
+                let mut encoder =
+                    device.create_command_encoder(&CommandEncoderDescriptor::default());
+                let buffer = self.ghosts.as_ref().unwrap().encode(
+                    device,
+                    &mut encoder,
+                    &mesh,
+                    w,
+                    h,
+                    cfg,
+                    &self.bloom,
+                );
+                queue.submit(Some(encoder.finish()));
+                (buffer, 4)
+            }
+        };
         let ocular = upload(device, &ocular, BufferUsages::STORAGE);
         let config = [
             w as u32,
@@ -164,7 +209,7 @@ impl ResidentGpu {
             (if ep.style_preset < 6 { 1.0_f32 } else { 0.0 }).to_bits(),
             u32::from(ep.physical_enabled),
             u32::from(ep.ocular_enabled),
-            0,
+            ghost_stride,
             0,
         ];
         let uniform = device.create_buffer_init(&util::BufferInitDescriptor {
@@ -243,6 +288,11 @@ impl ResidentGpu {
         }
         if !ok {
             return None;
+        }
+        #[cfg(test)]
+        if ghost_stride == 4 {
+            self.ghost_frames
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         #[cfg(test)]
         eprintln!(

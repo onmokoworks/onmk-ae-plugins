@@ -966,7 +966,27 @@ fn render_with_workers(
     cfg: Config,
     workers: usize,
 ) -> Vec<[f32; 3]> {
-    let mut out = vec![[0.0; 3]; w * h];
+    render_internal(l, sources, w, h, cfg, workers, None)
+}
+
+fn render_internal(
+    l: &LensSystem,
+    sources: &[BrightSource],
+    w: usize,
+    h: usize,
+    cfg: Config,
+    workers: usize,
+    mut sink: Option<&mut dyn FnMut(&[Triangle])>,
+) -> Vec<[f32; 3]> {
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    #[cfg(test)]
+    let mut raster_time = std::time::Duration::ZERO;
+    let mut out = if sink.is_some() {
+        Vec::new()
+    } else {
+        vec![[0.0; 3]; w * h]
+    };
     if sources.is_empty() {
         return out;
     }
@@ -1128,7 +1148,17 @@ fn render_with_workers(
                 // Batch ordered triangles instead of starting workers per ghost.
                 // At most one pupil mesh is added beyond this bounded batch.
                 if triangles.len() >= 32768 || workers == 1 {
-                    draw_triangles(&mut out, &triangles, w, h, workers);
+                    #[cfg(test)]
+                    let raster_started = std::time::Instant::now();
+                    if let Some(emit) = sink.as_mut() {
+                        emit(&triangles);
+                    } else {
+                        draw_triangles(&mut out, &triangles, w, h, workers);
+                    }
+                    #[cfg(test)]
+                    {
+                        raster_time += raster_started.elapsed();
+                    }
                     triangles.clear();
                 }
             } else {
@@ -1144,12 +1174,150 @@ fn render_with_workers(
             }
         }
     }
-    draw_triangles(&mut out, &triangles, w, h, workers);
-    if cfg.ghost_blur > 0. {
+    #[cfg(test)]
+    let raster_started = std::time::Instant::now();
+    if let Some(emit) = sink.as_mut() {
+        emit(&triangles);
+    } else {
+        draw_triangles(&mut out, &triangles, w, h, workers);
+    }
+    #[cfg(test)]
+    {
+        raster_time += raster_started.elapsed();
+    }
+    #[cfg(test)]
+    let before_blur = std::time::Instant::now();
+    if sink.is_none() && cfg.ghost_blur > 0. {
         let r = (cfg.ghost_blur * ((w * w + h * h) as f32).sqrt()) as usize;
         blur(&mut out, w, h, r, cfg.ghost_blur_passes)
     }
+    #[cfg(test)]
+    if w * h >= 1_000_000 {
+        eprintln!(
+            "ghost breakdown: trace/prep={:?} raster/bin={raster_time:?} blur={:?}",
+            before_blur
+                .duration_since(started)
+                .saturating_sub(raster_time),
+            before_blur.elapsed()
+        );
+    }
     out
+}
+
+pub struct GhostMesh {
+    pub triangles: Vec<[[f32; 4]; 4]>,
+    pub ranges: Vec<[u32; 2]>,
+    pub indices: Vec<u32>,
+}
+
+/// Same f64 traces, caustic rejection and prepared coefficients as CPU render.
+/// Per-tile references retain original triangle order; no unordered atomics.
+pub fn ghost_mesh(
+    l: &LensSystem,
+    sources: &[BrightSource],
+    w: usize,
+    h: usize,
+    cfg: Config,
+) -> Option<GhostMesh> {
+    if w == 0 || h == 0 || !cfg.surface_raster {
+        return None;
+    }
+    let tiles_x = w.div_ceil(16);
+    let tiles_y = h.div_ceil(16);
+    let mut bins = vec![Vec::<u32>::new(); tiles_x * tiles_y];
+    let mut data = Vec::new();
+    let mut refs = 0usize;
+    let mut failed = false;
+    let mut emit = |triangles: &[Triangle]| {
+        if failed {
+            return;
+        }
+        for &t in triangles {
+            let Some(t) = PreparedTriangle::new(t, w, h) else {
+                continue;
+            };
+            let (packed, x0, x1, y0, y1) = match t {
+                PreparedTriangle::Tent { ch, x, y, total } => (
+                    [
+                        [x, y, total / (1.5 * 1.5), ch as f32],
+                        [0.0; 4],
+                        [0.0; 4],
+                        [0.0; 4],
+                    ],
+                    (x - 1.5).floor().max(0.0) as usize,
+                    (x + 1.5).ceil().min((w - 1) as f32) as usize,
+                    (y - 1.5).floor().max(0.0) as usize,
+                    (y + 1.5).ceil().min((h - 1) as f32) as usize,
+                ),
+                PreparedTriangle::Area {
+                    ch,
+                    a,
+                    b,
+                    c,
+                    minx,
+                    maxx,
+                    miny,
+                    maxy,
+                    inv_area,
+                    density,
+                    mean,
+                } => (
+                    [
+                        [a.x, a.y, a.energy, ch as f32],
+                        [b.x, b.y, b.energy, 1.0],
+                        [c.x, c.y, c.energy, 0.0],
+                        [inv_area, density, mean, 0.0],
+                    ],
+                    minx,
+                    maxx,
+                    miny,
+                    maxy,
+                ),
+            };
+            if x0 > x1 || y0 > y1 {
+                continue;
+            }
+            if packed.iter().flatten().any(|v| !v.is_finite()) {
+                failed = true;
+                return;
+            }
+            let count = (x1 / 16 - x0 / 16 + 1) * (y1 / 16 - y0 / 16 + 1);
+            // At most 16 MiB coefficients + 16 MiB tile references.
+            if data.len() >= 262144 || refs + count > 4 * 1024 * 1024 {
+                failed = true;
+                return;
+            }
+            let index = data.len() as u32;
+            data.push(packed);
+            refs += count;
+            for ty in y0 / 16..=y1 / 16 {
+                for tx in x0 / 16..=x1 / 16 {
+                    let bin = &mut bins[ty * tiles_x + tx];
+                    // Bound per-invocation work on concentrated caustics.
+                    if bin.len() >= 16384 {
+                        failed = true;
+                        return;
+                    }
+                    bin.push(index);
+                }
+            }
+        }
+    };
+    render_internal(l, sources, w, h, cfg, 4, Some(&mut emit));
+    if failed {
+        return None;
+    }
+    let mut indices = Vec::with_capacity(refs);
+    let mut ranges = Vec::with_capacity(bins.len());
+    for bin in bins {
+        ranges.push([indices.len() as u32, bin.len() as u32]);
+        indices.extend(bin);
+    }
+    Some(GhostMesh {
+        triangles: data,
+        ranges,
+        indices,
+    })
 }
 
 fn blur(img: &mut Vec<[f32; 3]>, w: usize, h: usize, r: usize, passes: usize) {

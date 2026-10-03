@@ -70,49 +70,17 @@ impl BloomGpu {
             completed: std::sync::atomic::AtomicUsize::new(0),
         })
     }
-    pub fn render(
+    // Caller validates limits and owns submission/error handling.
+    pub(crate) fn encode(
         &self,
         device: &Device,
-        queue: &Queue,
-        input: &[[f32; 3]],
+        encoder: &mut CommandEncoder,
+        input_buf: &Buffer,
         w: usize,
         h: usize,
         cfg: Config,
-    ) -> Option<Vec<[f32; 3]>> {
-        let n = w.checked_mul(h)?;
-        let bytes = n.checked_mul(16)? as u64;
-        // Five frame buffers <= 192 MiB. Fallback before allocating on large
-        // frames, exceptional values, or unsupported resource limits.
-        let limits = device.limits();
-        if n == 0
-            || input.len() != n
-            || bytes > 192 * 1024 * 1024 / 5
-            || bytes > limits.max_storage_buffer_binding_size as u64
-            || bytes > limits.max_buffer_size
-            || w.div_ceil(16) > limits.max_compute_workgroups_per_dimension as usize
-            || h.div_ceil(16) > limits.max_compute_workgroups_per_dimension as usize
-            || !cfg.bloom_radius.is_finite()
-            || !cfg.bloom_strength.is_finite()
-            || cfg.bloom_passes > 16
-            || input
-                .iter()
-                .flatten()
-                .any(|v| !v.is_finite() || v.is_sign_negative() || *v > f32::MAX / (2.0 * n as f32))
-        {
-            return None;
-        }
-        if cfg.bloom_strength <= 0.0 {
-            return Some(vec![[0.0; 3]; n]);
-        }
-        let data: Vec<[f32; 4]> = input.iter().map(|v| [v[0], v[1], v[2], 0.0]).collect();
-        let _guard = self.guard.lock();
-        device.push_error_scope(ErrorFilter::OutOfMemory);
-        device.push_error_scope(ErrorFilter::Validation);
-        let input_buf = device.create_buffer_init(&util::BufferInitDescriptor {
-            label: None,
-            contents: as_bytes(&data),
-            usage: BufferUsages::COPY_SRC,
-        });
+    ) -> Buffer {
+        let bytes = (w * h * 16) as u64;
         let mk = |usage| {
             device.create_buffer(&BufferDescriptor {
                 label: None,
@@ -124,8 +92,6 @@ impl BloomGpu {
         let working = mk(BufferUsages::STORAGE | BufferUsages::COPY_DST);
         let prefix = mk(BufferUsages::STORAGE);
         let total = mk(BufferUsages::STORAGE | BufferUsages::COPY_SRC);
-        let staging = mk(BufferUsages::COPY_DST | BufferUsages::MAP_READ);
-        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
         let diag = ((w * w + h * h) as f32).sqrt();
         let chroma = [
             [1.0, 1.0, 1.0, 0.0],
@@ -178,7 +144,7 @@ impl BloomGpu {
                 layout: &self.layout,
                 entries: &entries,
             });
-            encoder.copy_buffer_to_buffer(&input_buf, 0, &working, 0, bytes);
+            encoder.copy_buffer_to_buffer(input_buf, 0, &working, 0, bytes);
             for _ in 0..cfg.bloom_passes.max(1) {
                 for stage in 0..4 {
                     let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
@@ -200,6 +166,63 @@ impl BloomGpu {
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(w.div_ceil(16) as u32, h.div_ceil(16) as u32, 1);
         }
+        total
+    }
+
+    pub fn render(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        input: &[[f32; 3]],
+        w: usize,
+        h: usize,
+        cfg: Config,
+    ) -> Option<Vec<[f32; 3]>> {
+        let n = w.checked_mul(h)?;
+        let bytes = n.checked_mul(16)? as u64;
+        // Five frame buffers <= 192 MiB. Fallback before allocating on large
+        // frames, exceptional values, or unsupported resource limits.
+        let limits = device.limits();
+        if n == 0
+            || input.len() != n
+            || bytes > 192 * 1024 * 1024 / 5
+            || bytes > limits.max_storage_buffer_binding_size as u64
+            || bytes > limits.max_buffer_size
+            || w.div_ceil(16) > limits.max_compute_workgroups_per_dimension as usize
+            || h.div_ceil(16) > limits.max_compute_workgroups_per_dimension as usize
+            || !cfg.bloom_radius.is_finite()
+            || !cfg.bloom_strength.is_finite()
+            || cfg.bloom_passes > 16
+            || input
+                .iter()
+                .flatten()
+                .any(|v| !v.is_finite() || v.is_sign_negative() || *v > f32::MAX / (2.0 * n as f32))
+        {
+            return None;
+        }
+        if cfg.bloom_strength <= 0.0 {
+            return Some(vec![[0.0; 3]; n]);
+        }
+        let data: Vec<[f32; 4]> = input.iter().map(|v| [v[0], v[1], v[2], 0.0]).collect();
+        let _guard = self.guard.lock();
+        device.push_error_scope(ErrorFilter::OutOfMemory);
+        device.push_error_scope(ErrorFilter::Validation);
+        let input_buf = device.create_buffer_init(&util::BufferInitDescriptor {
+            label: None,
+            contents: as_bytes(&data),
+            usage: BufferUsages::COPY_SRC,
+        });
+        let mk = |usage| {
+            device.create_buffer(&BufferDescriptor {
+                label: None,
+                size: bytes,
+                usage,
+                mapped_at_creation: false,
+            })
+        };
+        let staging = mk(BufferUsages::COPY_DST | BufferUsages::MAP_READ);
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        let total = self.encode(device, &mut encoder, &input_buf, w, h, cfg);
         encoder.copy_buffer_to_buffer(&total, 0, &staging, 0, bytes);
         queue.submit(Some(encoder.finish()));
         let slice = staging.slice(..);

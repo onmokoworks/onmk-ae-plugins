@@ -84,6 +84,7 @@ struct BufferState {
     bind_group: BindGroup,
     last_access: AtomicUsize,
     uploaded_optics: parking_lot::Mutex<std::sync::Weak<Vec<[f32; 4]>>>,
+    resident_cache: parking_lot::Mutex<Option<(EffectParams, Vec<physical::BrightSource>)>>,
 }
 
 pub struct GpuProcessor {
@@ -96,6 +97,7 @@ pub struct GpuProcessor {
     source_gpu: Option<crate::source_gpu::SourceGpu>,
     bloom_gpu: Option<crate::bloom_gpu::BloomGpu>,
     optical_gpu_guard: parking_lot::Mutex<()>,
+    resident_gpu: Option<crate::resident_gpu::ResidentGpu>,
     #[cfg(test)]
     optical_uploads: AtomicUsize,
 }
@@ -171,6 +173,321 @@ fn combine_optical_layers(
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "GPU resident pipeline: full-frame A/B, cache, fallback and timing"]
+    fn resident_gpu_qualification() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut gpu = GpuProcessor::new();
+        gpu.source_gpu = None;
+        gpu.bloom_gpu = None;
+        gpu.resident_gpu = None;
+        let mut stage =
+            Some(crate::resident_gpu::ResidentGpu::new(&gpu.device).expect("resident pipeline"));
+        let mut ep = EffectParams {
+            light_x: 715.5,
+            light_y: 465.0,
+            global_scale: 1.0,
+            global_brightness: 1.0,
+            flare_opacity: 1.0,
+            source_opacity: 1.0,
+            source_mode: 1,
+            transfer_mode: 4,
+            physical_enabled: true,
+            ray_grid: 26,
+            physical_gain: 3000.0,
+            max_area_boost: 8.0,
+            ghost_intensity: 2.9,
+            ghost_normalize: true,
+            physical_ghost_blur: 0.005,
+            physical_blur_passes: 3,
+            bloom_strength: 0.6,
+            bloom_radius: 0.018,
+            bloom_passes: 3,
+            bloom_octaves: 4,
+            bloom_chromatic: true,
+            starburst_blades: 6,
+            unified_diffraction: 0.18,
+            hotspot_intensity: 1.6,
+            ..Default::default()
+        };
+        let compare = |a: &[u8], b: &[u8]| {
+            assert_eq!(a.len(), b.len());
+            let max = a.iter().zip(b).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+            let changed = a.iter().zip(b).filter(|(a, b)| a != b).count();
+            assert!(
+                max <= 1 && changed <= a.len() / 1000 + 1,
+                "max={max}, changed={changed}"
+            );
+            (max, changed)
+        };
+        for lens in 0..4 {
+            let (w, h) = if lens < 2 { (1920, 1080) } else { (321, 181) };
+            ep.lens_preset = lens;
+            ep.ray_grid = if lens < 2 { 26 } else { 12 };
+            ep.light_y = h as f64 * 0.43;
+            let mut src = vec![0u8; w * h * 4];
+            for p in src.chunks_exact_mut(4) {
+                p[0] = 255;
+            }
+            let mut cpu_times = Vec::new();
+            let mut gpu_times = Vec::new();
+            for frame in 0..5 {
+                ep.light_x = w as f64 * (0.37 + frame as f64 * 0.02);
+                let start = std::time::Instant::now();
+                let cpu = gpu.process(&ep, &src, w, h);
+                cpu_times.push(start.elapsed());
+                gpu.resident_gpu = stage.take();
+                let count = gpu.resident_gpu.as_ref().unwrap().frames.load(Relaxed);
+                let reads = gpu
+                    .resident_gpu
+                    .as_ref()
+                    .unwrap()
+                    .status_readback_bytes
+                    .load(Relaxed);
+                let start = std::time::Instant::now();
+                let actual = gpu.process(&ep, &src, w, h);
+                gpu_times.push(start.elapsed());
+                assert_eq!(
+                    count + 1,
+                    gpu.resident_gpu.as_ref().unwrap().frames.load(Relaxed),
+                    "must not silently fall back"
+                );
+                assert_eq!(
+                    reads + 4,
+                    gpu.resident_gpu
+                        .as_ref()
+                        .unwrap()
+                        .status_readback_bytes
+                        .load(Relaxed)
+                );
+                let (max, changed) = compare(&cpu, &actual);
+                let start = std::time::Instant::now();
+                assert_eq!(actual, gpu.process(&ep, &src, w, h));
+                let warm = start.elapsed();
+                assert_eq!(
+                    count + 1,
+                    gpu.resident_gpu.as_ref().unwrap().frames.load(Relaxed)
+                );
+                // Composite-only changes reuse the resident optical buffer.
+                ep.global_brightness = 0.8;
+                gpu.process(&ep, &src, w, h);
+                ep.global_brightness = 1.0;
+                assert_eq!(
+                    count + 1,
+                    gpu.resident_gpu.as_ref().unwrap().frames.load(Relaxed)
+                );
+                if lens == 1 && frame == 0 {
+                    std::fs::create_dir_all("target").unwrap();
+                    for (pixels, name) in [(&cpu, "cpu"), (&actual, "resident")] {
+                        let rgba: Vec<_> = pixels
+                            .chunks_exact(4)
+                            .flat_map(|p| [p[1], p[2], p[3], p[0]])
+                            .collect();
+                        image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+                            .unwrap()
+                            .save(format!("target/resident-{name}.png"))
+                            .unwrap();
+                    }
+                }
+                if frame == 4 {
+                    // Test failure AFTER a GPU write, with a matching old CPU
+                    // cache entry: destination must be restored, not reused.
+                    gpu.resident_gpu
+                        .as_ref()
+                        .unwrap()
+                        .force_failure
+                        .store(true, Relaxed);
+                    for s in gpu.state.write().values_mut() {
+                        s.resident_cache.get_mut().take();
+                    }
+                    assert_eq!(cpu, gpu.process(&ep, &src, w, h));
+                    gpu.resident_gpu
+                        .as_ref()
+                        .unwrap()
+                        .force_failure
+                        .store(false, Relaxed);
+                    gpu.state.write().clear();
+                    compare(&cpu, &gpu.process(&ep, &src, w, h));
+                }
+                stage = gpu.resident_gpu.take();
+                eprintln!(
+                    "resident lens={lens} frame={frame} max={max} changed={changed} warm={warm:?}"
+                );
+            }
+            cpu_times.sort();
+            gpu_times.sort();
+            eprintln!(
+                "resident {w}x{h} lens={lens}: CPU median={:?}, resident median={:?}",
+                cpu_times[2], gpu_times[2]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "resident boundary, colored input, ocular, legacy, and fallback cases"]
+    fn resident_edge_cases() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut gpu = GpuProcessor::new();
+        gpu.source_gpu = None;
+        gpu.bloom_gpu = None;
+        gpu.resident_gpu = None;
+        let mut stage = Some(crate::resident_gpu::ResidentGpu::new(&gpu.device).unwrap());
+        for case in 0..24 {
+            let (w, h) = match case % 4 {
+                0 => (1, 1),
+                1 => (1, 31),
+                2 => (31, 1),
+                _ => (97, 61),
+            };
+            let ep = EffectParams {
+                light_x: w as f64 * 0.6,
+                light_y: h as f64 * 0.3,
+                global_scale: 1.0,
+                global_brightness: 1.0,
+                flare_opacity: 1.0,
+                source_opacity: 0.7,
+                source_mode: case % 3 + 1,
+                source_threshold: 0.5,
+                source_downsample: 1,
+                transfer_mode: case % 6,
+                physical_enabled: case % 4 != 0,
+                lens_preset: (case % 4) as usize,
+                ray_grid: 8,
+                physical_gain: 3000.0,
+                ghost_intensity: 2.9,
+                max_area_boost: 8.0,
+                ghost_normalize: true,
+                physical_ghost_blur: 0.005,
+                physical_blur_passes: 3,
+                bloom_strength: if case % 5 == 0 { 0.0 } else { 0.6 },
+                bloom_radius: 0.018,
+                bloom_passes: (case % 4) as usize,
+                bloom_octaves: (case % 6 + 1) as usize,
+                bloom_chromatic: case % 2 == 0,
+                starburst_blades: 6,
+                unified_diffraction: 0.18,
+                hotspot_intensity: 1.6,
+                style_preset: if case % 2 == 0 { 0 } else { 6 },
+                ocular_enabled: case % 3 == 0,
+                ocular_pupil_mm: 6.0,
+                ocular_age: 30.0,
+                ocular_seed: 17,
+                ocular_corona: 0.75,
+                ocular_corona_radius: 0.22,
+                ocular_veil: 0.28,
+                ocular_veil_radius: 0.65,
+                ocular_halo: 0.18,
+                ocular_halo_radius: 0.14,
+                ..Default::default()
+            };
+            let src: Vec<_> = (0..w * h)
+                .flat_map(|i| {
+                    [
+                        if i % 2 == 0 { 255 } else { 128 },
+                        (i % 251) as u8,
+                        ((i * 3) % 251) as u8,
+                        ((i * 7) % 251) as u8,
+                    ]
+                })
+                .collect();
+            let cpu = gpu.process(&ep, &src, w, h);
+            gpu.resident_gpu = stage.take();
+            let count = gpu.resident_gpu.as_ref().unwrap().frames.load(Relaxed);
+            let actual = gpu.process(&ep, &src, w, h);
+            assert_eq!(
+                count + 1,
+                gpu.resident_gpu.as_ref().unwrap().frames.load(Relaxed)
+            );
+            let max = cpu
+                .iter()
+                .zip(&actual)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(max <= 1, "case={case} max={max}");
+            assert_eq!(actual, gpu.process(&ep, &src, w, h));
+            stage = gpu.resident_gpu.take();
+        }
+        // Unsupported workloads fail before allocation and before touching the
+        // destination. Large images retain the established CPU implementation.
+        let output = gpu.device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: 16,
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let ep = EffectParams::default();
+        let cfg = physical::Config::default();
+        let r = stage.as_ref().unwrap();
+        assert!(r
+            .render(&gpu.device, &gpu.queue, &output, &ep, &[], 8192, 8192, cfg)
+            .is_none());
+        assert!(r
+            .render(&gpu.device, &gpu.queue, &output, &ep, &[], 0, 0, cfg)
+            .is_none());
+        for strength in [f32::NAN, f32::INFINITY] {
+            let cfg = physical::Config {
+                bloom_strength: strength,
+                ..cfg
+            };
+            assert!(r
+                .render(&gpu.device, &gpu.queue, &output, &ep, &[], 1, 1, cfg)
+                .is_none());
+        }
+        // Keep resident mode enabled across optical edits; each one must
+        // invalidate the device-local cache, including highlight changes.
+        let mut reference = GpuProcessor::new();
+        reference.resident_gpu = None;
+        reference.source_gpu = None;
+        reference.bloom_gpu = None;
+        gpu.resident_gpu = stage.take();
+        let (w, h) = (97, 61);
+        let mut src = vec![0u8; w * h * 4];
+        for p in src.chunks_exact_mut(4) {
+            p[0] = 255;
+        }
+        let mut ep = EffectParams {
+            light_x: 33.0,
+            light_y: 21.0,
+            source_mode: 1,
+            source_threshold: 0.5,
+            source_downsample: 1,
+            global_scale: 1.0,
+            global_brightness: 1.0,
+            flare_opacity: 1.0,
+            physical_enabled: true,
+            ray_grid: 8,
+            physical_gain: 3000.0,
+            ghost_intensity: 2.9,
+            bloom_strength: 0.6,
+            bloom_radius: 0.018,
+            bloom_passes: 3,
+            bloom_octaves: 4,
+            starburst_blades: 6,
+            hotspot_intensity: 1.6,
+            ..Default::default()
+        };
+        for step in 0..7 {
+            match step {
+                1 => ep.light_x += 5.0,
+                2 => ep.bloom_strength = 0.9,
+                3 => ep.lens_preset = 1,
+                4 => ep.source_mode = 3,
+                5 => src[4 * 123 + 1..4 * 123 + 4].fill(255),
+                6 => ep.style_preset = 6,
+                _ => {}
+            }
+            let before = gpu.resident_gpu.as_ref().unwrap().frames.load(Relaxed);
+            let actual = gpu.process(&ep, &src, w, h);
+            assert_eq!(
+                before + 1,
+                gpu.resident_gpu.as_ref().unwrap().frames.load(Relaxed)
+            );
+            let cpu = reference.process(&ep, &src, w, h);
+            assert!(actual.iter().zip(&cpu).all(|(a, b)| a.abs_diff(*b) <= 1));
+        }
+    }
 
     #[test]
     #[ignore = "GPU source optics: HDR tolerance, final pixels and timing"]
@@ -968,6 +1285,11 @@ impl GpuProcessor {
         } else {
             None
         };
+        let resident_gpu = if std::env::var("ONMK_GPU_RESIDENT").as_deref() == Ok("1") {
+            crate::resident_gpu::ResidentGpu::new(&device)
+        } else {
+            None
+        };
         Self {
             device,
             queue,
@@ -978,6 +1300,7 @@ impl GpuProcessor {
             source_gpu,
             bloom_gpu,
             optical_gpu_guard: parking_lot::Mutex::new(()),
+            resident_gpu,
             #[cfg(test)]
             optical_uploads: AtomicUsize::new(0),
         }
@@ -1037,6 +1360,7 @@ impl GpuProcessor {
             bind_group,
             last_access: AtomicUsize::new(ts()),
             uploaded_optics: parking_lot::Mutex::new(std::sync::Weak::new()),
+            resident_cache: parking_lot::Mutex::new(None),
         }
     }
 
@@ -1117,125 +1441,167 @@ impl GpuProcessor {
             });
         }
         let key = optical_key(ep);
-        let cached = self
-            .optical_cache
-            .lock()
-            .as_ref()
-            .filter(|cache| {
-                cache.params == key && cache.sources == sources && cache.dimensions == (w, h)
-            })
-            .map(|cache| Arc::clone(&cache.pixels));
-        let physical_layer = if let Some(pixels) = cached {
-            pixels
+        let resident = if let Some(gpu) = &self.resident_gpu {
+            let mut cache = state.resident_cache.lock();
+            if cache
+                .as_ref()
+                .is_some_and(|(k, s)| *k == key && *s == sources)
+            {
+                true
+            } else {
+                *cache = None;
+                // A failed GPU pass may have written the destination. Force a
+                // CPU upload even if its cached Arc still matches a prior frame.
+                *state.uploaded_optics.lock() = std::sync::Weak::new();
+                let _guard = self.optical_gpu_guard.lock();
+                if gpu
+                    .render(
+                        &self.device,
+                        &self.queue,
+                        &state.physical_buf,
+                        ep,
+                        &sources,
+                        w,
+                        h,
+                        cfg,
+                    )
+                    .is_some()
+                {
+                    *cache = Some((key.clone(), sources.clone()));
+                    true
+                } else {
+                    false
+                }
+            }
         } else {
-            // These layers are independent and previously blocked one another on
-            // the render thread.  Compute them concurrently without reducing ray
-            // count, blur passes, or any optical detail.
-            let (ghosts, bloom, ocular, source_optics) = std::thread::scope(|scope| {
-                let physical_job = scope.spawn(|| {
-                    #[cfg(test)]
-                    let start = std::time::Instant::now();
-                    if ep.physical_enabled {
-                        let lens = physical::bundled_lens(ep.lens_preset);
-                        let result = physical::render(&lens, &sources, w, h, cfg);
+            state.resident_cache.lock().take();
+            false
+        };
+        if !resident {
+            // If a resident attempt failed, use the CPU reference rather than
+            // retrying the older GPU readback stages on the same device.
+            let allow_layer_gpu = self.resident_gpu.is_none();
+            let cached = self
+                .optical_cache
+                .lock()
+                .as_ref()
+                .filter(|cache| {
+                    cache.params == key && cache.sources == sources && cache.dimensions == (w, h)
+                })
+                .map(|cache| Arc::clone(&cache.pixels));
+            let physical_layer = if let Some(pixels) = cached {
+                pixels
+            } else {
+                // These layers are independent and previously blocked one another on
+                // the render thread.  Compute them concurrently without reducing ray
+                // count, blur passes, or any optical detail.
+                let (ghosts, bloom, ocular, source_optics) = std::thread::scope(|scope| {
+                    let physical_job = scope.spawn(|| {
                         #[cfg(test)]
-                        eprintln!("ghosts: {:?}", start.elapsed());
-                        result
-                    } else {
-                        vec![[0.0; 3]; n]
-                    }
-                });
-                let bloom_job = scope.spawn(|| {
-                    #[cfg(test)]
-                    let start = std::time::Instant::now();
-                    if ep.physical_enabled {
-                        let bloom_source = physical::source_layer(&sources, w, h);
+                        let start = std::time::Instant::now();
+                        if ep.physical_enabled {
+                            let lens = physical::bundled_lens(ep.lens_preset);
+                            let result = physical::render(&lens, &sources, w, h, cfg);
+                            #[cfg(test)]
+                            eprintln!("ghosts: {:?}", start.elapsed());
+                            result
+                        } else {
+                            vec![[0.0; 3]; n]
+                        }
+                    });
+                    let bloom_job = scope.spawn(|| {
+                        #[cfg(test)]
+                        let start = std::time::Instant::now();
+                        if ep.physical_enabled {
+                            let bloom_source = physical::source_layer(&sources, w, h);
+                            let result = self
+                                .bloom_gpu
+                                .as_ref()
+                                .filter(|_| allow_layer_gpu)
+                                .and_then(|gpu| {
+                                    let _guard = self.optical_gpu_guard.lock();
+                                    gpu.render(&self.device, &self.queue, &bloom_source, w, h, cfg)
+                                })
+                                .unwrap_or_else(|| physical::bloom(&bloom_source, w, h, cfg));
+                            #[cfg(test)]
+                            eprintln!("bloom: {:?}", start.elapsed());
+                            result
+                        } else {
+                            vec![[0.0; 3]; n]
+                        }
+                    });
+                    let ocular_job = scope.spawn(|| crate::ocular::render(ep, &sources, w, h));
+                    let source_job = scope.spawn(|| {
+                        #[cfg(test)]
+                        let start = std::time::Instant::now();
                         let result = self
-                            .bloom_gpu
+                            .source_gpu
                             .as_ref()
+                            .filter(|_| allow_layer_gpu)
                             .and_then(|gpu| {
                                 let _guard = self.optical_gpu_guard.lock();
-                                gpu.render(&self.device, &self.queue, &bloom_source, w, h, cfg)
+                                gpu.render(&self.device, &self.queue, ep, &sources, w, h)
                             })
-                            .unwrap_or_else(|| physical::bloom(&bloom_source, w, h, cfg));
+                            .unwrap_or_else(|| crate::source_optics::render(ep, &sources, w, h));
                         #[cfg(test)]
-                        eprintln!("bloom: {:?}", start.elapsed());
+                        eprintln!("source optics: {:?}", start.elapsed());
                         result
-                    } else {
-                        vec![[0.0; 3]; n]
-                    }
+                    });
+                    (
+                        physical_job.join().expect("physical flare worker"),
+                        bloom_job.join().expect("bloom worker"),
+                        ocular_job.join().expect("ocular flare worker"),
+                        source_job.join().expect("source optics worker"),
+                    )
                 });
-                let ocular_job = scope.spawn(|| crate::ocular::render(ep, &sources, w, h));
-                let source_job = scope.spawn(|| {
-                    #[cfg(test)]
-                    let start = std::time::Instant::now();
-                    let result = self
-                        .source_gpu
-                        .as_ref()
-                        .and_then(|gpu| {
-                            let _guard = self.optical_gpu_guard.lock();
-                            gpu.render(&self.device, &self.queue, ep, &sources, w, h)
-                        })
-                        .unwrap_or_else(|| crate::source_optics::render(ep, &sources, w, h));
-                    #[cfg(test)]
-                    eprintln!("source optics: {:?}", start.elapsed());
-                    result
-                });
-                (
-                    physical_job.join().expect("physical flare worker"),
-                    bloom_job.join().expect("bloom worker"),
-                    ocular_job.join().expect("ocular flare worker"),
-                    source_job.join().expect("source optics worker"),
-                )
-            });
-            #[cfg(test)]
-            let start = std::time::Instant::now();
-            let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
-            let physical_layer = combine_optical_layers(
-                &ghosts,
-                &bloom,
-                &ocular,
-                &source_optics,
-                ep.ghost_intensity as f32,
-                if ep.style_preset < 6 { 1.0 } else { 0.0 },
-                workers,
-            );
-            #[cfg(test)]
-            eprintln!("combine: {:?}", start.elapsed());
-            let pixels = Arc::new(physical_layer);
-            // One shared entry, at most 128 MiB, rather than a full-frame cache per
-            // AE render thread. In-flight readers retain their own Arc safely.
-            let mut cache = self.optical_cache.lock();
-            *cache = if pixels.len() <= (128 * 1024 * 1024) / 16 {
-                Some(OpticalCache {
-                    params: key,
-                    sources,
-                    dimensions: (w, h),
-                    pixels: Arc::clone(&pixels),
-                })
-            } else {
-                None
-            };
-            pixels
-        };
-        {
-            let mut uploaded = state.uploaded_optics.lock();
-            let same = uploaded
-                .upgrade()
-                .is_some_and(|previous| Arc::ptr_eq(&previous, &physical_layer));
-            if !same {
-                self.queue.write_buffer(
-                    &state.physical_buf,
-                    0,
-                    as_bytes_slice(physical_layer.as_slice()),
-                );
-                *uploaded = Arc::downgrade(&physical_layer);
                 #[cfg(test)]
-                self.optical_uploads
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let start = std::time::Instant::now();
+                let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
+                let physical_layer = combine_optical_layers(
+                    &ghosts,
+                    &bloom,
+                    &ocular,
+                    &source_optics,
+                    ep.ghost_intensity as f32,
+                    if ep.style_preset < 6 { 1.0 } else { 0.0 },
+                    workers,
+                );
+                #[cfg(test)]
+                eprintln!("combine: {:?}", start.elapsed());
+                let pixels = Arc::new(physical_layer);
+                // One shared entry, at most 128 MiB, rather than a full-frame cache per
+                // AE render thread. In-flight readers retain their own Arc safely.
+                let mut cache = self.optical_cache.lock();
+                *cache = if pixels.len() <= (128 * 1024 * 1024) / 16 {
+                    Some(OpticalCache {
+                        params: key,
+                        sources,
+                        dimensions: (w, h),
+                        pixels: Arc::clone(&pixels),
+                    })
+                } else {
+                    None
+                };
+                pixels
+            };
+            {
+                let mut uploaded = state.uploaded_optics.lock();
+                let same = uploaded
+                    .upgrade()
+                    .is_some_and(|previous| Arc::ptr_eq(&previous, &physical_layer));
+                if !same {
+                    self.queue.write_buffer(
+                        &state.physical_buf,
+                        0,
+                        as_bytes_slice(physical_layer.as_slice()),
+                    );
+                    *uploaded = Arc::downgrade(&physical_layer);
+                    #[cfg(test)]
+                    self.optical_uploads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
-
         let flicker_mod = compute_flicker(ep);
         let (edge_bright, edge_scale) = compute_edge_trigger(ep, w, h);
 

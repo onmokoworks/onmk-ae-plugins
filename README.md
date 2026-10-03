@@ -33,6 +33,7 @@ onmkが開発・メンテナンスするAdobe After Effectsプラグインのモ
 | プラグイン | 概要 | 状態 |
 |---|---|---|
 | [CelGlow](./plugins/cel-glow/) | イラスト・アニメ向けの段階的なセルグロー | 実験的 |
+| [onmkFlare](./plugins/onmk-flare/) | 実レンズ処方によるゴースト、回折・Haze、Flare Studio | 開発中 |
 | [onmkGlow](./plugins/onmk-glow/) | After Glowとストリークを備えたマルチパス・グロー | 実験的 |
 | [ONMK Starglow](./plugins/starglow/) | 複数方向の光条とスペクトル色を生成するスターグロー | 実験的 |
 | [RefractionDispersion](./plugins/refraction-dispersion/) | ガラス風の屈折、色分散、ハイライト表現 | 開発中 |
@@ -104,6 +105,7 @@ Experimental and unpublished projects are developed outside this repository and 
 | Plugin | Description | Status |
 |---|---|---|
 | [CelGlow](./plugins/cel-glow/) | Stepped cel glow for illustration and anime compositing | Experimental |
+| [onmkFlare](./plugins/onmk-flare/) | Lens-prescription ghosts, diffraction, haze, and Flare Studio | In development |
 | [onmkGlow](./plugins/onmk-glow/) | Multi-pass glow with after-glow shaping and streaks | Experimental |
 | [ONMK Starglow](./plugins/starglow/) | Multi-direction spectral star glow | Experimental |
 | [RefractionDispersion](./plugins/refraction-dispersion/) | Glass-like refraction, chromatic dispersion, and highlights | In development |

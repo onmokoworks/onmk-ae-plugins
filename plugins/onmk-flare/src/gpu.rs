@@ -1,5 +1,6 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
+#[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use wgpu::*;
@@ -82,7 +83,6 @@ struct BufferState {
     params_buf: Buffer,
     physical_buf: Buffer,
     bind_group: BindGroup,
-    last_access: AtomicUsize,
     uploaded_optics: parking_lot::Mutex<std::sync::Weak<Vec<[f32; 4]>>>,
     resident_cache: parking_lot::Mutex<Option<(EffectParams, Vec<physical::BrightSource>)>>,
 }
@@ -92,7 +92,8 @@ pub struct GpuProcessor {
     queue: Queue,
     flare_pipeline: ComputePipeline,
     bind_group_layout: BindGroupLayout,
-    state: RwLock<HashMap<std::thread::ThreadId, BufferState>>,
+    state: RwLock<HashMap<usize, BufferState>>,
+    healthy: Arc<std::sync::atomic::AtomicBool>,
     optical_cache: parking_lot::Mutex<Option<OpticalCache>>,
     source_gpu: Option<crate::source_gpu::SourceGpu>,
     bloom_gpu: Option<crate::bloom_gpu::BloomGpu>,
@@ -173,6 +174,197 @@ fn combine_optical_layers(
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn private_bytes() -> usize {
+        #[repr(C)]
+        struct Counters {
+            size: u32,
+            faults: u32,
+            values: [usize; 9],
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn K32GetProcessMemoryInfo(
+                process: *mut std::ffi::c_void,
+                counters: *mut Counters,
+                size: u32,
+            ) -> i32;
+        }
+        let mut c = Counters {
+            size: std::mem::size_of::<Counters>() as u32,
+            faults: 0,
+            values: [0; 9],
+        };
+        assert_ne!(
+            unsafe {
+                K32GetProcessMemoryInfo(
+                    -1isize as *mut _,
+                    &mut c,
+                    std::mem::size_of::<Counters>() as u32,
+                )
+            },
+            0
+        );
+        c.values[8]
+    }
+
+    #[test]
+    #[ignore = "1200 full-HD frames, resize/toggle churn, worker contention and actual device destruction"]
+    fn memory_stability_soak() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut gpu = GpuProcessor::new();
+        let mut resident = crate::resident_gpu::ResidentGpu::new(&gpu.device).unwrap();
+        resident.ghosts = Some(crate::ghost_gpu::GhostGpu::new(&gpu.device).unwrap());
+        gpu.resident_gpu = Some(resident);
+        gpu.source_gpu = None;
+        gpu.bloom_gpu = None;
+        let mut ep = EffectParams {
+            light_x: 700.0,
+            light_y: 400.0,
+            source_mode: 1,
+            global_scale: 1.0,
+            global_brightness: 1.0,
+            flare_opacity: 1.0,
+            source_opacity: 1.0,
+            transfer_mode: 4,
+            physical_enabled: true,
+            ray_grid: 12,
+            physical_gain: 3000.0,
+            max_area_boost: 8.0,
+            ghost_intensity: 2.9,
+            ghost_normalize: true,
+            physical_ghost_blur: 0.005,
+            physical_blur_passes: 3,
+            bloom_strength: 0.6,
+            bloom_radius: 0.018,
+            bloom_passes: 3,
+            bloom_octaves: 4,
+            bloom_chromatic: true,
+            hotspot_intensity: 1.6,
+            ..Default::default()
+        };
+        let mut black = vec![0; 1920 * 1080 * 4];
+        for pixel in black.chunks_exact_mut(4) {
+            pixel[0] = 255;
+        }
+        for i in 0..40 {
+            ep.light_x += 0.1;
+            ep.lens_preset = i % 2;
+            gpu.process(&ep, &black, 1920, 1080);
+        }
+        let stage = gpu.resident_gpu.as_ref().unwrap();
+        let allocations = stage.scratch.lock().allocations;
+        let frames = stage.frames.load(Relaxed);
+        #[cfg(windows)]
+        let memory_start = private_bytes();
+        let mut times = Vec::new();
+        for i in 0..1200 {
+            ep.light_x = 600.0 + (i % 300) as f64;
+            ep.lens_preset = (i / 100) % 2;
+            let start = std::time::Instant::now();
+            let out = gpu.process(&ep, &black, 1920, 1080);
+            times.push(start.elapsed());
+            assert_eq!(out.len(), black.len());
+            assert!(gpu.is_healthy());
+            assert_eq!(
+                stage.frames.load(Relaxed),
+                frames + i as usize + 1,
+                "no silent fallback"
+            );
+            assert_eq!(gpu.state.read().len(), 1);
+            assert_eq!(
+                stage.scratch.lock().allocations,
+                allocations,
+                "large buffers must be reused"
+            );
+            assert!(stage.scratch.lock().bytes() <= 256 * 1024 * 1024);
+            if i % 200 == 199 {
+                #[cfg(windows)]
+                eprintln!(
+                    "soak frame={} private MiB={} scratch MiB={}",
+                    i + 1,
+                    private_bytes() / 1024 / 1024,
+                    stage.scratch.lock().bytes() / 1024 / 1024
+                );
+            }
+        }
+        #[cfg(windows)]
+        {
+            let memory_end = private_bytes();
+            eprintln!("process private bytes: start={memory_start} end={memory_end}");
+            assert!(
+                memory_end <= memory_start + 128 * 1024 * 1024,
+                "unexpected sustained private-memory growth"
+            );
+        }
+        times.sort();
+        eprintln!(
+            "1200 frames p50={:?} p95={:?} p99={:?} max={:?}",
+            times[600], times[1140], times[1188], times[1199]
+        );
+        for i in 0..120 {
+            let (w, h) = [(97, 61), (640, 360), (1280, 720), (1920, 1080)][i % 4];
+            ep.physical_enabled = i % 3 != 0;
+            ep.ocular_enabled = i % 7 == 0;
+            ep.light_x = w as f64 * 0.4 + i as f64 * 0.01;
+            ep.light_y = h as f64 * 0.4;
+            ep.lens_preset = i % 4;
+            gpu.process(&ep, &black[..w * h * 4], w, h);
+            assert!(gpu.is_healthy());
+            assert_eq!(gpu.state.read().len(), 1);
+            if !ep.physical_enabled {
+                assert_eq!(stage.scratch.lock().bytes(), (w * h * 16) as u64);
+            }
+        }
+        ep.ocular_enabled = false;
+        ep.physical_enabled = true;
+        // New host worker IDs must not create per-worker frame caches.
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let gpu = &gpu;
+                let black = &black;
+                let mut params = ep.clone();
+                scope.spawn(move || {
+                    for i in 0..8 {
+                        params.light_x = 30.0 + (worker * 8 + i) as f64 * 0.1;
+                        gpu.process(&params, &black[..97 * 61 * 4], 97, 61);
+                    }
+                });
+            }
+        });
+        assert_eq!(gpu.state.read().len(), 1);
+        // Failure after a GPU write must release scratch and restore CPU optics.
+        stage.force_failure.store(true, Relaxed);
+        ep.light_x += 1.0;
+        let failed = gpu.process(&ep, &black[..97 * 61 * 4], 97, 61);
+        assert_eq!(stage.scratch.lock().bytes(), 0);
+        stage.force_failure.store(false, Relaxed);
+        let count = stage.frames.load(Relaxed);
+        ep.light_x += 1.0;
+        gpu.process(&ep, &black[..97 * 61 * 4], 97, 61);
+        assert_eq!(
+            stage.frames.load(Relaxed),
+            count,
+            "failure retry must back off"
+        );
+        assert!(failed.iter().any(|v| *v != 0));
+        gpu.release_caches();
+        assert!(gpu.state.read().is_empty());
+        gpu.process(&ep, &black[..97 * 61 * 4], 97, 61);
+        assert_eq!(stage.frames.load(Relaxed), count + 1);
+        // Deliberate wgpu device destruction exercises the real loss callback.
+        gpu.device.destroy();
+        let _ = gpu.device.poll(PollType::Wait);
+        let actual = gpu.process(&ep, &black[..97 * 61 * 4], 97, 61);
+        assert!(!gpu.is_healthy());
+        assert!(gpu.state.read().is_empty());
+        assert_eq!(stage.scratch.lock().bytes(), 0);
+        assert_eq!(
+            actual,
+            crate::flare::process(&ep, &black[..97 * 61 * 4], 97, 61)
+        );
+    }
 
     #[test]
     #[ignore = "HDR ghost raster/blur CPU comparison at center, edge and outside"]
@@ -1342,6 +1534,18 @@ impl GpuProcessor {
         }))
         .expect("Failed to create GPU device");
 
+        let healthy = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let lost = healthy.clone();
+        device.set_device_lost_callback(move |_, message| {
+            lost.store(false, std::sync::atomic::Ordering::Release);
+            log::error!("onmkFlare GPU device lost: {message}");
+        });
+        let failed = healthy.clone();
+        device.on_uncaptured_error(Box::new(move |error| {
+            failed.store(false, std::sync::atomic::Ordering::Release);
+            log::error!("onmkFlare uncaptured GPU error: {error}");
+        }));
+
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("onmk_flare"),
             source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("../shader.wgsl"))),
@@ -1389,6 +1593,7 @@ impl GpuProcessor {
             None
         };
         Self {
+            healthy,
             device,
             queue,
             flare_pipeline,
@@ -1456,7 +1661,6 @@ impl GpuProcessor {
             params_buf,
             physical_buf,
             bind_group,
-            last_access: AtomicUsize::new(ts()),
             uploaded_optics: parking_lot::Mutex::new(std::sync::Weak::new()),
             resident_cache: parking_lot::Mutex::new(None),
         }
@@ -1466,43 +1670,83 @@ impl GpuProcessor {
         &self,
         w: u32,
         h: u32,
-    ) -> parking_lot::RwLockUpgradableReadGuard<'_, HashMap<std::thread::ThreadId, BufferState>>
-    {
+    ) -> parking_lot::RwLockUpgradableReadGuard<'_, HashMap<usize, BufferState>> {
         let mut lock = self.state.upgradable_read();
-        let tid = std::thread::current().id();
+        let tid = 0;
         if lock
             .get(&tid)
             .map(|s| s.width != w || s.height != h)
             .unwrap_or(true)
         {
             lock.with_upgraded(|x| {
-                let max = num_cpus::get().max(2) - 1;
-                if x.len() > max {
-                    let mut keys: Vec<_> = x
-                        .iter()
-                        .map(|(k, v)| {
-                            (*k, v.last_access.load(std::sync::atomic::Ordering::Relaxed))
-                        })
-                        .collect();
-                    keys.sort_by_key(|a| a.1);
-                    for (k, _) in keys.iter().take(x.len() - max) {
-                        x.remove(k);
-                    }
+                // The upgradable guard already serializes frames. Keep one
+                // shared frame, not a full-frame allocation per AE worker.
+                x.clear();
+                self.optical_cache.lock().take();
+                if let Some(gpu) = &self.resident_gpu {
+                    gpu.release();
                 }
                 x.insert(tid, self.create_buffers(w, h));
             });
         }
-        lock.get(&tid)
-            .unwrap()
-            .last_access
-            .store(ts(), std::sync::atomic::Ordering::Relaxed);
         lock
     }
 
     pub fn process(&self, ep: &EffectParams, src: &[u8], w: usize, h: usize) -> Vec<u8> {
+        // Bound in-flight work across processor instances in this plugin/DLL.
+        static FRAME: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+        let _frame = FRAME.lock();
+        let valid = w.checked_mul(h).and_then(|n| n.checked_mul(4));
+        if w == 0 || h == 0 || valid != Some(src.len()) {
+            return src.to_vec();
+        }
+        let limits = self.device.limits();
+        let n = w * h;
+        let fits = w <= u32::MAX as usize
+            && h <= u32::MAX as usize
+            && n as u64 <= (512 * 1024 * 1024) / 28
+            && (n as u64) * 16 <= limits.max_storage_buffer_binding_size as u64
+            && (n as u64) * 16 <= limits.max_buffer_size
+            && w.div_ceil(16) <= limits.max_compute_workgroups_per_dimension as usize
+            && h.div_ceil(16) <= limits.max_compute_workgroups_per_dimension as usize;
+        if self.is_healthy() && fits {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.process_inner(ep, src, w, h)
+            })) {
+                Ok(Some(result)) if self.is_healthy() => return result,
+                _ => {
+                    self.healthy
+                        .store(false, std::sync::atomic::Ordering::Release);
+                    log::error!("onmkFlare GPU frame failed; discarding caches and using CPU");
+                }
+            }
+        }
+        self.release_caches();
+        crate::flare::process(ep, src, w, h)
+    }
+
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.healthy.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn destroy_device_for_test(&self) {
+        self.device.destroy();
+        let _ = self.device.poll(PollType::Wait);
+    }
+
+    pub(crate) fn release_caches(&self) {
+        self.state.write().clear();
+        self.optical_cache.lock().take();
+        if let Some(gpu) = &self.resident_gpu {
+            gpu.release();
+        }
+    }
+
+    fn process_inner(&self, ep: &EffectParams, src: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
         let (ww, hh, n) = (w as u32, h as u32, w * h);
         let lock = self.get_state(ww, hh);
-        let state = lock.get(&std::thread::current().id()).unwrap();
+        let state = lock.get(&0).unwrap();
 
         self.queue.write_buffer(&state.source_buf, 0, &src[..n * 4]);
 
@@ -1700,6 +1944,9 @@ impl GpuProcessor {
                 }
             }
         }
+        if resident {
+            self.optical_cache.lock().take();
+        }
         let flicker_mod = compute_flicker(ep);
         let (edge_bright, edge_scale) = compute_edge_trigger(ep, w, h);
 
@@ -1826,18 +2073,25 @@ impl GpuProcessor {
         self.queue.submit(Some(enc.finish()));
 
         let slice = state.staging_buf.slice(..);
-        let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
-        slice.map_async(MapMode::Read, move |v| tx.send(v).unwrap());
-        let _ = self.device.poll(PollType::Wait);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(MapMode::Read, move |v| {
+            let _ = tx.send(v);
+        });
+        if self.device.poll(PollType::Wait).is_err() {
+            return None;
+        }
 
         let mut result = vec![0u8; n * 4];
-        if let Some(Ok(())) = pollster::block_on(rx.receive()) {
+        if let Ok(Ok(())) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
             let data = slice.get_mapped_range();
             result.copy_from_slice(&data[..n * 4]);
             drop(data);
             state.staging_buf.unmap();
+        } else {
+            state.staging_buf.unmap();
+            return None;
         }
-        result
+        Some(result)
     }
 }
 
@@ -1931,11 +2185,4 @@ fn as_bytes<T: Sized>(val: &T) -> &[u8] {
 
 fn as_bytes_slice<T: Sized>(slice: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice)) }
-}
-
-fn ts() -> usize {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as usize
 }

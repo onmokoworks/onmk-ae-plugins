@@ -8,23 +8,15 @@ mod lens;
 mod ocular;
 mod physical;
 mod resident_gpu;
+mod runtime;
+mod scratch;
 mod source_gpu;
 mod source_optics;
 mod viewer;
 
 use std::sync::OnceLock;
 
-static GPU: OnceLock<Option<gpu::GpuProcessor>> = OnceLock::new();
-
-fn get_gpu() -> Option<&'static gpu::GpuProcessor> {
-    GPU.get_or_init(
-        || match std::panic::catch_unwind(|| gpu::GpuProcessor::new()) {
-            Ok(g) => Some(g),
-            Err(_) => None,
-        },
-    )
-    .as_ref()
-}
+static GPU: OnceLock<parking_lot::Mutex<runtime::Runtime>> = OnceLock::new();
 
 #[derive(Eq, PartialEq, Hash, Clone, Copy, Debug)]
 enum Params {
@@ -1076,6 +1068,11 @@ impl AdobePluginGlobal for Plugin {
         params: &mut ae::Parameters<Params>,
     ) -> Result<(), ae::Error> {
         match cmd {
+            ae::Command::GlobalSetdown => {
+                if let Some(runtime) = GPU.get() {
+                    *runtime.lock() = Default::default();
+                }
+            }
             ae::Command::About => {
                 out_data.set_return_msg(
                     "onmkFlare v2.0\rCinematic lens flare generator.\rHotspot, glow, streaks, stripe, rings,\rstarburst, ghosts, edge trigger, atmosphere.\rGPU-accelerated. Written in Rust.",
@@ -1095,9 +1092,7 @@ impl AdobePluginGlobal for Plugin {
                 mut out_layer,
             } => {
                 let ep = get_params(params, &in_data)?;
-                let (original, w, h) = layer_to_flat(&in_layer);
-                let result = render_flare(&ep, &original, w, h);
-                flat_to_layer(&result, &mut out_layer, w, h);
+                render_layers(&ep, &in_layer, &mut out_layer);
             }
 
             ae::Command::SmartPreRender { mut extra } => {
@@ -1131,9 +1126,7 @@ impl AdobePluginGlobal for Plugin {
                 let cb = extra.callbacks();
                 let input_world = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
                 let mut output_world = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
-                let (original, w, h) = layer_to_flat(&input_world);
-                let result = render_flare(&ep, &original, w, h);
-                flat_to_layer(&result, &mut output_world, w, h);
+                render_layers(&ep, &input_world, &mut output_world);
                 cb.checkin_layer_pixels(0)?;
             }
 
@@ -1728,10 +1721,11 @@ fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
     }
 }
 
-fn render_flare(ep: &EffectParams, original: &[u8], w: usize, h: usize) -> Vec<u8> {
-    if let Some(gpu) = get_gpu() {
-        gpu.process(ep, original, w, h)
-    } else {
-        flare::process(ep, original, w, h)
-    }
+fn render_layers(ep: &EffectParams, input: &ae::Layer, output: &mut ae::Layer) {
+    // Acquire before allocating our flat input/output copies, not only before
+    // GPU submission. AE checkout/checkin callbacks remain outside this lock.
+    let mut runtime = GPU.get_or_init(Default::default).lock();
+    let (original, w, h) = layer_to_flat(input);
+    let result = runtime.render(ep, &original, w, h);
+    flat_to_layer(&result, output, w, h);
 }

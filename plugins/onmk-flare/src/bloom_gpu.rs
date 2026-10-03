@@ -80,18 +80,32 @@ impl BloomGpu {
         h: usize,
         cfg: Config,
     ) -> Buffer {
+        self.encode_pooled(device, encoder, input_buf, w, h, cfg, None)
+    }
+
+    pub(crate) fn encode_pooled(
+        &self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        input_buf: &Buffer,
+        w: usize,
+        h: usize,
+        cfg: Config,
+        mut pool: Option<&mut crate::scratch::Scratch>,
+    ) -> Buffer {
         let bytes = (w * h * 16) as u64;
-        let mk = |usage| {
-            device.create_buffer(&BufferDescriptor {
-                label: None,
-                size: bytes,
-                usage,
-                mapped_at_creation: false,
-            })
-        };
-        let working = mk(BufferUsages::STORAGE | BufferUsages::COPY_DST);
-        let prefix = mk(BufferUsages::STORAGE);
-        let total = mk(BufferUsages::STORAGE | BufferUsages::COPY_SRC);
+        let mut mk =
+            |slot, usage| crate::scratch::buffer(pool.as_deref_mut(), device, slot, bytes, usage);
+        let working = mk(
+            "bloom working",
+            BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        );
+        let prefix = mk("bloom prefix", BufferUsages::STORAGE);
+        let total = mk(
+            "bloom total",
+            BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+        );
+        encoder.clear_buffer(&total, 0, None);
         let diag = ((w * w + h * h) as f32).sqrt();
         let chroma = [
             [1.0, 1.0, 1.0, 0.0],
@@ -178,6 +192,7 @@ impl BloomGpu {
         w: usize,
         h: usize,
         cfg: Config,
+        pool: Option<&mut crate::scratch::Scratch>,
     ) -> Buffer {
         let radius = ((cfg.ghost_blur * ((w * w + h * h) as f32).sqrt()) as usize).min(w.max(h));
         let params = [
@@ -195,12 +210,13 @@ impl BloomGpu {
             contents: as_bytes(&params),
             usage: BufferUsages::UNIFORM,
         });
-        let prefix = device.create_buffer(&BufferDescriptor {
-            label: None,
-            size: (w * h * 16) as u64,
-            usage: BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
+        let prefix = crate::scratch::buffer(
+            pool,
+            device,
+            "ghost prefix",
+            (w * h * 16) as u64,
+            BufferUsages::STORAGE,
+        );
         // The shared layout includes an accumulator, but blur stages never use it.
         let unused = device.create_buffer(&BufferDescriptor {
             label: None,

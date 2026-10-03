@@ -51,17 +51,30 @@ impl SourceGpu {
         w: usize,
         h: usize,
     ) -> Buffer {
+        self.encode_pooled(device, encoder, data, w, h, None)
+    }
+
+    pub(crate) fn encode_pooled(
+        &self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        data: &[[f32; 4]],
+        w: usize,
+        h: usize,
+        pool: Option<&mut crate::scratch::Scratch>,
+    ) -> Buffer {
         let uniform = device.create_buffer_init(&util::BufferInitDescriptor {
             label: Some("source optical parameters"),
             contents: as_bytes(data),
             usage: BufferUsages::UNIFORM,
         });
-        let output = device.create_buffer(&BufferDescriptor {
-            label: None,
-            size: (w * h * 16) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let output = crate::scratch::buffer(
+            pool,
+            device,
+            "source",
+            (w * h * 16) as u64,
+            BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        );
         let bind = device.create_bind_group(&BindGroupDescriptor {
             label: None,
             layout: &self.layout,

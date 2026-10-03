@@ -35,6 +35,20 @@ impl GhostGpu {
         cfg: physical::Config,
         blur: &BloomGpu,
     ) -> Buffer {
+        self.encode_pooled(device, encoder, mesh, w, h, cfg, blur, None)
+    }
+
+    pub(crate) fn encode_pooled(
+        &self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        mesh: &GhostMesh,
+        w: usize,
+        h: usize,
+        cfg: physical::Config,
+        blur: &BloomGpu,
+        mut pool: Option<&mut crate::scratch::Scratch>,
+    ) -> Buffer {
         fn bytes<T>(v: &[T]) -> &[u8] {
             unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), std::mem::size_of_val(v)) }
         }
@@ -66,12 +80,13 @@ impl GhostGpu {
             },
             BufferUsages::STORAGE,
         );
-        let output = device.create_buffer(&BufferDescriptor {
-            label: None,
-            size: (w * h * 16) as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let output = crate::scratch::buffer(
+            pool.as_deref_mut(),
+            device,
+            "ghost raster",
+            (w * h * 16) as u64,
+            BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        );
         let buffers = [&params, &triangles, &ranges, &indices, &output];
         let entries: Vec<_> = buffers
             .iter()
@@ -94,7 +109,7 @@ impl GhostGpu {
         }
         let radius = (cfg.ghost_blur * ((w * w + h * h) as f32).sqrt()) as usize;
         if cfg.ghost_blur > 0.0 && radius > 0 {
-            blur.encode_ghost_blur(device, encoder, output, w, h, cfg)
+            blur.encode_ghost_blur(device, encoder, output, w, h, cfg, pool)
         } else {
             output
         }

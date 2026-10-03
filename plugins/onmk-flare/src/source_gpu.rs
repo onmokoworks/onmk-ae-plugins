@@ -42,6 +42,49 @@ impl SourceGpu {
         })
     }
 
+    // Caller owns validation/error scopes and submission. No image readback.
+    pub(crate) fn encode(
+        &self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        data: &[[f32; 4]],
+        w: usize,
+        h: usize,
+    ) -> Buffer {
+        let uniform = device.create_buffer_init(&util::BufferInitDescriptor {
+            label: Some("source optical parameters"),
+            contents: as_bytes(data),
+            usage: BufferUsages::UNIFORM,
+        });
+        let output = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: (w * h * 16) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let bind = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &self.layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: output.as_entire_binding(),
+                },
+            ],
+        });
+        {
+            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(w.div_ceil(16) as u32, h.div_ceil(16) as u32, 1);
+        }
+        output
+    }
+
     pub fn render(
         &self,
         device: &Device,
@@ -69,44 +112,14 @@ impl SourceGpu {
         let _guard = self.guard.lock();
         device.push_error_scope(ErrorFilter::OutOfMemory);
         device.push_error_scope(ErrorFilter::Validation);
-        let uniform = device.create_buffer_init(&util::BufferInitDescriptor {
-            label: Some("source optical parameters"),
-            contents: as_bytes(&data),
-            usage: BufferUsages::UNIFORM,
-        });
-        let output = device.create_buffer(&BufferDescriptor {
-            label: None,
-            size: bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
         let staging = device.create_buffer(&BufferDescriptor {
             label: None,
             size: bytes,
             usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let bind = device.create_bind_group(&BindGroupDescriptor {
-            label: None,
-            layout: &self.layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: uniform.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: output.as_entire_binding(),
-                },
-            ],
-        });
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
-        {
-            let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.dispatch_workgroups(w.div_ceil(16) as u32, h.div_ceil(16) as u32, 1);
-        }
+        let output = self.encode(device, &mut encoder, &data, w, h);
         encoder.copy_buffer_to_buffer(&output, 0, &staging, 0, bytes);
         queue.submit(Some(encoder.finish()));
         let slice = staging.slice(..);
@@ -151,7 +164,7 @@ fn as_bytes(data: &[[f32; 4]]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), std::mem::size_of_val(data)) }
 }
 
-fn parameters(
+pub(crate) fn parameters(
     ep: &EffectParams,
     sources: &[BrightSource],
     w: usize,

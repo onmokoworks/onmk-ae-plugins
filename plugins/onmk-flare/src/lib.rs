@@ -6,6 +6,7 @@ mod gpu;
 mod lens;
 mod ocular;
 mod physical;
+mod resident_gpu;
 mod source_gpu;
 mod source_optics;
 mod viewer;

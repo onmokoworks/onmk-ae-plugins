@@ -125,6 +125,25 @@ cargo test --release optical_cache_1080p -- --ignored --nocapture
 
 `benchmark_gpu_source_full`は両GPU層とCPU版を明示的に切り替えて比較し、GPUで実際に描画したことも検証します。`target/gpu-source-cpu-reference.png`と`target/gpu-source-candidate.png`に比較用画像を出力します。`aex_gpu_output_comparison`は`ONMK_AEX_GPU_TEST_DIR`で指定した既存AEXCompat出力ディレクトリの`gpu-optics-{cpu,gpu}-{1920x1080,1280x720}.png`を比較します。
 
+### GPU常駐合成（追加実装）
+
+`ONMK_GPU_RESIDENT=1`で、光源核・光芒・Haze・Bloomの中間画像をGPU上に保持し、光学層の合成までGPUで実行します。単体版の2つの環境変数は不要です。成功したフレームでは、これらのHDR中間画像をCPUへ読み戻したり再アップロードしたりしません。光源位置からBloomの点入力だけを転送し、CPUで生成するゴースト・有効時の肉眼グレアをRGBのまま一度アップロードします。無効な肉眼グレア層は大きなゼロ画像を生成・転送しません。
+
+CPUへ戻すのは最終ARGB画像と、異常値検出用の4バイトだけです。光学設定が同じフレームではGPUバッファを再利用し、検査値の読み戻しも再計算も不要です。キャッシュはバッファに属し、光源・レンズ・Bloom・抽出光源の変更や解像度変更で更新します。GPU書き込み後に失敗した場合も、CPU結果を必ず書き戻します。失敗前のCPUキャッシュを誤って再利用してGPU結果が残るケースを、故障注入テストで検証しています。
+
+GPU常駐処理用に明示的に確保する最大7枚相当の一時フルフレームバッファは合計256MiB以内に制限します。既存の最終出力・ドライバーの内部領域・CPUメモリは別です。1080pは対象、4Kなど上限を超える入力は従来経路へ戻します。**既定は引き続き無効**で、物理ゴーストの倍精度光線計算・ラスタライズと肉眼グレアはCPUのままです。
+
+同一実行内の1080p・各5フレーム中央値はCooke約101→76ms、Double Gauss約148→125ms。キャッシュ利用時は約4～5msでした。小さな画像ではGPU投入コストが勝る場合があります。内部描画時間であり、GPU初期化・シェーダー生成・AE起動時間は含みません。AEXCompat worker全体の初回時間が同じ割合で短縮するという意味ではありません。
+
+4レンズ計20フレーム、24種類の境界条件、キャッシュ更新、GPU書き込み後の故障注入を検証しました。1080pのCPU版との差は最大1/255で、各フレーム0～3チャンネル。AEXCompatの黒入力はCPU/常駐GPUとも両解像度で成功し、1080pは一致、720pは1チャンネルだけ1/255の差でした。既定経路の従来22参照画像も一致しています。全GPUベンダー・AE実機の全ビット深度を検証したものではありません。
+
+```powershell
+cargo test --release resident_gpu_qualification -- --ignored --nocapture
+cargo test --release resident_edge_cases -- --ignored --nocapture
+```
+
+比較テストはCPU経路と常駐経路を明示的に選択します。実験AEXは`onmkFlare-gpu-resident.aex`として別にビルドし、MediaCoreの既存AEXは更新していません。新しく起動するホストプロセスに`ONMK_GPU_RESIDENT=1`を渡すと有効になります。無効に戻す場合は`0`または未設定にしてホストを再起動してください。古い単体比較用フラグも未設定にすれば、元のCPU光学層に戻ります。
+
 ## Recovery（元の独立リポジトリ）
 
 全面移植前の状態は、元の独立したonmkFlareリポジトリのGitタグ `before-full-flaresim-port` に保存されています。以下はその独立リポジトリ内だけで使えます。モノレポへのソース取り込みには、このタグと過去の履歴は含まれません。

@@ -94,22 +94,7 @@ impl GhostGpu {
         }
         let radius = (cfg.ghost_blur * ((w * w + h * h) as f32).sqrt()) as usize;
         if cfg.ghost_blur > 0.0 && radius > 0 {
-            // Single white octave is the same separable box filter as ghosts.
-            blur.encode(
-                device,
-                encoder,
-                &output,
-                w,
-                h,
-                physical::Config {
-                    bloom_strength: 1.0,
-                    bloom_radius: cfg.ghost_blur,
-                    bloom_passes: cfg.ghost_blur_passes,
-                    bloom_octaves: 1,
-                    bloom_chromatic: false,
-                    ..cfg
-                },
-            )
+            blur.encode_ghost_blur(device, encoder, output, w, h, cfg)
         } else {
             output
         }

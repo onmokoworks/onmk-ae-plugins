@@ -313,13 +313,20 @@ struct TraceState {
     current: f64,
 }
 
-fn trace_first(mut ray: Ray, l: &LensSystem, b: usize, wave: f64) -> Option<TraceState> {
+#[cfg(test)]
+fn trace_first(
+    mut ray: Ray,
+    l: &LensSystem,
+    b: usize,
+    wave: f64,
+    indices: &[f64],
+) -> Option<TraceState> {
     let mut weight = 1.0;
     let mut current = 1.0;
     for i in 0..=b {
         let (h, n) = intersect(ray, &l.surfaces[i])?;
         ray.o = h;
-        let n2 = ior(&l.surfaces[i], wave);
+        let n2 = indices[i];
         let r = reflectance(n.dot(ray.d).abs(), current, n2, l.surfaces[i].coating, wave);
         if i == b {
             ray.d = reflect(ray.d, n);
@@ -343,6 +350,7 @@ fn trace_remaining(
     a: usize,
     b: usize,
     wave: f64,
+    indices: &[f64],
 ) -> Option<Hit> {
     let TraceState {
         mut ray,
@@ -352,12 +360,12 @@ fn trace_remaining(
     for i in (a..b).rev() {
         let (h, n) = intersect(ray, &l.surfaces[i])?;
         ray.o = h;
-        let n2 = before(l, i, wave);
+        let n2 = if i == 0 { 1.0 } else { indices[i - 1] };
         let r = reflectance(n.dot(ray.d).abs(), current, n2, l.surfaces[i].coating, wave);
         if i == a {
             ray.d = reflect(ray.d, n);
             weight *= r;
-            current = ior(&l.surfaces[a], wave);
+            current = indices[a];
         } else {
             ray.d = refract(ray.d, n, current / n2)?;
             weight *= 1.0 - r;
@@ -367,7 +375,7 @@ fn trace_remaining(
     for i in a + 1..l.surfaces.len() {
         let (h, n) = intersect(ray, &l.surfaces[i])?;
         ray.o = h;
-        let n2 = ior(&l.surfaces[i], wave);
+        let n2 = indices[i];
         let r = reflectance(n.dot(ray.d).abs(), current, n2, l.surfaces[i].coating, wave);
         ray.d = refract(ray.d, n, current / n2)?;
         weight *= 1.0 - r;
@@ -966,10 +974,10 @@ fn render_with_workers(
     cfg: Config,
     workers: usize,
 ) -> Vec<[f32; 3]> {
-    render_internal(l, sources, w, h, cfg, workers, None)
+    render_internal::<true>(l, sources, w, h, cfg, workers, None)
 }
 
-fn render_internal(
+fn render_internal<const SHARED_PREFIX: bool>(
     l: &LensSystem,
     sources: &[BrightSource],
     w: usize,
@@ -1029,10 +1037,96 @@ fn render_internal(
         std::collections::HashMap::new();
     let entry_bytes = n * n * std::mem::size_of::<[Option<TraceState>; 3]>();
     let mut triangles = Vec::new();
-    for (a, b) in pairs(l) {
-        if pair_estimate(l, a, b) < cfg.min_ghost {
-            continue;
+    // Dispersion is invariant for every ray in this frame. Evaluate the exact
+    // original f64 formula once per surface/wavelength, not per intersection.
+    let indices = [650.0, 550.0, 450.0]
+        .map(|wave| l.surfaces.iter().map(|s| ior(s, wave)).collect::<Vec<_>>());
+    let active_pairs: Vec<_> = pairs(l)
+        .into_iter()
+        .filter(|&(a, b)| !(pair_estimate(l, a, b) < cfg.min_ghost))
+        .collect();
+    // Allocate the same bounded cache entries in the same pair/source order.
+    if SHARED_PREFIX {
+        for &(_, b) in &active_pairs {
+            for source_index in 0..sources.len() {
+                if b >= 2
+                    && !first_legs.contains_key(&(source_index, b))
+                    && (first_legs.len() + 1) * entry_bytes <= 16 * 1024 * 1024
+                {
+                    first_legs.insert((source_index, b), vec![[None; 3]; n * n]);
+                }
+            }
         }
+        for (source_index, src) in sources.iter().enumerate() {
+            let mut targets: Vec<_> = first_legs
+                .iter_mut()
+                .filter_map(|(&(s, b), states)| (s == source_index).then_some((b, states)))
+                .collect();
+            targets.sort_unstable_by_key(|(b, _)| *b);
+            let Some(max_b) = targets.last().map(|(b, _)| *b) else {
+                continue;
+            };
+            let d = V3 {
+                x: src.angle_x.tan(),
+                y: src.angle_y.tan(),
+                z: 1.0,
+            }
+            .norm();
+            for (grid_index, pupil) in grid.iter().enumerate() {
+                let Some((u, v)) = *pupil else {
+                    continue;
+                };
+                for (ch, wave) in [650.0, 550.0, 450.0].into_iter().enumerate() {
+                    let mut ray = Ray {
+                        o: V3 {
+                            x: u * l.surfaces[0].semi_aperture,
+                            y: v * l.surfaces[0].semi_aperture,
+                            z: l.surfaces[0].z - 20.0,
+                        },
+                        d,
+                    };
+                    let mut weight = 1.0;
+                    let mut current = 1.0;
+                    let mut next = 0;
+                    for i in 0..=max_b {
+                        let Some((h, normal)) = intersect(ray, &l.surfaces[i]) else {
+                            break;
+                        };
+                        ray.o = h;
+                        let n2 = indices[ch][i];
+                        let r = reflectance(
+                            normal.dot(ray.d).abs(),
+                            current,
+                            n2,
+                            l.surfaces[i].coating,
+                            wave,
+                        );
+                        if i == targets[next].0 {
+                            targets[next].1[grid_index][ch] = Some(TraceState {
+                                ray: Ray {
+                                    o: h,
+                                    d: reflect(ray.d, normal),
+                                },
+                                weight: weight * r,
+                                current,
+                            });
+                            next += 1;
+                            if next == targets.len() {
+                                break;
+                            }
+                        }
+                        let Some(direction) = refract(ray.d, normal, current / n2) else {
+                            break;
+                        };
+                        ray.d = direction;
+                        weight *= 1.0 - r;
+                        current = n2;
+                    }
+                }
+            }
+        }
+    }
+    for (a, b) in active_pairs {
         let boost = if cfg.normalize {
             area_boost(l, a, b, sw, sh, cfg.max_area_boost)
         } else {
@@ -1045,31 +1139,7 @@ fn render_internal(
                 z: 1.0,
             }
             .norm();
-            let cached = if b >= 2
-                && (first_legs.contains_key(&(source_index, b))
-                    || (first_legs.len() + 1) * entry_bytes <= 16 * 1024 * 1024)
-            {
-                Some(first_legs.entry((source_index, b)).or_insert_with(|| {
-                    grid.iter()
-                        .map(|pupil| {
-                            let Some((u, v)) = *pupil else {
-                                return [None; 3];
-                            };
-                            let ray = Ray {
-                                o: V3 {
-                                    x: u * l.surfaces[0].semi_aperture,
-                                    y: v * l.surfaces[0].semi_aperture,
-                                    z: l.surfaces[0].z - 20.0,
-                                },
-                                d,
-                            };
-                            [650.0, 550.0, 450.0].map(|wave| trace_first(ray, l, b, wave))
-                        })
-                        .collect()
-                }))
-            } else {
-                None
-            };
+            let cached = first_legs.get(&(source_index, b));
             let mut samples = vec![[None; 3]; n * n];
             let mut point_hits: Vec<(f32, f32, usize, f32)> = Vec::new();
             let mut minx = f32::MAX;
@@ -1090,7 +1160,7 @@ fn render_internal(
                 for (ch, wave) in [650.0, 550.0, 450.].into_iter().enumerate() {
                     let hit = if let Some(states) = &cached {
                         states[grid_index][ch]
-                            .and_then(|state| trace_remaining(state, l, a, b, wave))
+                            .and_then(|state| trace_remaining(state, l, a, b, wave, &indices[ch]))
                     } else {
                         trace(ray, l, a, b, wave)
                     };
@@ -1303,7 +1373,7 @@ pub fn ghost_mesh(
             }
         }
     };
-    render_internal(l, sources, w, h, cfg, 4, Some(&mut emit));
+    render_internal::<true>(l, sources, w, h, cfg, 4, Some(&mut emit));
     if failed {
         return None;
     }
@@ -1685,6 +1755,36 @@ pub fn bundled_lens(index: usize) -> LensSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shared_forward_paths_match_uncached_traces() {
+        let sources = [
+            BrightSource {
+                angle_x: -0.16,
+                angle_y: 0.04,
+                rgb: [1.0, 0.7, 0.3],
+            },
+            BrightSource {
+                angle_x: 0.3,
+                angle_y: -0.08,
+                rgb: [0.3, 0.8, 1.0],
+            },
+        ];
+        for preset in 0..4 {
+            for grid in [4, 12, 40] {
+                let lens = bundled_lens(preset);
+                let cfg = Config {
+                    ray_grid: grid,
+                    surface_raster: grid != 4,
+                    ..Config::default()
+                };
+                let expected = render_internal::<false>(&lens, &sources, 37, 23, cfg, 1, None);
+                let actual = render_internal::<true>(&lens, &sources, 37, 23, cfg, 1, None);
+                for (a, b) in expected.iter().flatten().zip(actual.iter().flatten()) {
+                    assert_eq!(a.to_bits(), b.to_bits(), "lens={preset}, grid={grid}");
+                }
+            }
+        }
+    }
     // Reference implementation retained to detect changes to summation,
     // clipping at image edges, and multi-pass rounding.
     fn reference_blur(img: &mut Vec<[f32; 3]>, w: usize, h: usize, r: usize, passes: usize) {
@@ -1876,8 +1976,9 @@ mod tests {
                             .norm(),
                         };
                         let original = trace(ray, &l, a, b, wave);
-                        let shared = trace_first(ray, &l, b, wave)
-                            .and_then(|s| trace_remaining(s, &l, a, b, wave));
+                        let indices: Vec<_> = l.surfaces.iter().map(|s| ior(s, wave)).collect();
+                        let shared = trace_first(ray, &l, b, wave, &indices)
+                            .and_then(|s| trace_remaining(s, &l, a, b, wave, &indices));
                         match (original, shared) {
                             (None, None) => {}
                             (Some(a), Some(b)) => assert_eq!(

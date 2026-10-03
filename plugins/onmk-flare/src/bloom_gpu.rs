@@ -169,6 +169,74 @@ impl BloomGpu {
         total
     }
 
+    /// Ghosts need only the box filter, not an octave accumulator or input copy.
+    pub(crate) fn encode_ghost_blur(
+        &self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        pixels: Buffer,
+        w: usize,
+        h: usize,
+        cfg: Config,
+    ) -> Buffer {
+        let radius = ((cfg.ghost_blur * ((w * w + h * h) as f32).sqrt()) as usize).min(w.max(h));
+        let params = [
+            [
+                f32::from_bits(w as u32),
+                f32::from_bits(h as u32),
+                f32::from_bits(radius as u32),
+                0.0,
+            ],
+            [1.0; 4],
+            [1.0; 4],
+        ];
+        let uniform = device.create_buffer_init(&util::BufferInitDescriptor {
+            label: None,
+            contents: as_bytes(&params),
+            usage: BufferUsages::UNIFORM,
+        });
+        let prefix = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: (w * h * 16) as u64,
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        // The shared layout includes an accumulator, but blur stages never use it.
+        let unused = device.create_buffer(&BufferDescriptor {
+            label: None,
+            size: 16,
+            usage: BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        let buffers = [&uniform, &pixels, &prefix, &unused];
+        let entries: Vec<_> = buffers
+            .iter()
+            .enumerate()
+            .map(|(i, b)| BindGroupEntry {
+                binding: i as u32,
+                resource: b.as_entire_binding(),
+            })
+            .collect();
+        let bind = device.create_bind_group(&BindGroupDescriptor {
+            label: None,
+            layout: &self.layout,
+            entries: &entries,
+        });
+        for _ in 0..cfg.ghost_blur_passes.max(1) {
+            for stage in 0..4 {
+                let mut pass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+                pass.set_pipeline(&self.pipelines[stage]);
+                pass.set_bind_group(0, &bind, &[]);
+                match stage {
+                    0 => pass.dispatch_workgroups(h.div_ceil(64) as u32, 1, 1),
+                    2 => pass.dispatch_workgroups(w.div_ceil(64) as u32, 1, 1),
+                    _ => pass.dispatch_workgroups(w.div_ceil(16) as u32, h.div_ceil(16) as u32, 1),
+                }
+            }
+        }
+        pixels
+    }
+
     pub fn render(
         &self,
         device: &Device,

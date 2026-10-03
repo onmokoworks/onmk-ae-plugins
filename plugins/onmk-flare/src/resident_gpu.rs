@@ -4,6 +4,8 @@ use crate::{bloom_gpu::BloomGpu, physical, source_gpu::SourceGpu, EffectParams};
 use wgpu::{util::DeviceExt, *};
 
 pub struct ResidentGpu {
+    pub(crate) scratch: parking_lot::Mutex<crate::scratch::Scratch>,
+    retry_at: parking_lot::Mutex<Option<std::time::Instant>>,
     pub ghosts: Option<crate::ghost_gpu::GhostGpu>,
     source: SourceGpu,
     bloom: BloomGpu,
@@ -43,6 +45,8 @@ impl ResidentGpu {
             return None;
         }
         Some(Self {
+            scratch: parking_lot::Mutex::new(crate::scratch::Scratch::default()),
+            retry_at: parking_lot::Mutex::new(None),
             ghosts,
             source,
             bloom,
@@ -70,6 +74,58 @@ impl ResidentGpu {
         w: usize,
         h: usize,
         cfg: physical::Config,
+    ) -> Option<()> {
+        if self
+            .retry_at
+            .lock()
+            .is_some_and(|t| std::time::Instant::now() < t)
+        {
+            return None;
+        }
+        let mut pool = self.scratch.lock();
+        pool.begin(w, h);
+        let mut attempted = false;
+        let result = self.render_pooled(
+            device,
+            queue,
+            output,
+            ep,
+            sources,
+            w,
+            h,
+            cfg,
+            &mut pool,
+            &mut attempted,
+        );
+        if result.is_some() {
+            pool.finish();
+        } else {
+            pool.clear();
+            if attempted {
+                *self.retry_at.lock() =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(2));
+            }
+        }
+        result
+    }
+
+    pub(crate) fn release(&self) {
+        self.scratch.lock().clear();
+        *self.retry_at.lock() = None;
+    }
+
+    fn render_pooled(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        output: &Buffer,
+        ep: &EffectParams,
+        sources: &[physical::BrightSource],
+        w: usize,
+        h: usize,
+        cfg: physical::Config,
+        pool: &mut crate::scratch::Scratch,
+        attempted: &mut bool,
     ) -> Option<()> {
         let n = w.checked_mul(h)?;
         let bytes = n.checked_mul(16)? as u64;
@@ -102,6 +158,7 @@ impl ResidentGpu {
             return None;
         }
         let data = crate::source_gpu::parameters(ep, sources, w, h)?;
+        *attempted = true;
         #[cfg(test)]
         let timer = std::time::Instant::now();
         device.push_error_scope(ErrorFilter::OutOfMemory);
@@ -124,15 +181,13 @@ impl ResidentGpu {
                     GhostResult::Cpu(Vec::new())
                 }
             });
-            let ocular_job = scope.spawn(|| {
-                if ep.ocular_enabled {
-                    crate::ocular::render(ep, sources, w, h)
-                } else {
-                    Vec::new()
-                }
-            });
+            let ocular_job = ep
+                .ocular_enabled
+                .then(|| scope.spawn(|| crate::ocular::render(ep, sources, w, h)));
             let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
-            let source = self.source.encode(device, &mut encoder, &data, w, h);
+            let source = self
+                .source
+                .encode_pooled(device, &mut encoder, &data, w, h, Some(pool));
             let bloom = if ep.physical_enabled && cfg.bloom_strength > 0.0 {
                 // Bloom starts with a handful of impulses, not a dense CPU
                 // image. WGPU initializes unwritten buffer bytes to zero.
@@ -163,7 +218,7 @@ impl ResidentGpu {
                     queue.write_buffer(&input_buf, (i * 16) as u64, bytes_of(&p));
                 }
                 self.bloom
-                    .encode(device, &mut encoder, &input_buf, w, h, cfg)
+                    .encode_pooled(device, &mut encoder, &input_buf, w, h, cfg, Some(pool))
             } else {
                 device.create_buffer(&BufferDescriptor {
                     label: None,
@@ -178,7 +233,9 @@ impl ResidentGpu {
                 source,
                 bloom,
                 ghost_job.join().expect("resident ghost worker"),
-                ocular_job.join().expect("resident ocular worker"),
+                ocular_job
+                    .map(|job| job.join().expect("resident ocular worker"))
+                    .unwrap_or_default(),
             )
         });
         #[cfg(test)]
@@ -188,7 +245,7 @@ impl ResidentGpu {
             GhostResult::Mesh(mesh) => {
                 let mut encoder =
                     device.create_command_encoder(&CommandEncoderDescriptor::default());
-                let buffer = self.ghosts.as_ref().unwrap().encode(
+                let buffer = self.ghosts.as_ref().unwrap().encode_pooled(
                     device,
                     &mut encoder,
                     &mesh,
@@ -196,6 +253,7 @@ impl ResidentGpu {
                     h,
                     cfg,
                     &self.bloom,
+                    Some(pool),
                 );
                 queue.submit(Some(encoder.finish()));
                 (buffer, 4)

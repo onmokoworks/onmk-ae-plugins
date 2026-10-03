@@ -1,4 +1,4 @@
-struct Config { dimensions: vec2<u32>, gain: f32, modern: f32, physical_enabled: u32, ocular_enabled: u32, padding: vec2<u32> }
+struct Config { dimensions: vec2<u32>, gain: f32, modern: f32, physical_enabled: u32, ocular_enabled: u32, ghost_stride:u32, padding:u32 }
 @group(0) @binding(0) var<uniform> p: Config;
 @group(0) @binding(1) var<storage, read> ghosts: array<f32>;
 @group(0) @binding(2) var<storage, read> bloom: array<vec4<f32>>;
@@ -17,7 +17,8 @@ fn combine(@builtin(global_invocation_id) id: vec3<u32>) {
         if !finite(source[i][c]) || !finite(bloom[i][c]) { atomicStore(&invalid,1u); }
         // Same ordering and finite sanitization as combine_optical_layers.
         var g=0.0;var e=0.0;
-        if p.physical_enabled!=0u { g=ghosts[i*3u+c]; }
+        if p.physical_enabled!=0u { g=ghosts[i*p.ghost_stride+c]; }
+        if !finite(g) {atomicStore(&invalid,1u);}
         if p.ocular_enabled!=0u { e=ocular[i*3u+c]; }
         result[c]=safe(g+bloom[i][c])
             +safe(e+source[i][c]*p.modern)/max(p.gain,0.001);

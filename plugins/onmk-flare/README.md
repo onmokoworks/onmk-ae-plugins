@@ -144,6 +144,26 @@ cargo test --release resident_edge_cases -- --ignored --nocapture
 
 比較テストはCPU経路と常駐経路を明示的に選択します。実験AEXは`onmkFlare-gpu-resident.aex`として別にビルドし、MediaCoreの既存AEXは更新していません。新しく起動するホストプロセスに`ONMK_GPU_RESIDENT=1`を渡すと有効になります。無効に戻す場合は`0`または未設定にしてホストを再起動してください。古い単体比較用フラグも未設定にすれば、元のCPU光学層に戻ります。
 
+### 物理ゴーストのGPUラスタライズ・ぼかし（追加実装）
+
+上記の常駐経路に加え、`ONMK_GPU_GHOSTS=1`で物理ゴーストのラスタライズとぼかしもGPUへ移します。倍精度の光線追跡、反射経路、サンプル数、面積補正、ぼかし回数は維持します。16×16画素のタイルごとに三角形を元の順序で評価し、浮動小数点atomicの加算順序に依存しません。ゴースト画像のCPU生成・GPUアップロードも不要になります。光線追跡と肉眼グレアは引き続きCPUです。
+
+1080p・光源を移動させる各5フレームの同一実行内中央値は、CookeがCPU約102ms→33ms、Double Gaussが約145ms→45msでした。直前のGPU常駐版の約76～78ms／125～127msからも短縮しています。これは内部描画時間です。初回起動やAE全体の時間ではなく、小さい画像や光線追跡が支配的な複雑なレンズで同じ倍率になるとは限りません。
+
+4レンズ×光源位置3条件×ぼかし3条件の36ケースで、GPUゴースト単体のHDR値をCPUと比較しました。最大差は約4e-8、判定基準は`1e-6 + abs(reference)*1e-4`です。常駐経路の全体比較、24種類の境界条件、キャッシュ更新と故障注入も通過。1080p合成画像の差は最大1/255、各フレーム0～3チャンネルでした。AEXCompatの黒入力ではCPU/GPU双方が成功し、1080pは全画素一致、720pは1チャンネルだけ1/255の差でした。既定CPU経路の従来22参照画像も一致しています。実機AE全操作・全ビット深度・全GPUベンダーを保証する検証ではありません。
+
+一時フルフレームバッファは10枚相当・合計384MiB以内の予算で制限します。これとは別に三角形係数16MiB、タイル参照16MiBとタイル範囲表を使用します。CPU側のリスト容量、既存フレーム、ドライバー内部領域は別です。三角形262,144個、総参照4,194,304個、1タイル16,384参照を上限とし、超過時は三角形を省略せずCPU描画へ戻します。GPU処理失敗・非有限値も従来経路へ戻します。4Kなどフレーム予算を超える解像度もCPUへ戻ります。
+
+```powershell
+$env:ONMK_GPU_RESIDENT = "1"
+$env:ONMK_GPU_GHOSTS = "1"
+cargo test --release ghost_gpu_qualification -- --ignored --nocapture
+cargo test --release resident_gpu_qualification -- --ignored --nocapture
+cargo test --release resident_edge_cases -- --ignored --nocapture
+```
+
+既定は無効です。有効化は新規ホストプロセスに上記2変数を渡してください。実験AEXは元の独立作業ディレクトリの`target/release/onmkFlare-gpu-ghosts.aex`に分離し、既存MediaCoreのAEXは変更していません。
+
 ## Recovery（元の独立リポジトリ）
 
 全面移植前の状態は、元の独立したonmkFlareリポジトリのGitタグ `before-full-flaresim-port` に保存されています。以下はその独立リポジトリ内だけで使えます。モノレポへのソース取り込みには、このタグと過去の履歴は含まれません。

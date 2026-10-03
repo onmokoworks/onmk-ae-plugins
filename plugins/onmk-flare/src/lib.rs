@@ -2,6 +2,7 @@ use after_effects as ae;
 
 mod bloom_gpu;
 mod flare;
+mod ghost_gpu;
 mod gpu;
 mod lens;
 mod ocular;

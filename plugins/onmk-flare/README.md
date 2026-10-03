@@ -92,7 +92,40 @@ cargo build --release
 
 比較レンダーは `cargo test write_comparison_preview -- --ignored` でPPMとして生成できます。
 
-## Recovery
+## 実験的なGPU光学層（2026-10-03）
+
+光源核・光芒・HazeとBloomに、切り替え可能なWGPU compute実装を追加しました。**両方とも既定では無効**です。物理ゴーストの倍精度光線追跡・ラスタライズ、肉眼グレアはCPUのままです。全描画のGPU化が完了したという意味ではありません。
+
+- `ONMK_GPU_SOURCE_OPTICS=1`：光源核・光芒・HazeをGPUで計算
+- `ONMK_GPU_BLOOM=1`：BloomをGPUで計算
+- 未設定または`0`：従来のCPU光学層。これまでの参照画像とビット一致
+
+環境変数はGPU初期化時に読み取ります。切り替えは新しいホストプロセスで行ってください。AEのパラメーター構成、PiPL、ピクセル形式の契約は変更していません。既存MediaCoreのAEXは自動更新しません。
+
+GPU生成失敗、リソース上限超過、読み戻し失敗、非有限出力などでは該当層をCPUへ戻します。光源層の一時GPUバッファは128MiB、Bloomは192MiBを上限とし、それを超える解像度はCPUへ戻します。これは各層の一時領域の上限で、既存のフレームバッファ・CPUメモリを含むアプリ全体の上限ではありません。Bloomの負値・負のゼロ・非有限値・極端な値や16を超えるパス数もCPUへ戻します。GPUのエラースコープが衝突しないよう、両層のGPU処理は直列化しています。
+
+### 検証結果と現在の制限
+
+元の式・サンプル数・ぼかし回数・オクターブ数を維持していますが、GPUの超越関数や浮動小数点演算はCPUとビット一致しません。HDR比較の合格基準は光源層`2e-4 + abs(reference)*1e-4`、Bloom`1e-7 + abs(reference)*5e-5`。全体8bit画像は最大1段階、変更チャンネル数0.1%未満を上限にしています。NaNやInfを許容誤差として見逃しません。
+
+今回の1080p・Cooke/Double Gauss計10フレームでは差は最大1/255、各フレーム0～2チャンネルでした。4レンズの321×181光源層合成比較は一致。通常14テスト、GPU有効時のキャッシュ再作成・光源移動・レンズ/Bloom変更、奇数寸法・1画素軸・複数光源・高密度入力も検証しています。
+
+AEXCompatの黒入力で実験版AEXをCPU/GPU各モードで描画した結果、1080pは一致、720pは1チャンネルだけ1/255の差でした。両モードとも両解像度で`passed: true`。実機AEの全操作、全ビット深度、他GPUベンダーまでの保証ではありません。
+
+光源層単体は3光源の1080pで約191→17ms、Bloom単体は端を含む3点入力・4オクターブで約153→53msでした。ただし全体は1光源の同一実行内中央値でCooke100→102ms、Double Gauss141→136msと、まだ大幅な改善ではありません。GPU読み戻し・CPU合成・再転送とCPUゴーストが残っています。既定を切り替えず、次のGPU常駐化のための比較可能な実験実装として保持します。
+
+```powershell
+cargo test --release
+cargo test --release qualification -- --ignored --nocapture --test-threads=1
+cargo test --release benchmark_gpu_source_full -- --ignored --nocapture
+$env:ONMK_GPU_SOURCE_OPTICS = "1"
+$env:ONMK_GPU_BLOOM = "1"
+cargo test --release optical_cache_1080p -- --ignored --nocapture
+```
+
+`benchmark_gpu_source_full`は両GPU層とCPU版を明示的に切り替えて比較し、GPUで実際に描画したことも検証します。`target/gpu-source-cpu-reference.png`と`target/gpu-source-candidate.png`に比較用画像を出力します。`aex_gpu_output_comparison`は`ONMK_AEX_GPU_TEST_DIR`で指定した既存AEXCompat出力ディレクトリの`gpu-optics-{cpu,gpu}-{1920x1080,1280x720}.png`を比較します。
+
+## Recovery（元の独立リポジトリ）
 
 全面移植前の状態は、元の独立したonmkFlareリポジトリのGitタグ `before-full-flaresim-port` に保存されています。以下はその独立リポジトリ内だけで使えます。モノレポへのソース取り込みには、このタグと過去の履歴は含まれません。
 

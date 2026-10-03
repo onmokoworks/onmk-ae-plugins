@@ -1,10 +1,12 @@
 use after_effects as ae;
 
+mod bloom_gpu;
 mod flare;
 mod gpu;
 mod lens;
 mod ocular;
 mod physical;
+mod source_gpu;
 mod source_optics;
 mod viewer;
 

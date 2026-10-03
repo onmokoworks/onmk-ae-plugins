@@ -93,6 +93,9 @@ pub struct GpuProcessor {
     bind_group_layout: BindGroupLayout,
     state: RwLock<HashMap<std::thread::ThreadId, BufferState>>,
     optical_cache: parking_lot::Mutex<Option<OpticalCache>>,
+    source_gpu: Option<crate::source_gpu::SourceGpu>,
+    bloom_gpu: Option<crate::bloom_gpu::BloomGpu>,
+    optical_gpu_guard: parking_lot::Mutex<()>,
     #[cfg(test)]
     optical_uploads: AtomicUsize,
 }
@@ -168,6 +171,169 @@ fn combine_optical_layers(
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "GPU source optics: HDR tolerance, final pixels and timing"]
+    fn gpu_source_qualification() {
+        let mut gpu = GpuProcessor::new();
+        gpu.source_gpu = None;
+        let stage =
+            crate::source_gpu::SourceGpu::new(&gpu.device).expect("source pipeline validation");
+        let mut ep = EffectParams {
+            unified_diffraction: 0.18,
+            global_scale: 1.0,
+            starburst_blades: 6,
+            hotspot_intensity: 1.6,
+            bloom_radius: 0.018,
+            bloom_strength: 0.6,
+            ..Default::default()
+        };
+        let sources = [
+            physical::BrightSource {
+                angle_x: -0.16,
+                angle_y: 0.05,
+                rgb: [1.0, 0.7, 0.3],
+            },
+            physical::BrightSource {
+                angle_x: 0.0,
+                angle_y: 0.0,
+                rgb: [0.2, 0.8, 1.0],
+            },
+            physical::BrightSource {
+                angle_x: 0.8,
+                angle_y: -0.4,
+                rgb: [3.0, 0.1, 0.5],
+            },
+        ];
+        for (case, (w, h, scale, blades, angle)) in [
+            (1, 1, 1.0, 6, 0.0),
+            (31, 17, 0.1, 3, 0.0),
+            (97, 61, 1.4, 7, 23.0),
+            (257, 129, 8.0, 16, -179.0),
+            (1920, 1080, 1.0, 6, 0.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ep.global_scale = scale;
+            ep.starburst_blades = blades;
+            ep.flare_angle = angle;
+            let start = std::time::Instant::now();
+            let cpu = crate::source_optics::render(&ep, &sources, w, h);
+            let cpu_time = start.elapsed();
+            let start = std::time::Instant::now();
+            let actual = stage
+                .render(&gpu.device, &gpu.queue, &ep, &sources, w, h)
+                .expect("GPU render");
+            let gpu_time = start.elapsed();
+            let mut max_error = 0.0_f32;
+            for (index, (a, b)) in cpu
+                .iter()
+                .flatten()
+                .zip(actual.iter().flatten())
+                .enumerate()
+            {
+                let error = (a - b).abs();
+                max_error = max_error.max(error);
+                assert!(
+                    error <= 2e-4 + a.abs() * 1e-4,
+                    "case={case} channel={index} CPU={a} GPU={b} error={error}"
+                );
+            }
+            eprintln!("source qualification {w}x{h}: CPU={cpu_time:?} GPU={gpu_time:?} max HDR error={max_error}");
+        }
+        assert!(stage
+            .render(&gpu.device, &gpu.queue, &ep, &sources, 0, 0)
+            .is_none());
+        assert!(stage
+            .render(&gpu.device, &gpu.queue, &ep, &sources, 8192, 8192)
+            .is_none());
+        let bad = [physical::BrightSource {
+            angle_x: f64::NAN,
+            angle_y: 0.0,
+            rgb: [1.0; 3],
+        }];
+        assert!(stage
+            .render(&gpu.device, &gpu.queue, &ep, &bad, 31, 17)
+            .is_none());
+        let empty = stage
+            .render(&gpu.device, &gpu.queue, &ep, &[], 31, 17)
+            .unwrap();
+        assert!(empty.iter().flatten().all(|v| *v == 0.0));
+
+        // Selection/truncation, equal energies, dense overlapping sources,
+        // minimum and maximum aperture settings, and zero diffraction.
+        let many: Vec<_> = (0..10)
+            .map(|i| physical::BrightSource {
+                angle_x: (i as f64 - 4.0) * 0.045,
+                angle_y: (i as f64 - 5.0) * 0.025,
+                rgb: if i % 2 == 0 {
+                    [1.0, 0.7, 0.3]
+                } else {
+                    [0.2, 0.8, 1.0]
+                },
+            })
+            .collect();
+        for diffraction in [0.0, 1.0] {
+            ep.unified_diffraction = diffraction;
+            let cpu = crate::source_optics::render(&ep, &many, 193, 109);
+            let actual = stage
+                .render(&gpu.device, &gpu.queue, &ep, &many, 193, 109)
+                .unwrap();
+            for (a, b) in cpu.iter().flatten().zip(actual.iter().flatten()) {
+                assert!((a - b).abs() <= 2e-4 + a.abs() * 1e-4);
+            }
+        }
+
+        // Complete composite checks, including both image halves and all four
+        // lens prescriptions. CPU reference is produced before toggling stage.
+        for lens in 0..4 {
+            ep = EffectParams {
+                light_x: 195.0,
+                light_y: 51.0,
+                source_mode: 1,
+                physical_enabled: true,
+                lens_preset: lens,
+                ray_grid: 12,
+                physical_gain: 3000.0,
+                ghost_intensity: 2.9,
+                global_brightness: 1.0,
+                global_scale: 1.0,
+                hotspot_intensity: 1.6,
+                starburst_blades: 6,
+                unified_diffraction: 0.18,
+                bloom_radius: 0.018,
+                bloom_strength: 0.6,
+                bloom_octaves: 4,
+                bloom_passes: 3,
+                flare_opacity: 1.0,
+                ..Default::default()
+            };
+            let (w, h) = (321, 181);
+            let mut input = vec![0u8; w * h * 4];
+            for p in input.chunks_exact_mut(4) {
+                p[0] = 255;
+            }
+            gpu.source_gpu = None;
+            gpu.optical_cache.lock().take();
+            let reference = gpu.process(&ep, &input, w, h);
+            gpu.source_gpu = Some(crate::source_gpu::SourceGpu::new(&gpu.device).unwrap());
+            gpu.optical_cache.lock().take();
+            let actual = gpu.process(&ep, &input, w, h);
+            let max = reference
+                .iter()
+                .zip(&actual)
+                .map(|(a, b)| a.abs_diff(*b))
+                .max()
+                .unwrap();
+            assert!(max <= 1, "lens {lens} final 8-bit error {max}");
+            assert!(actual
+                .chunks_exact(4)
+                .any(|p| p[1..].iter().any(|v| *v > 0)));
+            assert_eq!(actual, gpu.process(&ep, &input, w, h));
+            eprintln!("lens {lens} final max 8-bit error={max}");
+        }
+    }
 
     #[test]
     #[ignore = "colored ARGB byte-layout references; capture explicitly on baseline"]
@@ -351,6 +517,256 @@ mod cache_tests {
             }
             times.sort();
             eprintln!("1080p lens={lens} median={:?}", times[2]);
+        }
+    }
+
+    #[test]
+    #[ignore = "1080p full-frame CPU/GPU source optics A/B"]
+    fn benchmark_gpu_source_full() {
+        let mut gpu = GpuProcessor::new();
+        gpu.source_gpu = None;
+        gpu.bloom_gpu = None;
+        let mut stage = Some(crate::source_gpu::SourceGpu::new(&gpu.device).unwrap());
+        let mut bloom_stage = Some(crate::bloom_gpu::BloomGpu::new(&gpu.device).unwrap());
+        let (w, h) = (1920, 1080);
+        let mut src = vec![0u8; w * h * 4];
+        for p in src.chunks_exact_mut(4) {
+            p[0] = 255;
+        }
+        let mut ep = EffectParams {
+            light_x: 715.5,
+            light_y: 465.0,
+            global_scale: 1.0,
+            global_brightness: 1.0,
+            flare_opacity: 1.0,
+            source_opacity: 1.0,
+            source_mode: 1,
+            transfer_mode: 4,
+            physical_enabled: true,
+            ray_grid: 26,
+            physical_gain: 3000.0,
+            max_area_boost: 8.0,
+            ghost_intensity: 2.9,
+            ghost_normalize: true,
+            physical_ghost_blur: 0.005,
+            physical_blur_passes: 3,
+            bloom_strength: 0.6,
+            bloom_radius: 0.018,
+            bloom_passes: 3,
+            bloom_octaves: 4,
+            bloom_chromatic: true,
+            starburst_blades: 6,
+            unified_diffraction: 0.18,
+            hotspot_intensity: 1.6,
+            ..Default::default()
+        };
+        for lens in 0..2 {
+            ep.lens_preset = lens;
+            let mut cpu_times = Vec::new();
+            let mut gpu_times = Vec::new();
+            for frame in 0..5 {
+                ep.light_x = 715.5 + frame as f64 * 25.5;
+                gpu.optical_cache.lock().take();
+                let start = std::time::Instant::now();
+                let reference = gpu.process(&ep, &src, w, h);
+                cpu_times.push(start.elapsed());
+                gpu.source_gpu = stage.take();
+                gpu.bloom_gpu = bloom_stage.take();
+                gpu.optical_cache.lock().take();
+                let completed = gpu
+                    .source_gpu
+                    .as_ref()
+                    .unwrap()
+                    .completed
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let start = std::time::Instant::now();
+                let actual = gpu.process(&ep, &src, w, h);
+                gpu_times.push(start.elapsed());
+                assert_eq!(
+                    completed + 1,
+                    gpu.source_gpu
+                        .as_ref()
+                        .unwrap()
+                        .completed
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    "GPU stage must run, not silently fall back"
+                );
+                stage = gpu.source_gpu.take();
+                assert!(
+                    gpu.bloom_gpu
+                        .as_ref()
+                        .unwrap()
+                        .completed
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        > 0
+                );
+                bloom_stage = gpu.bloom_gpu.take();
+                gpu.optical_cache.lock().take();
+                let max = reference
+                    .iter()
+                    .zip(&actual)
+                    .map(|(a, b)| a.abs_diff(*b))
+                    .max()
+                    .unwrap();
+                let changed = reference
+                    .iter()
+                    .zip(&actual)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert!(
+                    max <= 1 && changed < reference.len() / 1000,
+                    "lens={lens} frame={frame} max={max} changed={changed}"
+                );
+                eprintln!(
+                    "full A/B lens={lens} frame={frame} max={max} changed channels={changed}"
+                );
+                if lens == 1 && frame == 0 {
+                    std::fs::create_dir_all("target").unwrap();
+                    let save = |bytes: &[u8], path: &str| {
+                        let rgba: Vec<u8> = bytes
+                            .chunks_exact(4)
+                            .flat_map(|p| [p[1], p[2], p[3], p[0]])
+                            .collect();
+                        image::RgbaImage::from_raw(w as u32, h as u32, rgba)
+                            .unwrap()
+                            .save(path)
+                            .unwrap();
+                    };
+                    save(&reference, "target/gpu-source-cpu-reference.png");
+                    save(&actual, "target/gpu-source-candidate.png");
+                }
+            }
+            cpu_times.sort();
+            gpu_times.sort();
+            eprintln!(
+                "full 1080p lens={lens} CPU-source median={:?} GPU-source median={:?}",
+                cpu_times[2], gpu_times[2]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "GPU Bloom reference comparisons and resource fallback"]
+    fn gpu_bloom_qualification() {
+        let gpu = GpuProcessor::new();
+        let stage =
+            crate::bloom_gpu::BloomGpu::new(&gpu.device).expect("Bloom pipeline validation");
+        for (w, h) in [(1, 1), (1, 31), (31, 1), (97, 61), (1920, 1080)] {
+            let mut input = vec![[0.0; 3]; w * h];
+            input[0] = [0.2, 0.7, 1.0];
+            input[w * h / 2] = [1.0, 0.3, 0.6];
+            input[w * h - 1] = [0.1, 0.4, 0.2];
+            for octaves in [1, 4, 6] {
+                let cfg = physical::Config {
+                    bloom_strength: 0.6,
+                    bloom_radius: 0.018,
+                    bloom_passes: 3,
+                    bloom_octaves: octaves,
+                    bloom_chromatic: true,
+                    ..Default::default()
+                };
+                let start = std::time::Instant::now();
+                let reference = physical::bloom(&input, w, h, cfg);
+                let cpu_time = start.elapsed();
+                let start = std::time::Instant::now();
+                let actual = stage
+                    .render(&gpu.device, &gpu.queue, &input, w, h, cfg)
+                    .expect("GPU Bloom");
+                let gpu_time = start.elapsed();
+                let mut max_error = 0.0_f32;
+                for (i, (a, b)) in reference
+                    .iter()
+                    .flatten()
+                    .zip(actual.iter().flatten())
+                    .enumerate()
+                {
+                    let error = (a - b).abs();
+                    max_error = max_error.max(error);
+                    assert!(
+                        error <= 1e-7 + a.abs() * 5e-5,
+                        "{w}x{h},octaves={octaves},channel={i},CPU={a},GPU={b}"
+                    );
+                }
+                eprintln!("Bloom {w}x{h} octaves={octaves} CPU={cpu_time:?} GPU={gpu_time:?} max={max_error}");
+            }
+        }
+        for v in [-0.0, -1.0, f32::NAN, f32::INFINITY, f32::MAX] {
+            assert!(stage
+                .render(
+                    &gpu.device,
+                    &gpu.queue,
+                    &[[v; 3]],
+                    1,
+                    1,
+                    physical::Config::default()
+                )
+                .is_none());
+        }
+        // Dense input also exercises prefix cancellation, edge windows, and
+        // the radius>=frame branch, not just sparse impulse fixtures.
+        let (w, h) = (79, 43);
+        let dense: Vec<_> = (0..w * h)
+            .map(|i| {
+                [
+                    (i % 17) as f32 / 17.0,
+                    (i % 7) as f32 / 7.0,
+                    (i % 23) as f32 / 23.0,
+                ]
+            })
+            .collect();
+        for passes in [0, 1, 4] {
+            for radius in [0.0, 0.02, 10.0] {
+                let cfg = physical::Config {
+                    bloom_strength: 2.5,
+                    bloom_radius: radius,
+                    bloom_passes: passes,
+                    bloom_octaves: 6,
+                    bloom_chromatic: false,
+                    ..Default::default()
+                };
+                let cpu = physical::bloom(&dense, w, h, cfg);
+                let actual = stage
+                    .render(&gpu.device, &gpu.queue, &dense, w, h, cfg)
+                    .unwrap();
+                for (a, b) in cpu.iter().flatten().zip(actual.iter().flatten()) {
+                    assert!(
+                        (a - b).abs() <= 1e-7 + a.abs() * 5e-5,
+                        "dense CPU={a} GPU={b}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "compare existing AEXCompat CPU/GPU PNG results"]
+    fn aex_gpu_output_comparison() {
+        let directory = std::env::var("ONMK_AEX_GPU_TEST_DIR").expect("AEXCompat result directory");
+        for size in ["1920x1080", "1280x720"] {
+            let cpu = image::open(format!("{directory}/gpu-optics-cpu-{size}.png"))
+                .unwrap()
+                .into_rgba8();
+            let gpu = image::open(format!("{directory}/gpu-optics-gpu-{size}.png"))
+                .unwrap()
+                .into_rgba8();
+            assert_eq!(cpu.dimensions(), gpu.dimensions());
+            let expected = if size == "1920x1080" {
+                (1920, 1080)
+            } else {
+                (1280, 720)
+            };
+            assert_eq!(gpu.dimensions(), expected);
+            let mut count = 0;
+            let mut max = 0;
+            for (a, b) in cpu.as_raw().iter().zip(gpu.as_raw()) {
+                max = max.max(a.abs_diff(*b));
+                count += usize::from(a != b);
+            }
+            assert!(
+                max <= 1 && count < cpu.as_raw().len() / 1000,
+                "{size}: max={max} changed={count}"
+            );
+            eprintln!("AEXCompat {size}: max 8-bit difference={max}, changed channels={count}");
         }
     }
 
@@ -541,6 +957,17 @@ impl GpuProcessor {
             cache: Default::default(),
         });
 
+        // Explicit opt-in until cross-device/AE qualification is complete.
+        let source_gpu = if std::env::var("ONMK_GPU_SOURCE_OPTICS").as_deref() == Ok("1") {
+            crate::source_gpu::SourceGpu::new(&device)
+        } else {
+            None
+        };
+        let bloom_gpu = if std::env::var("ONMK_GPU_BLOOM").as_deref() == Ok("1") {
+            crate::bloom_gpu::BloomGpu::new(&device)
+        } else {
+            None
+        };
         Self {
             device,
             queue,
@@ -548,6 +975,9 @@ impl GpuProcessor {
             bind_group_layout,
             state: RwLock::new(HashMap::new()),
             optical_cache: parking_lot::Mutex::new(None),
+            source_gpu,
+            bloom_gpu,
+            optical_gpu_guard: parking_lot::Mutex::new(()),
             #[cfg(test)]
             optical_uploads: AtomicUsize::new(0),
         }
@@ -720,7 +1150,14 @@ impl GpuProcessor {
                     let start = std::time::Instant::now();
                     if ep.physical_enabled {
                         let bloom_source = physical::source_layer(&sources, w, h);
-                        let result = physical::bloom(&bloom_source, w, h, cfg);
+                        let result = self
+                            .bloom_gpu
+                            .as_ref()
+                            .and_then(|gpu| {
+                                let _guard = self.optical_gpu_guard.lock();
+                                gpu.render(&self.device, &self.queue, &bloom_source, w, h, cfg)
+                            })
+                            .unwrap_or_else(|| physical::bloom(&bloom_source, w, h, cfg));
                         #[cfg(test)]
                         eprintln!("bloom: {:?}", start.elapsed());
                         result
@@ -732,7 +1169,14 @@ impl GpuProcessor {
                 let source_job = scope.spawn(|| {
                     #[cfg(test)]
                     let start = std::time::Instant::now();
-                    let result = crate::source_optics::render(ep, &sources, w, h);
+                    let result = self
+                        .source_gpu
+                        .as_ref()
+                        .and_then(|gpu| {
+                            let _guard = self.optical_gpu_guard.lock();
+                            gpu.render(&self.device, &self.queue, ep, &sources, w, h)
+                        })
+                        .unwrap_or_else(|| crate::source_optics::render(ep, &sources, w, h));
                     #[cfg(test)]
                     eprintln!("source optics: {:?}", start.elapsed());
                     result

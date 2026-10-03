@@ -1,0 +1,5 @@
+PluginName := "onmkFlare"
+BinaryName := "onmk_flare"
+BundleIdentifier := "com.onmk.onmkFlare"
+
+import "AdobePlugin.just"

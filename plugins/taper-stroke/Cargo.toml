@@ -1,0 +1,21 @@
+[package]
+name = "taper-stroke"
+version = "0.3.1"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+coordinate-trace = []
+
+[dependencies]
+after-effects = { git = "https://github.com/virtualritz/after-effects.git", rev = "0e0b197850f28c1bb24e8c82fce2e3d4c120d1e9" }
+
+[build-dependencies]
+pipl = { git = "https://github.com/virtualritz/after-effects.git", rev = "0e0b197850f28c1bb24e8c82fce2e3d4c120d1e9" }
+winres = "0.1.12"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

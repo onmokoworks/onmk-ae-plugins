@@ -738,56 +738,143 @@ fn bands_to_gpu(bands: &[Band]) -> ([gpu::GpuBand; MAX_BANDS], usize) {
 }
 
 /// Layer → row-major RGBA f32 0..1 (alpha first in slice order A,R,G,B per pixel).
-fn box_blur_1ch(src: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
+fn float_plane(w:usize,h:usize,channels:usize)->Result<Vec<f32>,ae::Error> {
+    let count=w.checked_mul(h).and_then(|n|n.checked_mul(channels)).ok_or(ae::Error::OutOfMemory)?;
+    let mut values=Vec::new();
+    values.try_reserve_exact(count).map_err(|_|ae::Error::OutOfMemory)?;
+    values.resize(count,0.0);
+    Ok(values)
+}
+
+fn box_blur_1ch(src: &[f32], w: usize, h: usize, radius: usize) -> Result<Vec<f32>,ae::Error> {
+    if Some(src.len())!=w.checked_mul(h) {return Err(ae::Error::BadCallbackParameter);}
     if radius == 0 || w == 0 || h == 0 {
-        return src.to_vec();
+        let mut out=float_plane(w,h,1)?;
+        out.copy_from_slice(src);
+        return Ok(out);
     }
 
-    let mut tmp = vec![0.0f32; w * h];
-    let mut out = vec![0.0f32; w * h];
+    let mut tmp = float_plane(w,h,1)?;
+    let mut out = float_plane(w,h,1)?;
+    let mut prefix=float_plane(w.max(h).checked_add(1).ok_or(ae::Error::OutOfMemory)?,1,1)?;
 
     for y in 0..h {
-        let mut prefix = vec![0.0f32; w + 1];
+        prefix[0]=0.0;
         for x in 0..w {
             prefix[x + 1] = prefix[x] + src[y * w + x];
         }
         for x in 0..w {
             let left = x.saturating_sub(radius);
-            let right = (x + radius).min(w - 1);
+            let right = x.saturating_add(radius).min(w - 1);
             tmp[y * w + x] = (prefix[right + 1] - prefix[left]) / (right - left + 1) as f32;
         }
     }
 
     for x in 0..w {
-        let mut prefix = vec![0.0f32; h + 1];
+        prefix[0]=0.0;
         for y in 0..h {
             prefix[y + 1] = prefix[y] + tmp[y * w + x];
         }
         for y in 0..h {
             let top = y.saturating_sub(radius);
-            let bottom = (y + radius).min(h - 1);
+            let bottom = y.saturating_add(radius).min(h - 1);
             out[y * w + x] = (prefix[bottom + 1] - prefix[top]) / (bottom - top + 1) as f32;
         }
     }
 
-    out
+    Ok(out)
 }
 
-fn layer_to_rgba_f32(layer: &ae::Layer) -> (Vec<f32>, usize, usize) {
+#[test]
+fn blur_workspace_matches_direct_average_and_rejects_bad_sizes() {
+    assert!(float_plane(usize::MAX,2,4).is_err());
+    assert!(float_plane(usize::MAX,1,1).is_err());
+    assert!(box_blur_1ch(&[0.0],2,2,0).is_err());
+    assert!(box_blur_1ch(&[],0,7,2).unwrap().is_empty());
+    for (w,h) in [(1,1),(1,7),(9,1),(7,9)] {for radius in [0,1,3,64,usize::MAX] {
+        let src:Vec<f32>=(0..w*h).map(|i|(i%11) as f32/10.0).collect();
+        let out=box_blur_1ch(&src,w,h,radius).unwrap();
+        for y in 0..h {for x in 0..w {
+            let mut sum=0.0f64; let mut count=0;
+            for sy in y.saturating_sub(radius)..=y.saturating_add(radius).min(h-1) {
+                for sx in x.saturating_sub(radius)..=x.saturating_add(radius).min(w-1) {sum+=src[sy*w+sx] as f64;count+=1;}
+            }
+            assert!((out[y*w+x] as f64-sum/count as f64).abs()<1e-6);
+        }}
+    }}
+}
+
+fn depth_from_format(format: ae::PixelFormat) -> Result<i16, ae::Error> {
+    match format {
+        ae::PixelFormat::Argb32 => Ok(8),
+        ae::PixelFormat::Argb64 => Ok(16),
+        ae::PixelFormat::Argb128 => Ok(32),
+        _ => Err(ae::Error::BadCallbackParameter),
+    }
+}
+
+#[test]
+fn cpu_world_formats_are_explicit() {
+    assert_eq!(depth_from_format(ae::PixelFormat::Argb32).unwrap(), 8);
+    assert_eq!(depth_from_format(ae::PixelFormat::Argb64).unwrap(), 16);
+    assert_eq!(depth_from_format(ae::PixelFormat::Argb128).unwrap(), 32);
+    assert!(depth_from_format(ae::PixelFormat::GpuBgra128).is_err());
+}
+
+fn checked_layout(w:usize,h:usize,row_bytes:isize,depth:i16)->Result<usize,ae::Error> {
+    if ![8,16,32].contains(&depth) || w>i32::MAX as usize || h>i32::MAX as usize || row_bytes==i32::MIN as isize {
+        return Err(ae::Error::BadCallbackParameter);
+    }
+    let stride=row_bytes.unsigned_abs();
+    let row=w.checked_mul(depth as usize/2).ok_or(ae::Error::OutOfMemory)?;
+    let length=stride.checked_mul(h).ok_or(ae::Error::OutOfMemory)?;
+    if w!=0 && h!=0 && (stride<row || length>isize::MAX as usize) {return Err(ae::Error::BadCallbackParameter);}
+    Ok(stride)
+}
+
+fn world_stride(layer:&ae::Layer,depth:i16)->Result<usize,ae::Error> {
+    let stride=checked_layout(layer.width(),layer.height(),layer.row_bytes(),depth)?;
+    if depth_from_format(layer.pixel_format()?)?!=depth {return Err(ae::Error::BadCallbackParameter);}
+    if layer.width()!=0 && layer.height()!=0 && unsafe{layer.data_ptr()}.is_null() {return Err(ae::Error::BadCallbackParameter);}
+    Ok(stride)
+}
+
+fn physical_row(y:usize,h:usize,negative:bool)->usize {if negative {h-1-y}else{y}}
+
+#[test]
+fn legacy_world_layout_checks_depth_stride_and_orientation() {
+    for depth in [8,16,32] {
+        let stride=17*depth as usize/2+5;
+        assert_eq!(checked_layout(17,31,stride as isize,depth),Ok(stride));
+        assert_eq!(checked_layout(17,31,-(stride as isize),depth),Ok(stride));
+        assert!(checked_layout(17,31,1,depth).is_err());
+    }
+    assert!(checked_layout(1,1,4,12).is_err());
+    assert!(checked_layout(1,1,i32::MIN as isize,8).is_err());
+    assert!(checked_layout(i32::MAX as usize+1,1,4,8).is_err());
+    assert!(checked_layout(1,2,isize::MAX,8).is_err());
+    assert_eq!((0..3).map(|y|physical_row(y,3,true)).collect::<Vec<_>>(),[2,1,0]);
+    assert_eq!((0..3).map(|y|physical_row(y,3,false)).collect::<Vec<_>>(),[0,1,2]);
+}
+
+fn layer_to_rgba_f32(layer: &ae::Layer, depth: i16) -> Result<(Vec<f32>, usize, usize),ae::Error> {
     let w = layer.width() as usize;
     let h = layer.height() as usize;
     if w == 0 || h == 0 {
-        return (Vec::new(), 0, 0);
+        return Ok((Vec::new(), 0, 0));
     }
-    let depth = layer.bit_depth();
-    let stride = layer.buffer_stride();
+    let stride = world_stride(layer,depth)?;
+    let negative = layer.row_bytes()<0;
     let buf = layer.buffer();
-    let mut out = vec![0.0f32; w * h * 4];
+    let count=w.checked_mul(h).and_then(|n|n.checked_mul(4)).ok_or(ae::Error::OutOfMemory)?;
+    let mut out=Vec::new();
+    out.try_reserve_exact(count).map_err(|_|ae::Error::OutOfMemory)?;
+    out.resize(count,0.0f32);
     match depth {
         32 => {
             for y in 0..h {
                 for x in 0..w {
-                    let si = y * stride + x * 16;
+                    let si = physical_row(y,h,negative) * stride + x * 16;
                     let di = (y * w + x) * 4;
                     if si + 15 < buf.len() && di + 3 < out.len() {
                         for ch in 0..4 {
@@ -806,7 +893,7 @@ fn layer_to_rgba_f32(layer: &ae::Layer) -> (Vec<f32>, usize, usize) {
         16 => {
             for y in 0..h {
                 for x in 0..w {
-                    let si = y * stride + x * 8;
+                    let si = physical_row(y,h,negative) * stride + x * 8;
                     let di = (y * w + x) * 4;
                     if si + 7 < buf.len() && di + 3 < out.len() {
                         for ch in 0..4 {
@@ -820,7 +907,7 @@ fn layer_to_rgba_f32(layer: &ae::Layer) -> (Vec<f32>, usize, usize) {
         _ => {
             for y in 0..h {
                 for x in 0..w {
-                    let si = y * stride + x * 4;
+                    let si = physical_row(y,h,negative) * stride + x * 4;
                     let di = (y * w + x) * 4;
                     if si + 3 < buf.len() && di + 3 < out.len() {
                         for ch in 0..4 {
@@ -831,19 +918,21 @@ fn layer_to_rgba_f32(layer: &ae::Layer) -> (Vec<f32>, usize, usize) {
             }
         }
     }
-    (out, w, h)
+    Ok((out, w, h))
 }
 
-fn write_rgba_f32_to_layer(flat: &[f32], layer: &mut ae::Layer, w: usize, h: usize) {
-    let depth = layer.bit_depth();
-    let stride = layer.buffer_stride();
+fn write_rgba_f32_to_layer(flat: &[f32], layer: &mut ae::Layer, w: usize, h: usize, depth: i16) -> Result<(),ae::Error> {
+    if (w,h)!=(layer.width(),layer.height()) || Some(flat.len())!=w.checked_mul(h).and_then(|n|n.checked_mul(4)) {return Err(ae::Error::BadCallbackParameter);}
+    if w==0 || h==0 {return Ok(());}
+    let stride = world_stride(layer,depth)?;
+    let negative = layer.row_bytes()<0;
     let buf = layer.buffer_mut();
     match depth {
         32 => {
             for y in 0..h {
                 for x in 0..w {
                     let si = (y * w + x) * 4;
-                    let di = y * stride + x * 16;
+                    let di = physical_row(y,h,negative) * stride + x * 16;
                     if si + 3 < flat.len() && di + 15 < buf.len() {
                         for ch in 0..4 {
                             let bytes = flat[si + ch].to_ne_bytes();
@@ -860,7 +949,7 @@ fn write_rgba_f32_to_layer(flat: &[f32], layer: &mut ae::Layer, w: usize, h: usi
             for y in 0..h {
                 for x in 0..w {
                     let si = (y * w + x) * 4;
-                    let di = y * stride + x * 8;
+                    let di = physical_row(y,h,negative) * stride + x * 8;
                     if si + 3 < flat.len() && di + 7 < buf.len() {
                         for ch in 0..4 {
                             let v = ((flat[si + ch].clamp(0.0, 1.0)) * 32768.0).round() as u16;
@@ -876,13 +965,62 @@ fn write_rgba_f32_to_layer(flat: &[f32], layer: &mut ae::Layer, w: usize, h: usi
             for y in 0..h {
                 for x in 0..w {
                     let si = (y * w + x) * 4;
-                    let di = y * stride + x * 4;
+                    let di = physical_row(y,h,negative) * stride + x * 4;
                     if si + 3 < flat.len() && di + 3 < buf.len() {
                         for ch in 0..4 {
                             buf[di + ch] = (flat[si + ch] * 255.0).clamp(0.0, 255.0) as u8;
                         }
                     }
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn with_input_checkin(
+    work: impl FnOnce()->Result<(),ae::Error>,
+    checkin: impl FnOnce()->Result<(),ae::Error>,
+)->Result<(),ae::Error> {
+    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+    let cleanup=checkin();
+    match result {Ok(result)=>result.and(cleanup),Err(payload)=>std::panic::resume_unwind(payload)}
+}
+
+#[test]
+fn input_checkin_covers_early_errors_and_unwind() {
+    for mode in 0..3 {for release_fails in [false,true] {
+        let calls=std::cell::Cell::new(0);
+        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_input_checkin(||match mode {
+                0=>Ok(()),1=>Err(ae::Error::BadCallbackParameter),_=>panic!("work failure"),
+            },||{calls.set(calls.get()+1);if release_fails{Err(ae::Error::Generic)}else{Ok(())}})
+        }));
+        assert_eq!(calls.get(),1);
+        match mode {
+            0=>assert_eq!(result.unwrap(),if release_fails{Err(ae::Error::Generic)}else{Ok(())}),
+            1=>assert_eq!(result.unwrap(),Err(ae::Error::BadCallbackParameter)),
+            _=>assert!(result.is_err()),
+        }
+    }}
+}
+
+// Callers validate world dimensions before iterating offsets. Widen before
+// either operation: valid i32 origins can differ by more than i32::MAX.
+fn plane_coordinate(origin: i32, plane_start: i32, offset: usize) -> i64 {
+    i64::from(origin) - i64::from(plane_start) + offset as i64
+}
+
+#[test]
+fn plane_coordinates_do_not_wrap_into_the_input() {
+    assert_eq!(plane_coordinate(i32::MIN, i32::MAX, 0), -4_294_967_295);
+    assert_eq!(plane_coordinate(i32::MAX, i32::MIN, 1), 4_294_967_296);
+    assert_eq!(plane_coordinate(i32::MAX, i32::MAX, 31), 31);
+    for origin in [-127, 0, 91] {
+        for plane in [-63, 0, 75] {
+            for offset in 0..65 {
+                assert_eq!(plane_coordinate(origin, plane, offset),
+                    i64::from(origin + offset as i32 - plane));
             }
         }
     }
@@ -897,23 +1035,31 @@ fn smart_render(
     let Some(input_world) = cb.checkout_layer_pixels(0)? else {
         return Ok(());
     };
+    with_input_checkin(|| {
     let Some(mut output_world) = cb.checkout_output()? else {
-        let _ = cb.checkin_layer_pixels(0);
         return Ok(());
     };
 
+    let formats = (|| -> Result<_, ae::Error> {
+        Ok((depth_from_format(input_world.pixel_format()?)?,
+            depth_from_format(output_world.pixel_format()?)?))
+    })();
+    let (input_depth, output_depth) = match formats {
+        Ok(depths) => depths,
+        Err(err) => return Err(err),
+    };
     let out_w = output_world.width() as usize;
     let out_h = output_world.height() as usize;
     if out_w == 0 || out_h == 0 {
-        let _ = cb.checkin_layer_pixels(0);
         return Ok(());
     }
+    world_stride(&output_world, output_depth)?;
 
     let plane = match extra.pre_render_data::<CelGlowPlane>() {
         Some(p) => p.input_plane,
         None => {
-            let (inf, iw, ih) = layer_to_rgba_f32(&input_world);
-            let mut flat = vec![0.0f32; out_w * out_h * 4];
+            let (inf, iw, ih) = layer_to_rgba_f32(&input_world, input_depth)?;
+            let mut flat = float_plane(out_w,out_h,4)?;
             for y in 0..out_h.min(ih) {
                 for x in 0..out_w.min(iw) {
                     let s = (y * iw + x) * 4;
@@ -923,30 +1069,26 @@ fn smart_render(
                     }
                 }
             }
-            write_rgba_f32_to_layer(&flat, &mut output_world, out_w, out_h);
-            let _ = cb.checkin_layer_pixels(0);
+            write_rgba_f32_to_layer(&flat, &mut output_world, out_w, out_h, output_depth)?;
             return Ok(());
         }
     };
 
     let view = params.get(Params::View)?.as_popup()?.value() as i32;
 
-    let (rgba_in, iw, ih) = layer_to_rgba_f32(&input_world);
+    let (rgba_in, iw, ih) = layer_to_rgba_f32(&input_world, input_depth)?;
     if iw == 0 || ih == 0 {
-        let _ = cb.checkin_layer_pixels(0);
         return Ok(());
     }
     let ox0 = in_data.output_origin().h;
     let oy0 = in_data.output_origin().v;
-    let mut out_flat = vec![0.0f32; out_w * out_h * 4];
+    let mut out_flat = float_plane(out_w,out_h,4)?;
 
     if view == 3 {
         for y in 0..out_h {
             for x in 0..out_w {
-                let layer_x = ox0 + x as i32;
-                let layer_y = oy0 + y as i32;
-                let ix = layer_x - plane.left;
-                let iy = layer_y - plane.top;
+                let ix = plane_coordinate(ox0, plane.left, x);
+                let iy = plane_coordinate(oy0, plane.top, y);
                 if ix >= 0 && iy >= 0 && (ix as usize) < iw && (iy as usize) < ih {
                     let si = ((iy as usize) * iw + ix as usize) * 4;
                     let di = (y * out_w + x) * 4;
@@ -954,8 +1096,7 @@ fn smart_render(
                 }
             }
         }
-        write_rgba_f32_to_layer(&out_flat, &mut output_world, out_w, out_h);
-        let _ = cb.checkin_layer_pixels(0);
+        write_rgba_f32_to_layer(&out_flat, &mut output_world, out_w, out_h, output_depth)?;
         return Ok(());
     }
 
@@ -1052,14 +1193,13 @@ fn smart_render(
                 bands: gpu_bands,
             };
             if let Some(flat) = gpu.process_with_gpu_edt(&input) {
-                write_rgba_f32_to_layer(&flat, &mut output_world, out_w, out_h);
-                let _ = cb.checkin_layer_pixels(0);
+                write_rgba_f32_to_layer(&flat, &mut output_world, out_w, out_h, output_depth)?;
                 return Ok(());
             }
         }
     }
 
-    let mut soft = vec![0.0f32; iw * ih];
+    let mut soft = float_plane(iw,ih,1)?;
     for y in 0..ih {
         for x in 0..iw {
             let i = (y * iw + x) * 4;
@@ -1099,16 +1239,16 @@ fn smart_render(
         }
     }
     if source_blur > 0 {
-        soft = box_blur_1ch(&soft, iw, ih, source_blur);
+        soft = box_blur_1ch(&soft, iw, ih, source_blur)?;
     }
 
-    let mut bin = vec![0.0f32; iw * ih];
+    let mut bin = float_plane(iw,ih,1)?;
     for (dst, &m) in bin.iter_mut().zip(&soft) {
         *dst = if m > 0.001 { 1.0 } else { 0.0 };
     }
 
-    let mut dist = vec![0.0f32; iw * ih];
-    edt::euclidean_dt(&bin, iw, ih, &mut dist);
+    let mut dist = float_plane(iw,ih,1)?;
+    edt::euclidean_dt(&bin, iw, ih, &mut dist)?;
     let mut max_d = 1.0f32;
     for &d in &dist {
         if d < 1e18 {
@@ -1158,18 +1298,15 @@ fn smart_render(
             bands: gpu_bands,
         };
         if let Some(flat) = gpu.process(&input) {
-            write_rgba_f32_to_layer(&flat, &mut output_world, out_w, out_h);
-            let _ = cb.checkin_layer_pixels(0);
+            write_rgba_f32_to_layer(&flat, &mut output_world, out_w, out_h, output_depth)?;
             return Ok(());
         }
     }
 
     for y in 0..out_h {
         for x in 0..out_w {
-            let layer_x = ox0 + x as i32;
-            let layer_y = oy0 + y as i32;
-            let ix = layer_x - plane.left;
-            let iy = layer_y - plane.top;
+            let ix = plane_coordinate(ox0, plane.left, x);
+            let iy = plane_coordinate(oy0, plane.top, y);
 
             let (mut in_r, mut in_g, mut in_b, mut in_a) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
             let mut d_px = max_d;
@@ -1248,7 +1385,7 @@ fn smart_render(
         }
     }
 
-    write_rgba_f32_to_layer(&out_flat, &mut output_world, out_w, out_h);
-    let _ = cb.checkin_layer_pixels(0);
+    write_rgba_f32_to_layer(&out_flat, &mut output_world, out_w, out_h, output_depth)?;
     Ok(())
+    },||cb.checkin_layer_pixels(0))
 }

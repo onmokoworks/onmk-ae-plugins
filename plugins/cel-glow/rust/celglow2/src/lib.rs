@@ -516,18 +516,79 @@ fn read_view(p: &ae::Parameters<Params>) -> Result<celglow_core::DebugView, ae::
     })
 }
 
-fn layer_to_rgba_f32(layer: &ae::Layer) -> (Vec<f32>, usize, usize) {
+fn depth_from_format(format: ae::PixelFormat) -> Result<i16, ae::Error> {
+    match format {
+        ae::PixelFormat::Argb32 => Ok(8),
+        ae::PixelFormat::Argb64 => Ok(16),
+        ae::PixelFormat::Argb128 => Ok(32),
+        _ => Err(ae::Error::BadCallbackParameter),
+    }
+}
+
+#[test]
+fn cpu_world_formats_are_explicit() {
+    assert_eq!(depth_from_format(ae::PixelFormat::Argb32).unwrap(), 8);
+    assert_eq!(depth_from_format(ae::PixelFormat::Argb64).unwrap(), 16);
+    assert_eq!(depth_from_format(ae::PixelFormat::Argb128).unwrap(), 32);
+    assert!(depth_from_format(ae::PixelFormat::GpuBgra128).is_err());
+}
+
+fn checked_layout(w:usize,h:usize,row_bytes:isize,bpp:usize)->Result<usize,ae::Error> {
+    if w>i32::MAX as usize || h>i32::MAX as usize || row_bytes==i32::MIN as isize {
+        return Err(ae::Error::BadCallbackParameter);
+    }
+    let stride=row_bytes.unsigned_abs();
+    let row=w.checked_mul(bpp).ok_or(ae::Error::OutOfMemory)?;
+    let length=stride.checked_mul(h).ok_or(ae::Error::OutOfMemory)?;
+    if w!=0 && h!=0 && (stride<row || length>isize::MAX as usize) {
+        return Err(ae::Error::BadCallbackParameter);
+    }
+    Ok(stride)
+}
+
+fn checked_world_layout(layer:&ae::Layer,depth:i16)->Result<usize,ae::Error> {
+    let stride=checked_layout(layer.width(),layer.height(),layer.row_bytes(),depth as usize/2)?;
+    if layer.width()!=0 && layer.height()!=0 && unsafe{layer.data_ptr()}.is_null() {
+        return Err(ae::Error::BadCallbackParameter);
+    }
+    Ok(stride)
+}
+
+fn physical_row(y:usize,h:usize,bottom_up:bool)->usize {
+    if bottom_up {h-1-y} else {y}
+}
+
+#[test]
+fn world_layout_rejects_short_rows_and_maps_negative_stride() {
+    for bpp in [4,8,16] {
+        let stride=17*bpp+7;
+        assert_eq!(checked_layout(17,31,stride as isize,bpp),Ok(stride));
+        assert_eq!(checked_layout(17,31,-(stride as isize),bpp),Ok(stride));
+        assert!(checked_layout(17,31,(17*bpp-1) as isize,bpp).is_err());
+    }
+    assert!(checked_layout(1,1,i32::MIN as isize,4).is_err());
+    assert!(checked_layout(i32::MAX as usize+1,1,4,4).is_err());
+    assert!(checked_layout(1,2,isize::MAX,4).is_err());
+    assert_eq!((0..3).map(|y|physical_row(y,3,true)).collect::<Vec<_>>(),[2,1,0]);
+    assert_eq!((0..3).map(|y|physical_row(y,3,false)).collect::<Vec<_>>(),[0,1,2]);
+}
+
+fn layer_to_rgba_f32(layer: &ae::Layer) -> Result<(Vec<f32>, usize, usize), ae::Error> {
     let w = layer.width() as usize;
     let h = layer.height() as usize;
-    if w == 0 || h == 0 { return (Vec::new(), 0, 0); }
-    let depth = layer.bit_depth();
-    let stride = layer.buffer_stride();
+    if w == 0 || h == 0 { return Ok((Vec::new(), 0, 0)); }
+    let depth = depth_from_format(layer.pixel_format()?)?;
+    let stride = checked_world_layout(layer, depth)?;
+    let bottom_up = layer.row_bytes() < 0;
     let buf = layer.buffer();
-    let mut out = vec![0.0f32; w * h * 4];
+    let count=w.checked_mul(h).and_then(|n|n.checked_mul(4)).ok_or(ae::Error::OutOfMemory)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(count).map_err(|_|ae::Error::OutOfMemory)?;
+    out.resize(count,0.0f32);
     let (bytes_per_pixel, scale) = match depth { 32 => (16, 1.0), 16 => (8, 1.0 / 32768.0), _ => (4, 1.0 / 255.0) };
     for y in 0..h {
         for x in 0..w {
-            let si = y * stride + x * bytes_per_pixel;
+            let si = physical_row(y,h,bottom_up) * stride + x * bytes_per_pixel;
             let di = (y * w + x) * 4;
             if si + bytes_per_pixel <= buf.len() {
                 // PF_Pixel is laid out as alpha, red, green, blue. The core
@@ -555,19 +616,53 @@ fn layer_to_rgba_f32(layer: &ae::Layer) -> (Vec<f32>, usize, usize) {
             }
         }
     }
-    (out, w, h)
+    Ok((out, w, h))
 }
 
-fn write_rgba_f32_to_layer(flat: &[f32], layer: &mut ae::Layer, w: usize, h: usize) {
-    let depth = layer.bit_depth();
-    let stride = layer.buffer_stride();
+fn sanitize_output(values: &mut [f32], depth: i16) {
+    for value in values {
+        *value = if !value.is_finite() { 0.0 }
+            else if depth == 32 { *value }
+            else { value.clamp(0.0, 1.0) };
+    }
+}
+
+fn premultiplied_output(rgb: f32, alpha: f32, depth: i16) -> f32 {
+    let value = rgb * alpha;
+    if depth == 32 { value } else { value.clamp(0.0, 1.0) }
+}
+
+#[test]
+fn output_boundary_preserves_float_hdr_and_sanitizes_nonfinite() {
+    let mut rgba = [8.0, -2.0, f32::NAN, 0.5];
+    sanitize_output(&mut rgba, 32);
+    assert_eq!(rgba, [8.0, -2.0, 0.0, 0.5]);
+    assert_eq!(premultiplied_output(rgba[0], rgba[3], 32), 4.0);
+    assert_eq!(premultiplied_output(rgba[1], rgba[3], 32), -1.0);
+    for depth in [8, 16] {
+        let mut legacy = [8.0, -2.0, f32::INFINITY, 0.5];
+        sanitize_output(&mut legacy, depth);
+        assert_eq!(legacy, [1.0, 0.0, 0.0, 0.5]);
+        assert_eq!(premultiplied_output(legacy[0], legacy[3], depth), 0.5);
+    }
+}
+
+fn write_rgba_f32_to_layer(flat: &[f32], layer: &mut ae::Layer, w: usize, h: usize) -> Result<(), ae::Error> {
+    let depth = depth_from_format(layer.pixel_format()?)?;
+    if (w,h)!=(layer.width(),layer.height())
+        || Some(flat.len())!=w.checked_mul(h).and_then(|n|n.checked_mul(4)) {
+        return Err(ae::Error::BadCallbackParameter);
+    }
+    if w==0 || h==0 {return Ok(());}
+    let stride = checked_world_layout(layer, depth)?;
+    let bottom_up = layer.row_bytes() < 0;
     let buf = layer.buffer_mut();
     for y in 0..h {
         for x in 0..w {
             let si = (y * w + x) * 4;
             if si + 3 >= flat.len() { continue; }
             let (bytes_per_pixel, scale) = match depth { 32 => (16, 1.0), 16 => (8, 32768.0), _ => (4, 255.0) };
-            let di = y * stride + x * bytes_per_pixel;
+            let di = physical_row(y,h,bottom_up) * stride + x * bytes_per_pixel;
             if di + bytes_per_pixel > buf.len() { continue; }
             // PF_Pixel is alpha, red, green, blue while `flat` is RGBA.
             let alpha = flat[si + 3].clamp(0.0, 1.0);
@@ -577,7 +672,7 @@ fn write_rgba_f32_to_layer(flat: &[f32], layer: &mut ae::Layer, w: usize, h: usi
                 let v = if src_ch == 3 {
                     alpha
                 } else {
-                    (flat[si + src_ch] * alpha).clamp(0.0, 1.0)
+                    premultiplied_output(flat[si + src_ch], alpha, depth)
                 };
                 match depth {
                     32 => { let b = v.to_ne_bytes(); buf[di + ae_ch * 4..di + ae_ch * 4 + 4].copy_from_slice(&b); }
@@ -587,13 +682,55 @@ fn write_rgba_f32_to_layer(flat: &[f32], layer: &mut ae::Layer, w: usize, h: usi
             }
         }
     }
+    Ok(())
+}
+
+// The caller already owns an input checkout. Transfer that responsibility only
+// when an output exists; otherwise release it even if output checkout failed.
+fn checkout_output_or_release<T, E>(
+    checkout: impl FnOnce() -> Result<Option<T>, E>,
+    release: impl FnOnce() -> Result<(), E>,
+) -> Result<Option<T>, E> {
+    match checkout() {
+        Ok(Some(output)) => Ok(Some(output)),
+        result => {
+            let cleanup = release();
+            result.and_then(|none| cleanup.map(|()| none))
+        }
+    }
+}
+
+#[test]
+fn output_checkout_failure_releases_input_once_and_preserves_primary_error() {
+    use std::cell::Cell;
+    for output in [Ok(Some(7)), Ok(None), Err("checkout")] {
+        for cleanup in [Ok(()), Err("checkin")] {
+            let calls = Cell::new(0);
+            let result = checkout_output_or_release(|| output, || {
+                calls.set(calls.get() + 1);
+                cleanup
+            });
+            if output == Ok(Some(7)) {
+                assert_eq!(calls.get(), 0);
+                assert_eq!(result, output);
+            } else {
+                assert_eq!(calls.get(), 1);
+                assert_eq!(result, output.and_then(|none| cleanup.map(|()| none)));
+            }
+        }
+    }
 }
 
 fn smart_render(extra: &ae::pf::SmartRenderExtra, in_data: &ae::InData, params: &ae::Parameters<Params>) -> Result<(), ae::Error> {
     let cb = extra.callbacks();
     let Some(input_world) = cb.checkout_layer_pixels(INPUT_CHECKOUT_ID)? else { return Ok(()); };
-    let Some(mut output_world) = cb.checkout_output()? else { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Ok(()); };
-    let (rgba, iw, ih) = layer_to_rgba_f32(&input_world);
+    let Some(mut output_world) = checkout_output_or_release(
+        || cb.checkout_output(), || cb.checkin_layer_pixels(INPUT_CHECKOUT_ID),
+    )? else { return Ok(()); };
+    let (rgba, iw, ih) = match layer_to_rgba_f32(&input_world) {
+        Ok(frame) => frame,
+        Err(err) => { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Err(err); }
+    };
     let ow = output_world.width() as usize;
     let oh = output_world.height() as usize;
     if iw == 0 || ih == 0 || ow == 0 || oh == 0 { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Ok(()); }
@@ -609,9 +746,12 @@ fn smart_render(extra: &ae::pf::SmartRenderExtra, in_data: &ae::InData, params: 
     // Keep a default fallback for old serialized instances while their
     // appended controls are being initialized by AE.
     let core = read_core_params(params).unwrap_or_default();
-    let mut out = vec![0.0f32; ow * oh * 4];
+    let mut out = match output_plane(ow, oh) {
+        Ok(out) => out,
+        Err(err) => { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Err(err); }
+    };
     let view = read_view(params).unwrap_or(celglow_core::DebugView::Result);
-    let rendered = catch_unwind(AssertUnwindSafe(|| celglow_core::render(
+    let rendered = core_render_outcome(catch_unwind(AssertUnwindSafe(|| celglow_core::render(
         celglow_core::FrameBuf { w: iw, h: ih, rgba: &rgba },
         (plane.left, plane.top),
         output_origin,
@@ -619,31 +759,137 @@ fn smart_render(extra: &ae::pf::SmartRenderExtra, in_data: &ae::InData, params: 
         &core,
         view,
         &mut out,
-    )))
-    .map(|result| result.is_ok())
-    .unwrap_or(false);
+    ))));
+    let rendered = match rendered {
+        Ok(rendered) => rendered,
+        Err(err) => { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Err(err); }
+    };
     if !rendered {
         // ROI can be clipped by AE in edge cases; preserve the source instead
         // of leaving an uninitialised output surface.
-        out.fill(0.0);
-        for y in 0..oh.min(ih) { for x in 0..ow.min(iw) {
-            let si = (y * iw + x) * 4; let di = (y * ow + x) * 4;
-            out[di..di + 4].copy_from_slice(&rgba[si..si + 4]);
-        }}
+        if let Err(err) = copy_plane_region(&rgba, (iw,ih), (plane.left,plane.top),
+            &mut out, (ow,oh), output_origin) {
+            let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Err(err);
+        }
     }
     // AEXCompat (and AE's float compositor) reject unwritten/non-finite
     // samples. Keep the native render contract closed even when a malformed
     // source pixel or an extreme parameter produces NaN/Inf in the core.
-    for value in &mut out {
-        if !value.is_finite() {
-            *value = 0.0;
-        } else {
-            *value = value.clamp(0.0, 1.0);
+    let depth = match output_world.pixel_format().and_then(depth_from_format) {
+        Ok(depth) => depth,
+        Err(err) => { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Err(err); }
+    };
+    sanitize_output(&mut out, depth);
+    let result = write_rgba_f32_to_layer(&out, &mut output_world, ow, oh);
+    result.and(cb.checkin_layer_pixels(INPUT_CHECKOUT_ID))
+}
+
+fn copy_plane_region(src: &[f32], input: (usize,usize), input_origin: (i32,i32),
+    dst: &mut [f32], output: (usize,usize), output_origin: (i32,i32)) -> Result<(),ae::Error> {
+    let (iw,ih) = input;
+    let (ow,oh) = output;
+    for ((w,h),len) in [(input,src.len()),(output,dst.len())] {
+        if w > i32::MAX as usize || h > i32::MAX as usize
+            || w.checked_mul(h).and_then(|n|n.checked_mul(4)) != Some(len) {
+            return Err(ae::Error::BadCallbackParameter);
         }
     }
-    write_rgba_f32_to_layer(&out, &mut output_world, ow, oh);
-    let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID);
+    let dx=i64::from(output_origin.0)-i64::from(input_origin.0);
+    let dy=i64::from(output_origin.1)-i64::from(input_origin.1);
+    dst.fill(0.0);
+    let left=0i64.max(-dx);
+    let right=(ow as i64).min(iw as i64-dx);
+    let top=0i64.max(-dy);
+    let bottom=(oh as i64).min(ih as i64-dy);
+    if left >= right || top >= bottom { return Ok(()); }
+    let count=(right-left) as usize*4;
+    for y in top..bottom {
+        let si=((y+dy) as usize*iw+(left+dx) as usize)*4;
+        let di=(y as usize*ow+left as usize)*4;
+        dst[di..di+count].copy_from_slice(&src[si..si+count]);
+    }
     Ok(())
+}
+
+#[test]
+fn plane_copy_uses_global_intersection() {
+    let src:Vec<f32>=(1..=6).flat_map(|v|[v as f32;4]).collect();
+    let mut dst=[99.0;24];
+    copy_plane_region(&src,(3,2),(10,-4),&mut dst,(3,2),(11,-3)).unwrap();
+    assert_eq!(dst,[5.,5.,5.,5.,6.,6.,6.,6.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.,0.]);
+}
+
+#[test]
+fn plane_copy_extreme_origins_and_invalid_buffers() {
+    for (a,b) in [(i32::MIN,i32::MAX),(i32::MAX,i32::MIN)] {
+        let mut dst=[99.;4];
+        copy_plane_region(&[2.;4],(1,1),(a,a),&mut dst,(1,1),(b,b)).unwrap();
+        assert_eq!(dst,[0.;4]);
+        copy_plane_region(&[2.;4],(1,1),(a,a),&mut dst,(1,1),(a,a)).unwrap();
+        assert_eq!(dst,[2.;4]);
+    }
+    let mut dst=[99.;4];
+    for (size,src) in [((1,1),&[1.;3][..]),((usize::MAX,2),&[][..])] {
+        assert_eq!(copy_plane_region(src,size,(0,0),&mut dst,(1,1),(0,0)),Err(ae::Error::BadCallbackParameter));
+        assert_eq!(dst,[99.;4]);
+    }
+    let mut expanded=[99.;36];
+    copy_plane_region(&[2.;4],(1,1),(-1,-1),&mut expanded,(3,3),(-2,-2)).unwrap();
+    for (i,p) in expanded.chunks_exact(4).enumerate() { assert_eq!(p,if i==4 { &[2.;4] } else { &[0.;4] }); }
+}
+
+fn output_plane(w: usize, h: usize) -> Result<Vec<f32>, ae::Error> {
+    let count = w.checked_mul(h).and_then(|n| n.checked_mul(4))
+        .ok_or(ae::Error::BadCallbackParameter)?;
+    count.checked_mul(std::mem::size_of::<f32>())
+        .filter(|&n| n <= isize::MAX as usize)
+        .ok_or(ae::Error::BadCallbackParameter)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(count).map_err(|_| ae::Error::OutOfMemory)?;
+    out.resize(count, 0.0);
+    Ok(out)
+}
+
+#[test]
+fn output_plane_checks_geometry_before_allocation() {
+    for (w,h) in [(usize::MAX,2),(usize::MAX/4+1,1),(isize::MAX as usize/16+1,1)] {
+        assert_eq!(output_plane(w,h),Err(ae::Error::BadCallbackParameter));
+    }
+    for (w,h) in [(0,7),(7,0),(1,1),(1,31),(37,1),(17,31)] {
+        let out = output_plane(w,h).unwrap();
+        assert_eq!(out.len(),w*h*4);
+        assert!(out.iter().all(|&v|v==0.0));
+    }
+}
+
+fn core_render_outcome(
+    result: std::thread::Result<Result<(),celglow_core::RenderError>>,
+) -> Result<bool,ae::Error> {
+    use celglow_core::RenderError;
+    match result {
+        Ok(Ok(())) => Ok(true),
+        // Retain the existing clipped-ROI source fallback only for that error.
+        Ok(Err(RenderError::OutputOutsideInput {..})) => Ok(false),
+        Ok(Err(RenderError::FieldAllocation)) => Err(ae::Error::OutOfMemory),
+        Ok(Err(RenderError::FieldRadius)) => Err(ae::Error::InvalidParms),
+        Ok(Err(_)) => Err(ae::Error::BadCallbackParameter),
+        Err(_) => Err(ae::Error::InternalStructDamaged),
+    }
+}
+
+#[test]
+fn core_errors_are_not_silently_reported_as_passthrough() {
+    use celglow_core::RenderError;
+    assert_eq!(core_render_outcome(Ok(Ok(()))),Ok(true));
+    assert_eq!(core_render_outcome(Ok(Err(RenderError::FieldAllocation))),Err(ae::Error::OutOfMemory));
+    assert_eq!(core_render_outcome(Ok(Err(RenderError::FieldRadius))),Err(ae::Error::InvalidParms));
+    assert_eq!(core_render_outcome(Ok(Err(RenderError::FieldDimensions))),Err(ae::Error::BadCallbackParameter));
+    assert_eq!(core_render_outcome(Ok(Err(RenderError::InputLength {actual:3,expected:4}))),Err(ae::Error::BadCallbackParameter));
+    assert_eq!(core_render_outcome(Ok(Err(RenderError::OutputLength {actual:3,expected:4}))),Err(ae::Error::BadCallbackParameter));
+    assert_eq!(core_render_outcome(Err(Box::new("injected panic"))),Err(ae::Error::InternalStructDamaged));
+    assert_eq!(core_render_outcome(Ok(Err(RenderError::OutputOutsideInput {
+        input_origin:(0,0),input_size:(1,1),output_origin:(1,0),output_size:(1,1),
+    }))),Ok(false));
 }
 
 fn smart_render_gpu(extra: &ae::pf::SmartRenderExtra, in_data: &ae::InData, params: &ae::Parameters<Params>) -> Result<(), ae::Error> {
@@ -652,37 +898,40 @@ fn smart_render_gpu(extra: &ae::pf::SmartRenderExtra, in_data: &ae::InData, para
     }
     let cb = extra.callbacks();
     let Some(input_world) = cb.checkout_layer_pixels(INPUT_CHECKOUT_ID)? else { return Ok(()); };
-    let Some(mut output_world) = cb.checkout_output()? else { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Ok(()); };
-    let (rgba, iw, ih) = layer_to_rgba_f32(&input_world);
+    let Some(mut output_world) = checkout_output_or_release(
+        || cb.checkout_output(), || cb.checkin_layer_pixels(INPUT_CHECKOUT_ID),
+    )? else { return Ok(()); };
+    let (rgba, iw, ih) = match layer_to_rgba_f32(&input_world) {
+        Ok(frame) => frame,
+        Err(err) => { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Err(err); }
+    };
     let ow = output_world.width() as usize;
     let oh = output_world.height() as usize;
     if iw == 0 || ih == 0 || ow == 0 || oh == 0 { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Ok(()); }
     let plane = extra.pre_render_data::<CelGlowPlane>().map(|v| v.input_plane).unwrap_or(ae::Rect { left: 0, top: 0, right: iw as i32, bottom: ih as i32 });
-    let core = read_core_params(params).map_err(|_| ae::Error::InvalidParms)?;
+    let core = match read_core_params(params) {
+        Ok(core) => core,
+        Err(_) => { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Err(ae::Error::InvalidParms); }
+    };
     let gpu = gpu::render(celglow_core::FrameBuf { w: iw, h: ih, rgba: &rgba }, &core);
     let Ok(full) = gpu else {
         // GPU setup or interop can be unavailable on a host/device. Re-run the
         // exact CPU path after checking the layer back in.
-        let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID);
+        cb.checkin_layer_pixels(INPUT_CHECKOUT_ID)?;
         return smart_render(extra, in_data, params);
     };
     let ox = in_data.output_origin().h;
     let oy = in_data.output_origin().v;
-    let mut out = vec![0.0f32; ow * oh * 4];
-    for y in 0..oh {
-        for x in 0..ow {
-            let sx = ox + x as i32 - plane.left;
-            let sy = oy + y as i32 - plane.top;
-            if sx >= 0 && sy >= 0 && (sx as usize) < iw && (sy as usize) < ih {
-                let si = ((sy as usize) * iw + sx as usize) * 4;
-                let di = (y * ow + x) * 4;
-                out[di..di + 4].copy_from_slice(&full[si..si + 4]);
-            }
-        }
+    let mut out = match output_plane(ow, oh) {
+        Ok(out) => out,
+        Err(err) => { let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Err(err); }
+    };
+    if let Err(err) = copy_plane_region(&full,(iw,ih),(plane.left,plane.top),
+        &mut out,(ow,oh),(ox,oy)) {
+        let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID); return Err(err);
     }
-    write_rgba_f32_to_layer(&out, &mut output_world, ow, oh);
-    let _ = cb.checkin_layer_pixels(INPUT_CHECKOUT_ID);
-    Ok(())
+    let result = write_rgba_f32_to_layer(&out, &mut output_world, ow, oh);
+    result.and(cb.checkin_layer_pixels(INPUT_CHECKOUT_ID))
 }
 
 fn p_view_is_debug(params: &ae::Parameters<Params>) -> Result<bool, ae::Error> {

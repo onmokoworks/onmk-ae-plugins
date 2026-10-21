@@ -7,6 +7,8 @@ fn main() {
         Property::Kind(PIPLType::AEEffect),
         Property::Name("onmk Film"),
         Property::Category("onmk"),
+        #[cfg(target_os = "windows")]
+        Property::CodeWin64X86("EffectMain"),
         #[cfg(target_os = "macos")]
         Property::CodeMacIntel64("EffectMain"),
         #[cfg(target_os = "macos")]

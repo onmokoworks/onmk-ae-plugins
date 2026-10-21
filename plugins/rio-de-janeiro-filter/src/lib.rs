@@ -27,9 +27,9 @@ impl AdobePluginGlobal for Plugin {
             ae::Command::About => out.set_return_msg("Rio Grade v1.1\rBold purple-pink to orange gradient with a faded retro finish.\rWritten in Rust."),
             ae::Command::Render { in_layer, mut out_layer } => {
                 let p = GradeParams::from_ae(params)?;
-                let (src, w, h) = layer_to_flat(&in_layer);
-                let dst = grade(&src, w, h, p);
-                flat_to_layer(&dst, &mut out_layer, w, h);
+                let (mut dst, w, h) = layer_to_flat(&in_layer)?;
+                grade_in_place(&mut dst, w, h, p)?;
+                flat_to_layer(&dst, &mut out_layer, w, h)?;
             }
             _ => {}
         }
@@ -57,16 +57,60 @@ impl GradeParams {
     }
 }
 
-fn layer_to_flat(layer: &ae::Layer) -> (Vec<u8>, usize, usize) {
-    let w = layer.width() as usize; let h = layer.height() as usize; let stride = layer.buffer_stride();
-    let buf = layer.buffer(); let mut flat = vec![0u8; w * h * 4];
-    for y in 0..h { let n = w * 4; let s = y * stride; let d = y * n; if s + n <= buf.len() { flat[d..d+n].copy_from_slice(&buf[s..s+n]); } }
-    (flat, w, h)
+fn checked_extent(w: usize, h: usize, stride: usize) -> Result<usize, ae::Error> {
+    if w == 0 || h == 0 { return Ok(0); }
+    let row = w.checked_mul(4).ok_or(ae::Error::OutOfMemory)?;
+    if stride < row { return Err(ae::Error::BadCallbackParameter); }
+    (h-1).checked_mul(stride).and_then(|v|v.checked_add(row)).ok_or(ae::Error::OutOfMemory)
 }
 
-fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
-    let stride = layer.buffer_stride(); let buf = layer.buffer_mut();
-    for y in 0..h { let n = w * 4; let s = y * n; let d = y * stride; if d + n <= buf.len() { buf[d..d+n].copy_from_slice(&flat[s..s+n]); } }
+fn copy_rows(src: &[u8], dst: &mut [u8], w: usize, h: usize,
+    src_stride: usize, dst_stride: usize, src_reverse: bool, dst_reverse: bool) -> Result<(), ae::Error> {
+    let src_extent = checked_extent(w,h,src_stride)?;
+    let dst_extent = checked_extent(w,h,dst_stride)?;
+    if src.len()<src_extent || dst.len()<dst_extent { return Err(ae::Error::BadCallbackParameter); }
+    if w==0 || h==0 { return Ok(()); }
+    let row=w*4;
+    for y in 0..h {
+        let s=(if src_reverse {h-1-y} else {y})*src_stride;
+        let d=(if dst_reverse {h-1-y} else {y})*dst_stride;
+        dst[d..d+row].copy_from_slice(&src[s..s+row]);
+    }
+    Ok(())
+}
+
+fn validate_world(layer: &ae::Layer) -> Result<(), ae::Error> {
+    if layer.width()>i32::MAX as usize || layer.height()>i32::MAX as usize
+        || layer.row_bytes()==i32::MIN as isize { return Err(ae::Error::BadCallbackParameter); }
+    if layer.width()==0 || layer.height()==0 { return Ok(()); }
+    checked_extent(layer.width(),layer.height(),layer.buffer_stride())?;
+    // Layer::buffer constructs a slice covering stride * height.
+    let len=layer.buffer_stride().checked_mul(layer.height()).ok_or(ae::Error::OutOfMemory)?;
+    if len>isize::MAX as usize || unsafe {layer.data_ptr()}.is_null()
+        || layer.pixel_format()?!=ae::PixelFormat::Argb32 { return Err(ae::Error::BadCallbackParameter); }
+    Ok(())
+}
+
+fn layer_to_flat(layer: &ae::Layer) -> Result<(Vec<u8>, usize, usize), ae::Error> {
+    validate_world(layer)?;
+    let w = layer.width() as usize; let h = layer.height() as usize; let stride = layer.buffer_stride();
+    if w==0 || h==0 { return Ok((Vec::new(),w,h)); }
+    let row=w.checked_mul(4).ok_or(ae::Error::OutOfMemory)?;
+    let count=row.checked_mul(h).ok_or(ae::Error::OutOfMemory)?;
+    let mut flat=Vec::new();
+    flat.try_reserve_exact(count).map_err(|_|ae::Error::OutOfMemory)?;
+    flat.resize(count,0);
+    copy_rows(layer.buffer(),&mut flat,w,h,stride,row,layer.row_bytes()<0,false)?;
+    Ok((flat, w, h))
+}
+
+fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) -> Result<(), ae::Error> {
+    if (w,h)!=(layer.width(),layer.height()) { return Err(ae::Error::BadCallbackParameter); }
+    validate_world(layer)?;
+    if w==0 || h==0 { return Ok(()); }
+    let stride=layer.buffer_stride(); let reverse=layer.row_bytes()<0;
+    let row=w.checked_mul(4).ok_or(ae::Error::OutOfMemory)?;
+    copy_rows(flat,layer.buffer_mut(),w,h,row,stride,false,reverse)
 }
 
 #[inline] fn clamp(v: f32) -> f32 { v.clamp(0.0, 1.0) }
@@ -79,12 +123,18 @@ fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
     n = (n ^ (n >> 13)).wrapping_mul(1274126177); ((n ^ (n >> 16)) as f32 / u32::MAX as f32) * 2.0 - 1.0
 }
 
-fn grade(src: &[u8], w: usize, h: usize, p: GradeParams) -> Vec<u8> {
-    let mut out = src.to_vec(); let cx = w as f32 * 0.5; let cy = h as f32 * 0.5;
+fn grade_in_place(out: &mut [u8], w: usize, h: usize, p: GradeParams) -> Result<(), ae::Error> {
+    let count=w.checked_mul(h).and_then(|v|v.checked_mul(4)).ok_or(ae::Error::OutOfMemory)?;
+    if out.len()!=count { return Err(ae::Error::BadCallbackParameter); }
+    if p.strength == 0.0 || count==0 { return Ok(()); }
+    let cx = w as f32 * 0.5; let cy = h as f32 * 0.5;
     let radius = (cx * cx + cy * cy).sqrt();
     for y in 0..h { for x in 0..w {
-        let i = (y * w + x) * 4; let a = src[i];
-        let (mut r, mut g, mut b) = (src[i+1] as f32 / 255.0, src[i+2] as f32 / 255.0, src[i+3] as f32 / 255.0);
+        let i = (y * w + x) * 4; let a = out[i];
+        if a == 0 { out[i..i+4].fill(0); continue; }
+        // AE worlds contain premultiplied RGB. Grade straight colour, then
+        // premultiply the result before blending with the original pixels.
+        let (mut r, mut g, mut b) = (out[i+1] as f32 / a as f32, out[i+2] as f32 / a as f32, out[i+3] as f32 / a as f32);
         let luma = 0.2126*r + 0.7152*g + 0.0722*b;
         let shadow = 1.0 - smoothstep(0.08, 0.58, luma);
 
@@ -130,15 +180,62 @@ fn grade(src: &[u8], w: usize, h: usize, p: GradeParams) -> Vec<u8> {
         let vig_adjust = (1.0-(radial*(p.vignette-0.08)*0.35)).clamp(0.65, 1.0);
         let n = noise(x,y)*p.grain*0.035;
         r = clamp(r*vig_adjust+n); g = clamp(g*vig_adjust+n); b = clamp(b*vig_adjust+n); let m = p.strength;
-        out[i] = a; out[i+1] = ((src[i+1] as f32/255.0*(1.0-m)+r*m)*255.0+0.5) as u8;
-        out[i+2] = ((src[i+2] as f32/255.0*(1.0-m)+g*m)*255.0+0.5) as u8;
-        out[i+3] = ((src[i+3] as f32/255.0*(1.0-m)+b*m)*255.0+0.5) as u8;
-    }} out
+        let alpha = a as f32 / 255.0;
+        r *= alpha; g *= alpha; b *= alpha;
+        out[i] = a; out[i+1] = ((out[i+1] as f32/255.0*(1.0-m)+r*m)*255.0+0.5) as u8;
+        out[i+2] = ((out[i+2] as f32/255.0*(1.0-m)+g*m)*255.0+0.5) as u8;
+        out[i+3] = ((out[i+3] as f32/255.0*(1.0-m)+b*m)*255.0+0.5) as u8;
+    }} Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grade(src: &[u8], w: usize, h: usize, p: GradeParams) -> Vec<u8> {
+        let mut out=src.to_vec();
+        grade_in_place(&mut out,w,h,p).unwrap();
+        out
+    }
+
+    #[test]
+    fn in_place_grade_rejects_invalid_extents_without_mutation() {
+        let mut pixel=[255,40,80,120];
+        for (w,h) in [(1,2),(usize::MAX,2),(0,1)] {
+            assert!(grade_in_place(&mut pixel,w,h,defaults()).is_err());
+            assert_eq!(pixel,[255,40,80,120]);
+        }
+        grade_in_place(&mut [],0,5,defaults()).unwrap();
+    }
+
+    #[test]
+    fn malformed_rows_are_rejected_before_any_write() {
+        let src=[1,2,3,4,5,6,7,8];
+        let mut short=[99;7];
+        // The former loop wrote the first row and silently skipped the second.
+        let mut former=short;
+        for y in 0..2 { let d=y*4; if d+4<=former.len() { former[d..d+4].copy_from_slice(&src[d..d+4]); } }
+        assert_eq!(former,[1,2,3,4,99,99,99]);
+        assert!(copy_rows(&src,&mut short,1,2,4,4,false,false).is_err());
+        assert_eq!(short,[99;7]);
+        let mut dst=[99;8];
+        for (input,w,h,ss,ds) in [(&src[..7],1,2,4,4),(&src[..],2,1,4,8),(&src[..],1,2,4,3),(&src[..],usize::MAX,2,4,4),(&src[..],1,usize::MAX,4,4)] {
+            assert!(copy_rows(input,&mut dst,w,h,ss,ds,false,false).is_err());
+            assert_eq!(dst,[99;8]);
+        }
+    }
+
+    #[test]
+    fn padded_reversed_rows_round_trip_without_touching_padding() {
+        let src=[1,2,3,4,99,99,5,6,7,8];
+        let mut flat=[0;8];
+        copy_rows(&src,&mut flat,1,2,6,4,true,false).unwrap();
+        assert_eq!(flat,[5,6,7,8,1,2,3,4]);
+        let mut dst=[99;10];
+        copy_rows(&flat,&mut dst,1,2,4,6,false,true).unwrap();
+        assert_eq!(dst,src);
+        copy_rows(&[],&mut [],0,4,0,0,false,false).unwrap();
+    }
 
     fn defaults() -> GradeParams {
         GradeParams { strength: 1.0, warmth: 0.92, shadow_cyan: 0.78,
@@ -180,6 +277,23 @@ mod tests {
         let (_, _, bottom) = vertical_triplet(128);
         assert!(bottom[1] > bottom[3]);
         assert!(bottom[2] > bottom[3]);
+    }
+
+    #[test]
+    fn partial_alpha_matches_opaque_grade_then_premultiply() {
+        let opaque = [255, 255, 0, 255];
+        let graded = grade(&opaque, 1, 1, defaults());
+        for alpha in [0u8, 1, 64, 128, 254, 255] {
+            let src = [alpha, alpha, 0, alpha];
+            let output = grade(&src, 1, 1, defaults());
+            assert_eq!(output[0], alpha);
+            for channel in 1..4 {
+                let expected = (graded[channel] as u32 * alpha as u32 + 127) / 255;
+                assert!((output[channel] as i32 - expected as i32).abs() <= 1,
+                    "alpha={alpha}, channel={channel}: {} vs {expected}", output[channel]);
+                assert!(output[channel] <= alpha);
+            }
+        }
     }
 
     #[test]

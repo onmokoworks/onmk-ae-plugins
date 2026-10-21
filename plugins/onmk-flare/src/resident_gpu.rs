@@ -171,7 +171,11 @@ impl ResidentGpu {
             let ghost_job = scope.spawn(|| {
                 if ep.physical_enabled {
                     let lens = physical::bundled_lens(ep.lens_preset);
-                    if self.ghosts.is_some() {
+                    // The dense Canon reference exceeded our 2/32768 final
+                    // pixel tolerance with GPU rasterization (640x360). Keep
+                    // its canonical CPU ghost layer; GPU composition/cache
+                    // and the other reference lenses remain enabled.
+                    if self.ghosts.is_some() && ep.style_preset != 17 {
                         if let Some(mesh) = physical::ghost_mesh(&lens, sources, w, h, cfg) {
                             return GhostResult::Mesh(mesh);
                         }

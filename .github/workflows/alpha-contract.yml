@@ -1,0 +1,17 @@
+name: Alpha contract tools
+on:
+  pull_request:
+    paths: ['tools/alpha_contract.py', 'tools/test_alpha_contract.py', '.github/workflows/alpha-contract.yml']
+  push:
+    paths: ['tools/alpha_contract.py', 'tools/test_alpha_contract.py', '.github/workflows/alpha-contract.yml']
+permissions:
+  contents: read
+jobs:
+  contract-tool-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m unittest discover -s tools -p test_alpha_contract.py

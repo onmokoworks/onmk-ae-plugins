@@ -1,0 +1,22 @@
+onmk DistanceGradation
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+Original OLM attribution retained:
+Copyright 2017 OLM Digital, Inc. All rights reserved.
+Distance Gradation effect description: Copyright 2014 OLM Digital, Inc.
+
+Reference project: https://github.com/onmokoworks/OLM-for-mac
+Reference revision: f4e4dac86925b512d4c7b8784d250f1a68871cb7
+Reference files: mac/OLMDistanceGradation/OLMDistanceGradation.cpp,
+mac/OLMDistanceGradation/OLMDistanceGradation_Strings.cpp, LICENSE.
+
+onmk modifications (2026): Rust reimplementation; optional antialiasing enabled
+by default; original-image compositing enabled by default; straight-alpha
+output; downsample-aware distances; Windows packaging and regression tests.
+This implementation does not include the upstream C++ source and is not a
+binary-compatible replacement for OLM Distance Gradation.
+
+This project is not affiliated with or endorsed by OLM Digital, Inc.
+OLM names and trademarks remain the property of their respective owners.
+Third-party dependencies retain their own licenses.

@@ -48,7 +48,9 @@ onmkが開発・メンテナンスするAdobe After Effectsプラグインのモ
 | [PathArray](./plugins/path-array/) | マスクパスに沿ってレイヤーの複製を配置 | 実験的 |
 | [MaskTransform](./plugins/mask-transform/) | マスクパスの反転と回転 | 実験的 |
 | [MaskOffset](./plugins/mask-offset/) | マスクパスのオフセット、塗り、フェザー | 実験的 |
+| [TaperStroke](./plugins/taper-stroke/) | 開いたマスクパスから終点側が細くなるストロークを生成 | 実験的・v0.3.1 |
 | [LumaNormal](./plugins/luma-normal/) | 輝度勾配からRGBノーマルマップを生成 | 実験的・8 bpc |
+| [onmk DistanceGradation](./plugins/distance-gradation/) | AA切り替え・元画像保持に対応する距離グラデーション | 開発中・v0.1.0 |
 
 ### 時間・生成・スタイライズ
 
@@ -120,7 +122,9 @@ Experimental and unpublished projects are developed outside this repository and 
 | [PathArray](./plugins/path-array/) | Distributes layer copies along a mask path | Experimental |
 | [MaskTransform](./plugins/mask-transform/) | Flips and rotates mask paths | Experimental |
 | [MaskOffset](./plugins/mask-offset/) | Offsets mask paths with fill and feather controls | Experimental |
+| [TaperStroke](./plugins/taper-stroke/) | Variable-width tapered strokes from an open mask path | Experimental / v0.3.1 |
 | [LumaNormal](./plugins/luma-normal/) | Generates RGB normal maps from luminance gradients | Experimental / 8 bpc |
+| [onmk DistanceGradation](./plugins/distance-gradation/) | Antialiased distance gradients composited over the original layer | In development / v0.1.0 |
 
 ### Time, Generation, and Stylization
 
@@ -141,3 +145,11 @@ Experimental and unpublished projects are developed outside this repository and 
 | Plugin | Description | Status |
 |---|---|---|
 | [Particle Kit](./plugins/particle-kit/) | Particle effects, shared engine, Node UI, and Lattice Lab | Experimental |
+
+## アルファ処理の品質確認
+
+実装前に [AE アルファ契約と検査手順](docs/alpha-contract.md) を確認してください。[既存プラグインの監査](docs/alpha-audit-20261016.md) は確認済みの問題と未検証範囲を分けて記録しています。
+
+## FocusLines
+
+[ONMK FocusLines](plugins/focus-lines/) — GPU対応の集中線ジェネレーター。丸い先端、ランダム更新、短い線の長さ範囲と混合率を調整可能（v0.1.2、実験的）。

@@ -745,15 +745,48 @@ pub(crate) fn render_lattice_plan_8bit(plan: &LatticeRenderPlan, output: &mut [u
     let width = surface.width;
     let height = surface.height;
     let row_bytes = surface.row_bytes;
+    rasterize_lattice(plan,width,height,&mut |x,y,color,coverage,mode| {
+        blend_argb8_pixel(output,row_bytes,x,y,color,coverage,mode);
+    });
+}
+
+pub(crate) fn render_lattice_plan_16bit(plan: &LatticeRenderPlan, output: &mut [u8], stride: usize) -> Result<(),()> {
+    let surface=plan.runtime.surface().map_err(|_|())?;
+    let row=surface.width.checked_mul(8).ok_or(())?;
+    let len=stride.checked_mul(surface.height).ok_or(())?;
+    if stride<row || output.len()<len {return Err(());}
+    rasterize_lattice(plan,surface.width,surface.height,&mut |x,y,color,coverage,mode| {
+        let idx=y*stride+x*8;
+        let mut dst=[0.0f32;4];
+        for c in 0..4 {dst[c]=u16::from_ne_bytes([output[idx+c*2],output[idx+c*2+1]]) as f32/32768.0;}
+        let alpha=(color[3]*coverage).clamp(0.0,1.0);
+        let mut out=[0.0f32;4];
+        out[0]=(dst[0]+alpha*(1.0-dst[0])).clamp(0.0,1.0);
+        for c in 0..3 {
+            let src=color[c].clamp(0.0,1.0);
+            out[c+1]=match mode {
+                ArgbBlendMode::Normal=>dst[c+1]*(1.0-alpha)+src*alpha,
+                ArgbBlendMode::Add=>(dst[c+1]+src*alpha*1.2).clamp(0.0,1.0),
+                ArgbBlendMode::Screen=>1.0-(1.0-dst[c+1])*(1.0-src*alpha*0.9),
+            };
+        }
+        for c in 0..4 {output[idx+c*2..idx+c*2+2].copy_from_slice(&((out[c]*32768.0).round() as u16).to_ne_bytes());}
+    });
+    Ok(())
+}
+
+fn rasterize_lattice(plan: &LatticeRenderPlan,width:usize,height:usize,
+    blend: &mut impl FnMut(usize,usize,[f32;4],f32,ArgbBlendMode)) {
+    if width==0 || height==0 {return;}
     let blend_mode = lattice_blend_mode_to_renderer(plan.blend_mode);
     for edge in &plan.mesh_edges {
-        draw_lattice_edge(plan, edge, output, row_bytes, width, height, blend_mode);
+        draw_lattice_edge(plan, edge, width, height, blend_mode,blend);
     }
     for edge in &plan.links {
-        draw_lattice_edge(plan, edge, output, row_bytes, width, height, blend_mode);
+        draw_lattice_edge(plan, edge, width, height, blend_mode,blend);
     }
     for point in &plan.points {
-        draw_lattice_point(point, output, row_bytes, width, height, blend_mode);
+        draw_lattice_point(point, width, height, blend_mode,blend);
     }
 }
 
@@ -930,14 +963,51 @@ fn build_lattice_edges(
     opacity_falloff: f32,
     max_edges: usize,
 ) -> Vec<LatticeRenderEdge> {
-    if max_distance <= 0.0 || width <= 0.0 || color[3] <= 0.0 {
+    if max_edges==0 || points.len()<2 || max_distance <= 0.0 || width <= 0.0 || color[3] <= 0.0 {
         return Vec::new();
     }
 
     let max_distance_sq = max_distance * max_distance;
     let mut edges = Vec::new();
+    let mut low=[f32::INFINITY;3]; let mut high=[f32::NEG_INFINITY;3];
+    for point in points {for axis in 0..3 {
+        low[axis]=low[axis].min(point.position[axis]); high[axis]=high[axis].max(point.position[axis]);
+    }}
+    let axis=(0..3).max_by(|&a,&b| ((high[a] as f64)-(low[a] as f64)).total_cmp(&((high[b] as f64)-(low[b] as f64)))).unwrap();
+    if high[axis] as f64-low[axis] as f64<=max_distance as f64 {
+        'dense: for from in 0..points.len() {for to in from+1..points.len() {
+            if edges.len()>=max_edges {break 'dense;}
+            let ds=distance_squared(points[from].position,points[to].position);
+            if ds<=max_distance_sq {
+                let mut edge_color=color;
+                if opacity_falloff>0.0 {edge_color[3]*=(1.0-ds.sqrt()/max_distance).clamp(0.0,1.0).powf(opacity_falloff);}
+                edges.push(LatticeRenderEdge{from,to,width,color:edge_color});
+            }
+        }}
+        return edges;
+    }
+    let natural_order:Vec<usize>=(0..points.len()).collect();
+    let mut by_axis=natural_order.clone();
+    by_axis.sort_unstable_by(|&a,&b| points[a].position[axis].total_cmp(&points[b].position[axis]));
+    let mut candidates=Vec::new();
+    // Conservative f64 window accommodates f32 subtraction/squared-distance rounding.
+    let radius=max_distance as f64*1.000001+1.0e-20;
     'outer: for from in 0..points.len() {
-        for to in from + 1..points.len() {
+        if edges.len()>=max_edges {break;}
+        let center=points[from].position[axis] as f64;
+        let lo=by_axis.partition_point(|&i| (points[i].position[axis] as f64)<center-radius);
+        let hi=by_axis.partition_point(|&i| (points[i].position[axis] as f64)<=center+radius);
+        candidates.clear();
+        let selected=if hi-lo>points.len()/2 {
+            // Dense windows: scanning legacy order avoids repeatedly sorting most points.
+            &natural_order[from+1..]
+        } else {
+            candidates.extend(by_axis[lo..hi].iter().copied().filter(|&i|i>from));
+            // Keep legacy from/to order, including which edges survive the count cap.
+            candidates.sort_unstable();
+            &candidates[..]
+        };
+        for &to in selected {
             if edges.len() >= max_edges {
                 break 'outer;
             }
@@ -962,13 +1032,103 @@ fn build_lattice_edges(
     edges
 }
 
+#[test]
+fn spatial_edge_candidates_preserve_legacy_order_and_values() {
+    for count in [0,1,17,127] {for spacing in [0.0,0.1,10.0] {
+        let points:Vec<_>=(0..count).map(|i|LatticeRenderPoint {
+            position:[((i*37)%131) as f32*spacing,((i*11)%29) as f32*spacing,0.0],
+            size:1.0,color:[1.0;4],
+        }).collect();
+        for distance in [0.001,1.0,15.0,1000.0] {for cap in [0,1,23,20000] {
+            let mut expected=Vec::new();
+            'pairs: for from in 0..count {for to in from+1..count {
+                if expected.len()>=cap {break 'pairs;}
+                let ds=distance_squared(points[from].position,points[to].position);
+                if ds<=distance*distance {
+                    let mut color=[0.3,0.5,0.7,0.8];
+                    color[3]*=(1.0-ds.sqrt()/distance).clamp(0.0,1.0).powf(1.3);
+                    expected.push(LatticeRenderEdge{from,to,width:2.0,color});
+                }
+            }}
+            assert_eq!(build_lattice_edges(&points,distance,2.0,[0.3,0.5,0.7,0.8],1.3,cap),expected);
+        }}
+    }}
+}
+
+#[test]
+#[ignore = "bounded explicit edge-search timing audit"]
+fn edge_search_timing_audit() {
+    fn legacy(points:&[LatticeRenderPoint],distance:f32)->Vec<LatticeRenderEdge> {
+        let mut edges=Vec::new();
+        'pairs: for from in 0..points.len() {for to in from+1..points.len() {
+            if edges.len()>=20000 {break 'pairs;}
+            let ds=distance_squared(points[from].position,points[to].position);
+            if ds<=distance*distance {
+                let mut color=[0.3,0.5,0.7,0.8];
+                color[3]*=(1.0-ds.sqrt()/distance).clamp(0.0,1.0).powf(1.3);
+                edges.push(LatticeRenderEdge{from,to,width:2.0,color});
+            }
+        }}
+        edges
+    }
+    for layout in 0..3 {
+        let points:Vec<_>=(0..1024).map(|i|LatticeRenderPoint {
+            position:match layout {0=>[i as f32*10.0,0.0,0.0],1=>[(i%32) as f32,(i/32) as f32,0.0],_=>[0.0,i as f32*10.0,0.0]},
+            size:1.0,color:[1.0;4],
+        }).collect();
+        let distance=if layout==1 {100.0} else {1.0};
+        let optimized=||build_lattice_edges(std::hint::black_box(&points),distance,2.0,[0.3,0.5,0.7,0.8],1.3,20000);
+        assert_eq!(optimized(),legacy(&points,distance));
+        let start=std::time::Instant::now();
+        for _ in 0..10 {std::hint::black_box(legacy(std::hint::black_box(&points),distance));}
+        let old=start.elapsed();
+        let start=std::time::Instant::now();
+        for _ in 0..10 {std::hint::black_box(optimized());}
+        eprintln!("layout={layout} legacy_us={} candidate_us={}",old.as_micros(),start.elapsed().as_micros());
+    }
+}
+
+#[test]
+fn edge_window_keeps_float_boundaries_and_negative_positions() {
+    for center in [-100000.0,-1.0,0.0,100000.0] {
+        let one_below=f32::from_bits(1.0f32.to_bits()-1);
+        let one_above=f32::from_bits(1.0f32.to_bits()+1);
+        let points:Vec<_>=[center,center+one_below,center+1.0,center+one_above,center-1.0,
+            center+100.0,center+200.0,center+300.0,center+400.0,center+500.0,center+600.0,center+700.0]
+            .into_iter().map(|x|LatticeRenderPoint{position:[x,0.0,0.0],size:1.0,color:[1.0;4]}).collect();
+        let mut expected=Vec::new();
+        for from in 0..points.len() {for to in from+1..points.len() {
+            if distance_squared(points[from].position,points[to].position)<=1.0 {expected.push((from,to));}
+        }}
+        let actual=build_lattice_edges(&points,1.0,1.0,[1.0;4],0.0,20000);
+        assert_eq!(actual.iter().map(|e|(e.from,e.to)).collect::<Vec<_>>(),expected);
+    }
+}
+
+fn clipped_axis(min: f32, max: f32, extent: usize) -> Option<(usize, usize)> {
+    if extent == 0 || !min.is_finite() || !max.is_finite()
+        || max < 0.0 || min >= extent as f32 || min > max {
+        return None;
+    }
+    Some((min.max(0.0) as usize, (max as usize).min(extent - 1)))
+}
+
+#[test]
+fn offscreen_raster_bounds_do_not_wrap() {
+    assert_eq!(clipped_axis(-30.0, -10.0, 1), None);
+    assert_eq!(clipped_axis(10.0, 30.0, 1), None);
+    assert_eq!(clipped_axis(-30.0, 10.0, 1), Some((0, 0)));
+    assert_eq!(clipped_axis(-30.0, 10.0, 17), Some((0, 10)));
+    assert_eq!(clipped_axis(0.0, 10.0, 0), None);
+    assert_eq!(clipped_axis(f32::NAN, 10.0, 17), None);
+}
+
 fn draw_lattice_point(
     point: &LatticeRenderPoint,
-    output: &mut [u8],
-    row_bytes: usize,
     width: usize,
     height: usize,
     blend_mode: ArgbBlendMode,
+    blend: &mut impl FnMut(usize,usize,[f32;4],f32,ArgbBlendMode),
 ) {
     if point.size <= 0.0 || point.color[3] <= 0.0 {
         return;
@@ -976,16 +1136,12 @@ fn draw_lattice_point(
 
     let radius = (point.size * 0.5).max(0.5);
     let draw_radius = radius + 1.0;
-    let min_x = ((point.position[0] - draw_radius).floor() as isize).max(0) as usize;
-    let max_x = ((point.position[0] + draw_radius).ceil() as isize)
-        .min(width.saturating_sub(1) as isize) as usize;
-    let min_y = ((point.position[1] - draw_radius).floor() as isize).max(0) as usize;
-    let max_y = ((point.position[1] + draw_radius).ceil() as isize)
-        .min(height.saturating_sub(1) as isize) as usize;
-
-    if min_x > max_x || min_y > max_y {
-        return;
-    }
+    let Some((min_x, max_x)) = clipped_axis(
+        (point.position[0] - draw_radius).floor(),
+        (point.position[0] + draw_radius).ceil(), width) else { return; };
+    let Some((min_y, max_y)) = clipped_axis(
+        (point.position[1] - draw_radius).floor(),
+        (point.position[1] + draw_radius).ceil(), height) else { return; };
 
     for y in min_y..=max_y {
         let py = y as f32 + 0.5;
@@ -996,7 +1152,7 @@ fn draw_lattice_point(
             let distance = (dx * dx + dy * dy).sqrt();
             let coverage = (radius + 0.5 - distance).clamp(0.0, 1.0);
             if coverage > 0.0 {
-                blend_argb8_pixel(output, row_bytes, x, y, point.color, coverage, blend_mode);
+                blend(x,y,point.color,coverage,blend_mode);
             }
         }
     }
@@ -1005,11 +1161,10 @@ fn draw_lattice_point(
 fn draw_lattice_edge(
     plan: &LatticeRenderPlan,
     edge: &LatticeRenderEdge,
-    output: &mut [u8],
-    row_bytes: usize,
     width: usize,
     height: usize,
     blend_mode: ArgbBlendMode,
+    blend: &mut impl FnMut(usize,usize,[f32;4],f32,ArgbBlendMode),
 ) {
     if edge.width <= 0.0 || edge.color[3] <= 0.0 {
         return;
@@ -1024,16 +1179,12 @@ fn draw_lattice_edge(
     let by = to.position[1];
     let radius = (edge.width * 0.5).max(0.5);
     let draw_radius = radius + 1.0;
-    let min_x = ((ax.min(bx) - draw_radius).floor() as isize).max(0) as usize;
-    let max_x =
-        ((ax.max(bx) + draw_radius).ceil() as isize).min(width.saturating_sub(1) as isize) as usize;
-    let min_y = ((ay.min(by) - draw_radius).floor() as isize).max(0) as usize;
-    let max_y = ((ay.max(by) + draw_radius).ceil() as isize).min(height.saturating_sub(1) as isize)
-        as usize;
-
-    if min_x > max_x || min_y > max_y {
-        return;
-    }
+    let Some((min_x, max_x)) = clipped_axis(
+        (ax.min(bx) - draw_radius).floor(),
+        (ax.max(bx) + draw_radius).ceil(), width) else { return; };
+    let Some((min_y, max_y)) = clipped_axis(
+        (ay.min(by) - draw_radius).floor(),
+        (ay.max(by) + draw_radius).ceil(), height) else { return; };
 
     for y in min_y..=max_y {
         let py = y as f32 + 0.5;
@@ -1042,7 +1193,7 @@ fn draw_lattice_edge(
             let distance = distance_to_segment(px, py, ax, ay, bx, by);
             let coverage = (radius + 0.5 - distance).clamp(0.0, 1.0);
             if coverage > 0.0 {
-                blend_argb8_pixel(output, row_bytes, x, y, edge.color, coverage, blend_mode);
+                blend(x,y,edge.color,coverage,blend_mode);
             }
         }
     }

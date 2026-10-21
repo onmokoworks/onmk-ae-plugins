@@ -1,5 +1,5 @@
 use crate::params::{Params, SourceChannel};
-use crate::FrameBuf;
+use crate::{FrameBuf, RenderError};
 
 /// S1 のスカラー場。row-major、各要素は 0..=1。
 pub struct Field {
@@ -10,8 +10,21 @@ pub struct Field {
 }
 
 impl Field {
-    pub fn build(input: FrameBuf<'_>, params: &Params) -> Self {
-        let mut values = Vec::with_capacity(input.w * input.h);
+    pub fn build(input: FrameBuf<'_>, params: &Params) -> Result<Self, RenderError> {
+        let count = input.w.checked_mul(input.h).ok_or(RenderError::FieldDimensions)?;
+        let expected = count.checked_mul(4).ok_or(RenderError::FieldDimensions)?;
+        if input.w > isize::MAX as usize || input.h > isize::MAX as usize {
+            return Err(RenderError::FieldDimensions);
+        }
+        if input.rgba.len() != expected {
+            return Err(RenderError::InputLength {actual:input.rgba.len(),expected});
+        }
+        let spread = params.source.spread;
+        if !spread.is_finite() || spread < 0.0 { return Err(RenderError::FieldRadius); }
+        let radius = (spread / 3.0).round() as usize;
+        radius.checked_mul(2).and_then(|n| n.checked_add(1)).ok_or(RenderError::FieldRadius)?;
+        let mut values = Vec::new();
+        values.try_reserve_exact(count).map_err(|_| RenderError::FieldAllocation)?;
         for pixel in input.rgba.chunks_exact(4) {
             let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
             let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
@@ -36,21 +49,20 @@ impl Field {
             values.push(strength * gate);
         }
 
-        let radius = (params.source.spread / 3.0).round() as usize;
         for _ in 0..3 {
-            values = blur_horizontal(&values, input.w, input.h, radius);
-            values = blur_vertical(&values, input.w, input.h, radius);
+            values = blur_horizontal(&values, input.w, input.h, radius)?;
+            values = blur_vertical(&values, input.w, input.h, radius)?;
         }
         for value in &mut values {
             *value = value.clamp(0.0, 1.0).powf(params.source.field_gamma);
         }
         let peak = values.iter().copied().fold(0.0_f32, f32::max);
-        Self {
+        Ok(Self {
             w: input.w,
             h: input.h,
             values,
             peak,
-        }
+        })
     }
 
     /// Bilinear sample with clamp-to-zero outside the supplied input rect.
@@ -87,12 +99,20 @@ impl Field {
     }
 }
 
-fn blur_horizontal(source: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
+pub(crate) fn zero_plane(count: usize) -> Result<Vec<f32>, RenderError> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).map_err(|_| RenderError::FieldAllocation)?;
+    values.resize(count,0.0);
+    Ok(values)
+}
+
+fn blur_horizontal(source: &[f32], w: usize, h: usize, radius: usize) -> Result<Vec<f32>,RenderError> {
+    let mut output = zero_plane(source.len())?;
     if radius == 0 {
-        return source.to_vec();
+        output.copy_from_slice(source);
+        return Ok(output);
     }
     let width = (radius * 2 + 1) as f32;
-    let mut output = vec![0.0; source.len()];
     for y in 0..h {
         let row = y * w;
         let mut sum: f32 = source[row..row + (radius + 1).min(w)].iter().sum();
@@ -101,20 +121,22 @@ fn blur_horizontal(source: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32
             if x >= radius {
                 sum -= source[row + x - radius];
             }
-            if x + radius + 1 < w {
-                sum += source[row + x + radius + 1];
+            let next = x.saturating_add(radius).saturating_add(1);
+            if next < w {
+                sum += source[row + next];
             }
         }
     }
-    output
+    Ok(output)
 }
 
-fn blur_vertical(source: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
+fn blur_vertical(source: &[f32], w: usize, h: usize, radius: usize) -> Result<Vec<f32>,RenderError> {
+    let mut output = zero_plane(source.len())?;
     if radius == 0 {
-        return source.to_vec();
+        output.copy_from_slice(source);
+        return Ok(output);
     }
     let width = (radius * 2 + 1) as f32;
-    let mut output = vec![0.0; source.len()];
     for x in 0..w {
         let mut sum = (0..(radius + 1).min(h))
             .map(|y| source[y * w + x])
@@ -124,17 +146,53 @@ fn blur_vertical(source: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> 
             if y >= radius {
                 sum -= source[(y - radius) * w + x];
             }
-            if y + radius + 1 < h {
-                sum += source[(y + radius + 1) * w + x];
+            let next = y.saturating_add(radius).saturating_add(1);
+            if next < h {
+                sum += source[next * w + x];
             }
         }
     }
-    output
+    Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn field_rejects_bad_geometry_radius_and_capacity() {
+        let mut params = Params::default();
+        assert!(matches!(Field::build(FrameBuf {w:usize::MAX,h:2,rgba:&[]},&params),Err(RenderError::FieldDimensions)));
+        assert!(matches!(Field::build(FrameBuf {w:1,h:1,rgba:&[0.0;3]},&params),Err(RenderError::InputLength {..})));
+        assert!(matches!(zero_plane(usize::MAX),Err(RenderError::FieldAllocation)));
+        for spread in [-1.0,f32::NAN,f32::INFINITY,f32::MAX] {
+            params.source.spread = spread;
+            let input = FrameBuf {w:1,h:1,rgba:&[0.0;4]};
+            assert!(matches!(Field::build(input,&params),Err(RenderError::FieldRadius)));
+            let mut output = [19.0;4];
+            assert_eq!(crate::render(input,(0,0),(0,0),(1,1),&params,crate::DebugView::Result,&mut output),Err(RenderError::FieldRadius));
+            assert_eq!(output,[19.0;4]);
+        }
+        params.source.spread = 3.0;
+        assert!(Field::build(FrameBuf {w:0,h:7,rgba:&[]},&params).unwrap().values.is_empty());
+    }
+
+    #[test]
+    fn fallible_blur_matches_direct_zero_padded_average() {
+        for (w,h) in [(1,1),(1,7),(9,1),(7,9)] {
+            let source:Vec<f32>=(0..w*h).map(|i|((i*17)%31) as f32/31.0).collect();
+            for radius in [0,1,3,100] {
+                let horizontal=blur_horizontal(&source,w,h,radius).unwrap();
+                let vertical=blur_vertical(&source,w,h,radius).unwrap();
+                for y in 0..h {for x in 0..w {
+                    let hx:f32=(x.saturating_sub(radius)..(x+radius+1).min(w)).map(|xx|source[y*w+xx]).sum::<f32>()/(2*radius+1) as f32;
+                    let vy:f32=(y.saturating_sub(radius)..(y+radius+1).min(h)).map(|yy|source[yy*w+x]).sum::<f32>()/(2*radius+1) as f32;
+                    assert!((horizontal[y*w+x]-hx).abs()<1e-6);
+                    assert!((vertical[y*w+x]-vy).abs()<1e-6);
+                }}
+            }
+        }
+    }
 
     #[test]
     fn blur_is_symmetric_and_zero_padded() {
@@ -149,7 +207,7 @@ mod tests {
                 rgba: &input,
             },
             &params,
-        );
+        ).unwrap();
         assert!((field.values[0] - field.values[2]).abs() < 1e-6);
         assert!(field.values[1] > field.values[0]);
     }
@@ -161,7 +219,7 @@ mod tests {
         params.source.channel = SourceChannel::Alpha;
         params.source.spread = 0.0;
         params.source.threshold = 50.0;
-        let field = Field::build(FrameBuf { w: 2, h: 1, rgba: &input }, &params);
+        let field = Field::build(FrameBuf { w: 2, h: 1, rgba: &input }, &params).unwrap();
         assert_eq!(field.values[0], 0.0);
         assert!(field.values[1] > 0.0);
     }

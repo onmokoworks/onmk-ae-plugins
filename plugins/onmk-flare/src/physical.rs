@@ -79,6 +79,7 @@ pub struct BrightSource {
 
 #[derive(Clone, Copy)]
 pub struct Config {
+    pub wavelengths: [f64; 3],
     pub ray_grid: usize,
     pub min_ghost: f64,
     pub gain: f32,
@@ -99,6 +100,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            wavelengths: [650.0,550.0,450.0],
             ray_grid: 40,
             min_ghost: 1e-7,
             gain: 3_000.0,
@@ -223,7 +225,8 @@ fn intersect(ray: Ray, s: &Surface) -> Option<(V3, V3)> {
         }
         (p, n)
     };
-    if p.x * p.x + p.y * p.y > s.semi_aperture * s.semi_aperture {
+    let aperture=s.pupil_radius(p.x,p.y);
+    if p.x * p.x + p.y * p.y > aperture * aperture {
         return None;
     }
     if n.dot(ray.d) > 0.0 {
@@ -247,6 +250,7 @@ fn trace(mut ray: Ray, l: &LensSystem, a: usize, b: usize, wave: f64) -> Option<
     let mut current = 1.0;
     for i in 0..=b {
         let (h, n) = intersect(ray, &l.surfaces[i])?;
+        weight *= l.surfaces[i].transmission(h.x,h.y);
         ray.o = h;
         let n2 = ior(&l.surfaces[i], wave);
         let r = reflectance(n.dot(ray.d).abs(), current, n2, l.surfaces[i].coating, wave);
@@ -261,6 +265,7 @@ fn trace(mut ray: Ray, l: &LensSystem, a: usize, b: usize, wave: f64) -> Option<
     }
     for i in (a..b).rev() {
         let (h, n) = intersect(ray, &l.surfaces[i])?;
+        weight *= l.surfaces[i].transmission(h.x,h.y);
         ray.o = h;
         let n2 = before(l, i, wave);
         let r = reflectance(n.dot(ray.d).abs(), current, n2, l.surfaces[i].coating, wave);
@@ -276,6 +281,7 @@ fn trace(mut ray: Ray, l: &LensSystem, a: usize, b: usize, wave: f64) -> Option<
     }
     for i in (a + 1)..l.surfaces.len() {
         let (h, n) = intersect(ray, &l.surfaces[i])?;
+        weight *= l.surfaces[i].transmission(h.x,h.y);
         ray.o = h;
         let n2 = ior(&l.surfaces[i], wave);
         let r = reflectance(n.dot(ray.d).abs(), current, n2, l.surfaces[i].coating, wave);
@@ -325,6 +331,7 @@ fn trace_first(
     let mut current = 1.0;
     for i in 0..=b {
         let (h, n) = intersect(ray, &l.surfaces[i])?;
+        weight *= l.surfaces[i].transmission(h.x,h.y);
         ray.o = h;
         let n2 = indices[i];
         let r = reflectance(n.dot(ray.d).abs(), current, n2, l.surfaces[i].coating, wave);
@@ -359,6 +366,7 @@ fn trace_remaining(
     } = state;
     for i in (a..b).rev() {
         let (h, n) = intersect(ray, &l.surfaces[i])?;
+        weight *= l.surfaces[i].transmission(h.x,h.y);
         ray.o = h;
         let n2 = if i == 0 { 1.0 } else { indices[i - 1] };
         let r = reflectance(n.dot(ray.d).abs(), current, n2, l.surfaces[i].coating, wave);
@@ -374,6 +382,7 @@ fn trace_remaining(
     }
     for i in a + 1..l.surfaces.len() {
         let (h, n) = intersect(ray, &l.surfaces[i])?;
+        weight *= l.surfaces[i].transmission(h.x,h.y);
         ray.o = h;
         let n2 = indices[i];
         let r = reflectance(n.dot(ray.d).abs(), current, n2, l.surfaces[i].coating, wave);
@@ -493,6 +502,49 @@ struct SensorSample {
     x: f32,
     y: f32,
     energy: f32,
+}
+
+// Clip a pupil triangle at ray-validity boundaries instead of dropping its
+// entire area. Bisection uses fixed pupil coordinates (never frame randomness).
+// Flux must shrink with the retained PUPIL area, not the projected sensor area.
+fn clip_pupil_triangle(
+    vertices: [((f64, f64), Option<SensorSample>); 3],
+    ch: usize,
+    triangles: &mut Vec<Triangle>,
+    mut sample: impl FnMut((f64, f64)) -> Option<SensorSample>,
+) {
+    let valid = vertices.iter().filter(|v| v.1.is_some()).count();
+    if valid == 0 { return; }
+    if valid == 3 {
+        triangles.push((ch, vertices[0].1.unwrap(), vertices[1].1.unwrap(), vertices[2].1.unwrap()));
+        return;
+    }
+    let mut polygon = Vec::with_capacity(4);
+    for i in 0..3 {
+        let a = vertices[i];
+        let b = vertices[(i + 1) % 3];
+        if let Some(hit) = a.1 { polygon.push((a.0, hit)); }
+        if a.1.is_some() != b.1.is_some() {
+            let (mut inside, mut outside, mut hit) = if let Some(hit) = a.1 {
+                (a.0, b.0, hit)
+            } else { (b.0, a.0, b.1.unwrap()) };
+            for _ in 0..10 {
+                let mid = ((inside.0 + outside.0) * 0.5, (inside.1 + outside.1) * 0.5);
+                if let Some(h) = sample(mid) { inside = mid; hit = h; }
+                else { outside = mid; }
+            }
+            polygon.push((inside, hit));
+        }
+    }
+    let area = |a: (f64,f64), b: (f64,f64), c: (f64,f64)|
+        ((b.0-a.0)*(c.1-a.1)-(b.1-a.1)*(c.0-a.0)).abs();
+    let original = area(vertices[0].0, vertices[1].0, vertices[2].0);
+    for i in 1..polygon.len()-1 {
+        let v = [polygon[0], polygon[i], polygon[i+1]];
+        let fraction = (area(v[0].0,v[1].0,v[2].0)/original) as f32;
+        let scaled = v.map(|(_,mut h)| { h.energy *= fraction; h });
+        triangles.push((ch,scaled[0],scaled[1],scaled[2]));
+    }
 }
 
 #[cfg(test)]
@@ -974,10 +1026,10 @@ fn render_with_workers(
     cfg: Config,
     workers: usize,
 ) -> Vec<[f32; 3]> {
-    render_internal::<true>(l, sources, w, h, cfg, workers, None)
+    render_internal::<true, true>(l, sources, w, h, cfg, workers, None)
 }
 
-fn render_internal<const SHARED_PREFIX: bool>(
+fn render_internal<const SHARED_PREFIX: bool, const CLIP: bool>(
     l: &LensSystem,
     sources: &[BrightSource],
     w: usize,
@@ -1039,7 +1091,7 @@ fn render_internal<const SHARED_PREFIX: bool>(
     let mut triangles = Vec::new();
     // Dispersion is invariant for every ray in this frame. Evaluate the exact
     // original f64 formula once per surface/wavelength, not per intersection.
-    let indices = [650.0, 550.0, 450.0]
+    let indices = cfg.wavelengths
         .map(|wave| l.surfaces.iter().map(|s| ior(s, wave)).collect::<Vec<_>>());
     let active_pairs: Vec<_> = pairs(l)
         .into_iter()
@@ -1076,7 +1128,7 @@ fn render_internal<const SHARED_PREFIX: bool>(
                 let Some((u, v)) = *pupil else {
                     continue;
                 };
-                for (ch, wave) in [650.0, 550.0, 450.0].into_iter().enumerate() {
+                for (ch, wave) in cfg.wavelengths.into_iter().enumerate() {
                     let mut ray = Ray {
                         o: V3 {
                             x: u * l.surfaces[0].semi_aperture,
@@ -1092,6 +1144,7 @@ fn render_internal<const SHARED_PREFIX: bool>(
                         let Some((h, normal)) = intersect(ray, &l.surfaces[i]) else {
                             break;
                         };
+                        weight *= l.surfaces[i].transmission(h.x,h.y);
                         ray.o = h;
                         let n2 = indices[ch][i];
                         let r = reflectance(
@@ -1157,7 +1210,7 @@ fn render_internal<const SHARED_PREFIX: bool>(
                     },
                     d,
                 };
-                for (ch, wave) in [650.0, 550.0, 450.].into_iter().enumerate() {
+                for (ch, wave) in cfg.wavelengths.into_iter().enumerate() {
                     let hit = if let Some(states) = &cached {
                         states[grid_index][ch]
                             .and_then(|state| trace_remaining(state, l, a, b, wave, &indices[ch]))
@@ -1167,7 +1220,11 @@ fn render_internal<const SHARED_PREFIX: bool>(
                     if let Some(hit) = hit {
                         let px = ((hit.p.x / (2. * sw) + 0.5) * w as f64) as f32;
                         let py = ((hit.p.y / (2. * sh) + 0.5) * h as f64) as f32;
-                        let val = src.rgb[ch] * hit.w as f32 * rw * cfg.gain * boost;
+                        // Rasterization distributes sample energy over pixel
+                        // area. Keep exposure independent of output resolution,
+                        // calibrated to the 320x180 optical reference frame.
+                        let pixel_area_scale = (w as f32 / 320.0) * (h as f32 / 180.0);
+                        let val = src.rgb[ch] * hit.w as f32 * rw * cfg.gain * boost * pixel_area_scale;
                         if val > 1e-12 {
                             sample[ch] = Some(SensorSample {
                                 x: px,
@@ -1202,6 +1259,24 @@ fn render_internal<const SHARED_PREFIX: bool>(
                         let i01 = i00 + n;
                         let i11 = i01 + 1;
                         for ch in 0..3 {
+                            if CLIP {
+                                let uv = |i: usize| (((i % n) as f64 + 0.5) * 2.0 / n as f64 - 1.0,
+                                    ((i / n) as f64 + 0.5) * 2.0 / n as f64 - 1.0);
+                                for ids in [[i00,i10,i11],[i00,i11,i01]] {
+                                    clip_pupil_triangle(ids.map(|i| (uv(i), samples[i][ch])), ch, &mut triangles, |(u,v)| {
+                                        if u*u+v*v > 1.0 { return None; }
+                                        let ray = Ray { o: V3 { x:u*l.surfaces[0].semi_aperture,
+                                            y:v*l.surfaces[0].semi_aperture,z:l.surfaces[0].z-20.0 }, d };
+                                        let hit = trace(ray,l,a,b,cfg.wavelengths[ch])?;
+                                        let energy = src.rgb[ch]*hit.w as f32*rw*cfg.gain*boost
+                                            *(w as f32/320.0)*(h as f32/180.0);
+                                        if energy <= 1e-12 { return None; }
+                                        Some(SensorSample { x:((hit.p.x/(2.0*sw)+0.5)*w as f64) as f32,
+                                            y:((hit.p.y/(2.0*sh)+0.5)*h as f64) as f32,energy })
+                                    });
+                                }
+                                continue;
+                            }
                             if let (Some(a), Some(b), Some(c)) =
                                 (samples[i00][ch], samples[i10][ch], samples[i11][ch])
                             {
@@ -1373,7 +1448,7 @@ pub fn ghost_mesh(
             }
         }
     };
-    render_internal::<true>(l, sources, w, h, cfg, 4, Some(&mut emit));
+    render_internal::<true, true>(l, sources, w, h, cfg, 4, Some(&mut emit));
     if failed {
         return None;
     }
@@ -1673,8 +1748,8 @@ fn bloom_with_workers(
     out
 }
 
-pub fn extract_sources(
-    src: &[u8],
+pub fn extract_sources<T: crate::pixel::Channel>(
+    src: &[T],
     w: usize,
     h: usize,
     threshold: f32,
@@ -1692,7 +1767,7 @@ pub fn extract_sources(
                 for xx in x..(x + ds).min(w) {
                     let o = (yy * w + xx) * 4;
                     for c in 0..3 {
-                        rgb[c] += src[o + 1 + c] as f32 / 255.0
+                        rgb[c] += src[o + 1 + c].unit32()
                     }
                     n += 1.0
                 }
@@ -1777,8 +1852,8 @@ mod tests {
                     surface_raster: grid != 4,
                     ..Config::default()
                 };
-                let expected = render_internal::<false>(&lens, &sources, 37, 23, cfg, 1, None);
-                let actual = render_internal::<true>(&lens, &sources, 37, 23, cfg, 1, None);
+                let expected = render_internal::<false, true>(&lens, &sources, 37, 23, cfg, 1, None);
+                let actual = render_internal::<true, true>(&lens, &sources, 37, 23, cfg, 1, None);
                 for (a, b) in expected.iter().flatten().zip(actual.iter().flatten()) {
                     assert_eq!(a.to_bits(), b.to_bits(), "lens={preset}, grid={grid}");
                 }
@@ -2168,6 +2243,21 @@ mod tests {
     }
 
     #[test]
+    fn ghost_exposure_is_resolution_independent() {
+        let lens = bundled_lens(0);
+        let source = [BrightSource { angle_x: 0.1, angle_y: 0.0, rgb: [1.0; 3] }];
+        let cfg = Config { ray_grid: 16, gain: 120000.0, ghost_blur: 0.0, ..Config::default() };
+        let mean = |w, h| {
+            let image = render(&lens, &source, w, h, cfg);
+            image.iter().flat_map(|p| p.iter()).map(|&v| v as f64).sum::<f64>() / (w*h) as f64
+        };
+        let low = mean(320,180);
+        let high = mean(640,360);
+        assert!(low > 0.0 && high > 0.0);
+        assert!((high / low - 1.0).abs() < 0.2, "mean exposure: {low} -> {high}");
+    }
+
+    #[test]
     fn extracts_sources_and_bloom_spreads_energy() {
         let mut src = vec![0_u8; 32 * 18 * 4];
         let o = (9 * 32 + 12) * 4;
@@ -2188,6 +2278,16 @@ mod tests {
             },
         );
         assert!(output.iter().filter(|p| p[0] > 0.0).count() > 1);
+    }
+
+    #[test]
+    fn float_highlights_keep_sub_byte_threshold_detail() {
+        let v = 0.5_f32 + 1.0/32768.0;
+        let src=[1.0_f32,v,v,v];
+        let sources=extract_sources(&src,1,1,0.5,1);
+        assert_eq!(sources.len(),1);
+        assert!(sources[0].rgb[0]>0.0);
+        assert!(sources[0].rgb[0]<1.0/255.0);
     }
 
     #[test]
@@ -2240,5 +2340,69 @@ mod tests {
         image
             .save("onmkFlare_hullin_surface_comparison.png")
             .unwrap();
+    }
+
+    #[test]
+    fn clipped_pupil_flux_changes_continuously() {
+        // A moving half-plane must retain its fractional energy, not the
+        // full energy of a newly appearing triangle.
+        let hit = |p:(f64,f64)| SensorSample {x:p.0 as f32,y:p.1 as f32,energy:1.0};
+        for step in 1..100 {
+            let cut=step as f64/100.0;
+            let sample=|p:(f64,f64)| (p.0 <= cut).then(|| hit(p));
+            let mut tris=Vec::new();
+            clip_pupil_triangle([(0.,0.),(1.,0.),(0.,1.)].map(|p|(p,sample(p))),0,&mut tris,sample);
+            let flux:f32=tris.iter().map(|(_,a,b,c)|(a.energy+b.energy+c.energy)/6.0).sum();
+            let expected=(cut-cut*cut/2.0) as f32;
+            assert!((flux-expected).abs()<0.001,"cut={cut} flux={flux} expected={expected}");
+        }
+    }
+
+    #[test]
+    #[ignore = "bounded moving-light comparison: old 32-grid vs clipped 64-grid"]
+    fn write_temporal_quality_preview() {
+        let root=std::env::var("ONMK_QUALITY_OUT").expect("set output directory");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut gif=image::codecs::gif::GifEncoder::new(std::fs::File::create(format!("{root}/motion.gif")).unwrap());
+        gif.set_repeat(image::codecs::gif::Repeat::Infinite).unwrap();
+        let (w,h)=(320,180);
+        let mut histories:Vec<Vec<Vec<f32>>>=vec![Vec::new();6];
+        let started=std::time::Instant::now();
+        for frame in 0..17 {
+            let mut canvas=image::RgbaImage::new(640,540);
+            for (row,lens) in [0,1,3].into_iter().enumerate() {
+                for variant in 0..2 {
+                    let cfg=Config {ray_grid:if variant==0 {32} else {64},gain:120000.,bloom_strength:2.5,bloom_radius:0.012,..Config::default()};
+                    let sources=[BrightSource {angle_x:-0.16+(frame as f64-8.)*0.0004,angle_y:-0.07,rgb:[1.,0.92,0.78]}];
+                    let mut rgb=if variant==0 {render_internal::<true,false>(&bundled_lens(lens),&sources,w,h,cfg,4,None)}
+                        else {render(&bundled_lens(lens),&sources,w,h,cfg)};
+                    let bloom=bloom(&source_layer(&sources,w,h),w,h,cfg);
+                    let mut displayed=Vec::with_capacity(w*h*3);
+                    for i in 0..w*h {
+                        for c in 0..3 {
+                            rgb[i][c]+=bloom[i][c];
+                            let v=rgb[i][c].max(0.);
+                            displayed.push((v/(1.+v)).powf(1./2.2));
+                        }
+                        canvas.put_pixel((variant*w+i%w) as u32,(row*h+i/w) as u32,image::Rgba([
+                            (displayed[i*3]*255.) as u8,(displayed[i*3+1]*255.) as u8,(displayed[i*3+2]*255.) as u8,255]));
+                    }
+                    histories[row*2+variant].push(displayed);
+                }
+            }
+            if frame==8 {canvas.save(format!("{root}/before-after.png")).unwrap();}
+            gif.encode_frame(image::Frame::from_parts(canvas,0,0,image::Delay::from_numer_denom_ms(100,1))).unwrap();
+            eprintln!("motion frame {frame}/16 elapsed {:?}",started.elapsed());
+        }
+        let mut report=String::from("Rows: Cooke, Double Gauss, Canon. Columns: old 32, clipped 64. 17 frames, angle step .0004 rad.\nDisplay-space temporal second difference (not a universal no-flicker proof):\n");
+        for (i,frames) in histories.iter().enumerate() {
+            let mut curvature=0.0_f64;
+            for f in frames.windows(3) {for p in 0..f[0].len() {curvature+=(f[2][p]-2.*f[1][p]+f[0][p]).abs() as f64;}}
+            curvature/=((frames.len()-2)*frames[0].len()) as f64;
+            report.push_str(&format!("case {i}: {curvature:.9}\n"));
+        }
+        report.push_str(&format!("elapsed {:?}\n",started.elapsed()));
+        std::fs::write(format!("{root}/metrics.txt"),&report).unwrap();
+        eprintln!("{report}");
     }
 }

@@ -55,17 +55,6 @@ pub struct PhysicsConfig {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum ForceField {
-    Gravity(Vec3),
-    Wind(Vec3),
-    Turbulence {
-        strength: f32,
-        scale: f32,
-        speed: f32,
-    },
-}
-
-#[derive(Clone, Copy, Debug)]
 pub struct AppearanceConfig {
     pub color_start: [f32; 4],
     pub color_end: [f32; 4],
@@ -439,14 +428,26 @@ impl ParticleSystem {
         age: f32,
     ) {
         let age = age.max(0.0);
-        let acceleration = Self::evaluate_force_stack(physics, particle.position, time);
+        // Gravity and wind are true accelerations. Turbulence is a constant-speed
+        // flow whose direction changes over time, so it never accelerates with age.
+        let acceleration = physics.gravity + physics.wind;
         let initial_velocity = particle.velocity;
 
         let drag = physics.air_resistance.clamp(0.0, 20.0);
         let vel_damping = if drag > 0.0 { (-drag * age).exp() } else { 1.0 };
 
         particle.position += initial_velocity * age * vel_damping + 0.5 * acceleration * age * age;
-        particle.velocity = initial_velocity * vel_damping + acceleration * age;
+        let (turbulence_offset, turbulence_velocity) = Self::turbulence_motion(
+            physics.turbulence_strength,
+            physics.turbulence_scale,
+            physics.turbulence_speed,
+            particle.position,
+            time - age,
+            time,
+        );
+        particle.position += turbulence_offset;
+        particle.velocity =
+            initial_velocity * vel_damping + acceleration * age + turbulence_velocity;
         particle.rotation += particle.rotation_speed * age * vel_damping;
         particle.age = age;
 
@@ -467,34 +468,6 @@ impl ParticleSystem {
         particle.size = particle.size.max(0.1) * size_mult.max(0.0);
         particle.color = lerp_color(appearance.color_start, appearance.color_end, life_t);
         particle.color[3] = (alpha_mult * opacity_jitter).clamp(0.0, 1.0);
-    }
-
-    fn evaluate_force_stack(physics: PhysicsConfig, position: Vec3, time: f32) -> Vec3 {
-        let mut acceleration = Vec3::ZERO;
-        for force in Self::force_stack(physics) {
-            acceleration += match force {
-                ForceField::Gravity(value) => value,
-                ForceField::Wind(value) => value,
-                ForceField::Turbulence {
-                    strength,
-                    scale,
-                    speed,
-                } => Self::turbulence_force(strength, scale, speed, position, time),
-            };
-        }
-        acceleration
-    }
-
-    fn force_stack(physics: PhysicsConfig) -> [ForceField; 3] {
-        [
-            ForceField::Gravity(physics.gravity),
-            ForceField::Wind(physics.wind),
-            ForceField::Turbulence {
-                strength: physics.turbulence_strength,
-                scale: physics.turbulence_scale,
-                speed: physics.turbulence_speed,
-            },
-        ]
     }
 
     fn random_emitter_position(&self, rng: &mut fastrand::Rng) -> Vec3 {
@@ -564,18 +537,60 @@ impl ParticleSystem {
         (Quat::from_axis_angle(rot_axis, angle) * base).normalize_or_zero()
     }
 
-    fn turbulence_force(strength: f32, scale: f32, speed: f32, position: Vec3, time: f32) -> Vec3 {
-        if strength <= 0.0 {
-            return Vec3::ZERO;
-        }
+    fn turbulence_basis(scale: f32, position: Vec3) -> (Vec3, Vec3, Vec3, f32) {
         let scale = scale.max(0.0001);
-        let t = time * speed;
-        let sample = Vec3::new(
-            ((position.x / scale) + t).sin(),
-            ((position.y / scale) - t * 1.7).cos(),
-            ((position.x + position.y) / scale + t * 0.7).sin(),
-        );
-        sample.normalize_or_zero() * strength
+        let px = position.x / scale;
+        let py = position.y / scale;
+        let phase = px * 1.37 + py * 2.11;
+        let forward = Vec3::new(px.sin(), py.cos(), (px + py).sin()).normalize_or_zero();
+        let forward = if forward.length_squared() > 0.5 {
+            forward
+        } else {
+            Vec3::X
+        };
+        let reference = if forward.z.abs() < 0.9 {
+            Vec3::Z
+        } else {
+            Vec3::Y
+        };
+        let tangent = forward.cross(reference).normalize_or_zero();
+        let bitangent = forward.cross(tangent).normalize_or_zero();
+        (forward, tangent, bitangent, phase)
+    }
+
+    fn turbulence_motion(
+        strength: f32,
+        scale: f32,
+        speed: f32,
+        position: Vec3,
+        birth_time: f32,
+        time: f32,
+    ) -> (Vec3, Vec3) {
+        if strength <= 0.0 || speed.abs() <= f32::EPSILON {
+            return (Vec3::ZERO, Vec3::ZERO);
+        }
+
+        let (forward, tangent, bitangent, phase) = Self::turbulence_basis(scale, position);
+        let omega = speed;
+        let start_phase = phase + birth_time * omega;
+        let end_phase = phase + time * omega;
+        let age = (time - birth_time).max(0.0);
+
+        // Move along a gently curving helix. The forward component prevents the
+        // particle from being pulled back to its spawn point, while the rotating
+        // lateral component supplies the floaty change of direction.
+        const WOBBLE_ANGLE: f32 = 0.65;
+        let forward_weight = WOBBLE_ANGLE.cos();
+        let lateral_weight = WOBBLE_ANGLE.sin();
+        let offset = strength
+            * (forward * (forward_weight * age)
+                + tangent * (lateral_weight * (end_phase.sin() - start_phase.sin()) / omega)
+                + bitangent * (lateral_weight * (start_phase.cos() - end_phase.cos()) / omega));
+        let velocity = strength
+            * (forward * forward_weight
+                + (tangent * end_phase.cos() + bitangent * end_phase.sin()) * lateral_weight);
+
+        (offset, velocity)
     }
 }
 
@@ -725,5 +740,33 @@ mod tests {
         let particles = system.get_particles();
         assert_eq!(particles.len(), 2);
         assert!(particles[1].velocity.normalize().dot(Vec3::Y) > 0.999);
+    }
+
+    #[test]
+    fn turbulence_keeps_constant_speed_without_returning_to_origin() {
+        let strength = 12.0;
+        let position = Vec3::new(20.0, -10.0, 0.0);
+        let (short_offset, short_velocity) =
+            ParticleSystem::turbulence_motion(strength, 80.0, 1.0, position, 0.0, 1.0);
+        let (long_offset, long_velocity) =
+            ParticleSystem::turbulence_motion(strength, 80.0, 1.0, position, 0.0, 100.0);
+
+        assert!((short_velocity.length() - strength).abs() < 0.001);
+        assert!((long_velocity.length() - strength).abs() < 0.001);
+        assert!(long_offset.length() > short_offset.length() * 20.0);
+    }
+
+    #[test]
+    fn turbulence_starts_without_a_position_jump() {
+        let (offset, _) = ParticleSystem::turbulence_motion(
+            12.0,
+            80.0,
+            1.0,
+            Vec3::new(20.0, -10.0, 0.0),
+            4.0,
+            4.0,
+        );
+
+        assert_eq!(offset, Vec3::ZERO);
     }
 }

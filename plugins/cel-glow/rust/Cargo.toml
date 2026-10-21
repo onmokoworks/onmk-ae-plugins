@@ -1,5 +1,6 @@
 [workspace]
 members = ["celglow-core", "celglow-cli", "celglow2"]
+exclude = ["celglow"]
 resolver = "2"
 
 [workspace.package]

@@ -36,12 +36,34 @@ pub struct Image {
 }
 
 impl Image {
-    pub fn transparent(width: usize, height: usize) -> Self {
-        Self {
-            pixels: vec![[0.0; 4]; width * height],
+    fn count(width: usize, height: usize) -> Result<usize, after_effects::Error> {
+        if width > i32::MAX as usize || height > i32::MAX as usize {
+            return Err(after_effects::Error::BadCallbackParameter);
+        }
+        let count = width.checked_mul(height).ok_or(after_effects::Error::OutOfMemory)?;
+        if count > isize::MAX as usize / std::mem::size_of::<[f32; 4]>() {
+            return Err(after_effects::Error::OutOfMemory);
+        }
+        Ok(count)
+    }
+
+    pub fn validate(&self) -> Result<(), after_effects::Error> {
+        if self.pixels.len() != Self::count(self.width, self.height)? {
+            return Err(after_effects::Error::BadCallbackParameter);
+        }
+        Ok(())
+    }
+
+    pub fn transparent(width: usize, height: usize) -> Result<Self, after_effects::Error> {
+        let count = Self::count(width, height)?;
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(count).map_err(|_| after_effects::Error::OutOfMemory)?;
+        pixels.resize(count, [0.0; 4]);
+        Ok(Self {
+            pixels,
             width,
             height,
-        }
+        })
     }
 }
 
@@ -49,10 +71,10 @@ impl Image {
 ///
 /// Coordinates point at pixel centers so projecting an equally sized texture
 /// through the generated map reproduces the texture without a half-pixel shift.
-pub fn generate_planar(width: usize, height: usize, v_origin_bottom: bool) -> Image {
-    let mut out = Image::transparent(width, height);
+pub fn generate_planar(width: usize, height: usize, v_origin_bottom: bool) -> Result<Image, after_effects::Error> {
+    let mut out = Image::transparent(width, height)?;
     if width == 0 || height == 0 {
-        return out;
+        return Ok(out);
     }
 
     for y in 0..height {
@@ -68,11 +90,11 @@ pub fn generate_planar(width: usize, height: usize, v_origin_bottom: bool) -> Im
         }
     }
 
-    out
+    Ok(out)
 }
 
 #[inline]
-fn wrap_index(i: i32, n: i32, mode: WrapMode) -> i32 {
+fn wrap_index(i: i64, n: i64, mode: WrapMode) -> i64 {
     if n <= 1 {
         return 0;
     }
@@ -92,16 +114,18 @@ fn wrap_index(i: i32, n: i32, mode: WrapMode) -> i32 {
 }
 
 #[inline]
-fn texel(image: &Image, x: i32, y: i32, wrap: WrapMode) -> [f32; 4] {
-    let xx = wrap_index(x, image.width as i32, wrap) as usize;
-    let yy = wrap_index(y, image.height as i32, wrap) as usize;
+fn texel(image: &Image, x: i64, y: i64, wrap: WrapMode) -> [f32; 4] {
+    let xx = wrap_index(x, image.width as i64, wrap) as usize;
+    let yy = wrap_index(y, image.height as i64, wrap) as usize;
     image.pixels[yy * image.width + xx]
 }
 
 #[inline]
 fn bilinear_sample(image: &Image, fx: f32, fy: f32, wrap: WrapMode) -> [f32; 4] {
-    let x0 = fx.floor() as i32;
-    let y0 = fy.floor() as i32;
+    // Finite decoded UVs can span 65536 texture widths. Pixel indices must
+    // remain wide until wrapping, including the adjacent bilinear sample.
+    let x0 = fx.floor() as i64;
+    let y0 = fy.floor() as i64;
     let dx = fx - x0 as f32;
     let dy = fy - y0 as f32;
     let c00 = texel(image, x0, y0, wrap);
@@ -127,8 +151,10 @@ fn uv_at_output_pixel(uv: &Image, x: usize, y: usize, out_w: usize, out_h: usize
     bilinear_sample(uv, fx, fy, WrapMode::Clamp)
 }
 
-pub fn project(p: &UvParams, uv: &Image, texture: &Image, out_w: usize, out_h: usize) -> Image {
-    let mut out = Image::transparent(out_w, out_h);
+pub fn project(p: &UvParams, uv: &Image, texture: &Image, out_w: usize, out_h: usize) -> Result<Image, after_effects::Error> {
+    uv.validate()?;
+    texture.validate()?;
+    let mut out = Image::transparent(out_w, out_h)?;
     if uv.width == 0
         || uv.height == 0
         || texture.width == 0
@@ -136,7 +162,7 @@ pub fn project(p: &UvParams, uv: &Image, texture: &Image, out_w: usize, out_h: u
         || out_w == 0
         || out_h == 0
     {
-        return out;
+        return Ok(out);
     }
 
     for y in 0..out_h {
@@ -163,7 +189,7 @@ pub fn project(p: &UvParams, uv: &Image, texture: &Image, out_w: usize, out_h: u
             let sample = if p.bilinear {
                 bilinear_sample(texture, fx, fy, p.wrap)
             } else {
-                texel(texture, fx.round() as i32, fy.round() as i32, p.wrap)
+                texel(texture, fx.round() as i64, fy.round() as i64, p.wrap)
             };
 
             let mut coverage = p.opacity;
@@ -177,12 +203,78 @@ pub fn project(p: &UvParams, uv: &Image, texture: &Image, out_w: usize, out_h: u
         }
     }
 
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checked_images_reject_invalid_geometry_before_allocation_or_sampling() {
+        assert!(Image::transparent(usize::MAX,2).is_err());
+        assert!(Image::transparent(i32::MAX as usize,i32::MAX as usize).is_err());
+        assert!(generate_planar(usize::MAX,0,false).is_err());
+        assert!(Image::transparent(0,7).unwrap().pixels.is_empty());
+        let valid = Image::transparent(1,1).unwrap();
+        let bad = Image { width:2,height:2,pixels:vec![[0.0;4]] };
+        let p = UvParams { v_origin_bottom:false,wrap:WrapMode::Clamp,bilinear:true,use_uv_alpha:true,opacity:1.0 };
+        assert!(project(&p,&bad,&valid,1,1).is_err());
+        assert!(project(&p,&valid,&bad,1,1).is_err());
+        assert!(project(&p,&valid,&valid,usize::MAX,1).is_err());
+        assert!(project(&p,&valid,&valid,0,1).unwrap().pixels.is_empty());
+    }
+
+    #[test]
+    fn large_finite_uvs_preserve_wrap_and_signed_hdr_samples() {
+        let width = 40000;
+        let texture = Image { width, height: 1,
+            pixels: (0..width).map(|i| [1.0, i as f32 / width as f32, -0.25, 2.0]).collect() };
+        for u in [-65536.0f32, 65536.0] {
+            let uv = Image { width: 1, height: 1, pixels: vec![[1.0,u,0.5,0.0]] };
+            for wrap in [WrapMode::Clamp, WrapMode::Repeat, WrapMode::Mirror] {
+                for bilinear in [false,true] {
+                    let params = UvParams { v_origin_bottom:false, wrap, bilinear,
+                        use_uv_alpha:true, opacity:0.5 };
+                    let result = project(&params,&uv,&texture,1,1).unwrap();
+                    // f32 represents u*40000 exactly here; the half-texel term
+                    // is below its precision. The wrap period divides it exactly.
+                    let index = if wrap == WrapMode::Clamp && u > 0.0 { width-1 } else { 0 };
+                    let expected = texture.pixels[index].map(|value|value*0.5);
+                    assert_eq!(result.pixels[0],expected,"u={u}, bilinear={bilinear}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_indices_cover_negative_and_past_end_coordinates() {
+        for (mode, expected) in [
+            (WrapMode::Clamp, [0,0,0,0,0,1,2,2,2,2]),
+            (WrapMode::Repeat, [2,0,1,2,0,1,2,0,1,2]),
+            (WrapMode::Mirror, [2,2,1,0,0,1,2,2,1,0]),
+        ] {
+            for (index, want) in (-4..6).zip(expected) {
+                assert_eq!(wrap_index(index, 3, mode), want);
+                assert_eq!(wrap_index(index, 1, mode), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn bilinear_wrap_seams_match_hand_computed_colors() {
+        let texture = Image { width:3, height:1,
+            pixels:vec![[1.0,0.0,0.0,0.0],[1.0,0.5,0.0,0.0],[1.0,1.0,0.0,0.0]] };
+        for (mode, expected) in [
+            (WrapMode::Clamp, [0.0,0.0,1.0,1.0]),
+            (WrapMode::Repeat, [0.75,0.5,0.5,0.25]),
+            (WrapMode::Mirror, [0.25,0.0,1.0,0.75]),
+        ] {
+            for (x,want) in [-1.5,-0.5,2.5,3.5].into_iter().zip(expected) {
+                assert_eq!(bilinear_sample(&texture,x,0.0,mode), [1.0,want,0.0,0.0]);
+            }
+        }
+    }
 
     #[test]
     fn preserves_sub_8_bit_uv_precision() {
@@ -208,7 +300,7 @@ mod tests {
             &texture,
             1,
             1,
-        );
+        ).unwrap();
         assert!((result.pixels[0][1] - 0.5002).abs() < 0.001);
     }
 
@@ -236,7 +328,7 @@ mod tests {
             &texture,
             1,
             1,
-        );
+        ).unwrap();
         assert!((result.pixels[0][0] - 0.5).abs() < 1.0e-6);
         assert!((result.pixels[0][1] - 0.5).abs() < 1.0e-6);
     }
@@ -253,7 +345,7 @@ mod tests {
             width: 2,
             height: 2,
         };
-        let uv = generate_planar(2, 2, true);
+        let uv = generate_planar(2, 2, true).unwrap();
         let result = project(
             &UvParams {
                 v_origin_bottom: true,
@@ -266,14 +358,14 @@ mod tests {
             &texture,
             2,
             2,
-        );
+        ).unwrap();
         assert_eq!(result.pixels, texture.pixels);
     }
 
     #[test]
     fn planar_uv_respects_v_origin() {
-        let top = generate_planar(1, 2, false);
-        let bottom = generate_planar(1, 2, true);
+        let top = generate_planar(1, 2, false).unwrap();
+        let bottom = generate_planar(1, 2, true).unwrap();
         assert_eq!(top.pixels[0], [1.0, 0.5, 0.25, 0.0]);
         assert_eq!(top.pixels[1], [1.0, 0.5, 0.75, 0.0]);
         assert_eq!(bottom.pixels[0], [1.0, 0.5, 0.75, 0.0]);

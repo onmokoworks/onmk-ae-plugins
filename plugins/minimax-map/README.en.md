@@ -1,5 +1,17 @@
 # MinimaxMap
 
+Smart Render retains input origin and neighboring pixels before cropping output.
+Mapped renders conservatively request full primary/map bounds. Maximum output
+bounds do not shrink to the current ROI. Unit tests cover the crop/dependency
+rules, but real-host partial ROI, upstream expansion and downsampling remain
+under validation.
+
+Empty, truncated or dimension-overflowing radius maps use the no-map fallback.
+Valid black maps remain distinct and produce zero radius when not inverted.
+Regression tests cover empty-map bounds safety; headless fixtures cover constant
+maps, inversion, fractional radii and directions. Actual AE empty-world fault
+injection is not certified.
+
 [日本語](./README.md) | [English](./README.en.md)
 
 MinimaxMap is an Adobe After Effects effect plug-in for signed, linear morphological minimum/maximum filtering with optional radius-map control.

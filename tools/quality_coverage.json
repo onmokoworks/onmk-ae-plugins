@@ -1,0 +1,214 @@
+{
+  "schema": "onmk.quality_coverage.v1",
+  "audit_directory": "tools/target/quality-audit-20261004",
+  "scope": "Initial evidence index, not full plugin certification. See local status.json for failure classification and remaining requirements.",
+  "current_binary_reconciliation": {
+    "result": "26of26 current build DLL SHA256 values match their indexed primary summary plugin_sha256;0missing files,0mismatches after recent fixes",
+    "scope": "Exact tools/target/quality-build/release/<target_with_underscores>.dll paths;legacy celglow uses tools/target/quality-build-legacy/release/celglow.dll. No recursive scan.",
+    "limits": "This ties existing evidence to build artifacts only,not every current source file or installed MediaCore artifact. Depth/Prism nonpassing entries remain nonpassing;hash equality does not certify correctness. Do not repeat unchanged reconciliation as new coverage."
+  },
+  "targets": {
+    "adaptive_filter": "adaptive-assignment-aware-236",
+    "celglow": "celglow-gpu-cache",
+    "celglow2": "celglow2-build-refresh-180",
+    "depthonnxae": "depth-cleanup-rebuilt-20261005",
+    "edge-smith": "edge-smith-checkin-precedence",
+    "frame-slice": "frame-slice-classic-fixed-20261005",
+    "luma-grain": "luma-grain-build-refresh-180",
+    "luma-normal": "luma-normal-build-refresh-180",
+    "mask-offset": "mask-offset-edge-fixed-20261005",
+    "mask-transform": "mask-transform-world-copy",
+    "median_pro": "median-pro-world-guards",
+    "minimax-map": "minimax-map-combined-spatial",
+    "onmk_film_ae": "onmk_film_ae-build-refresh-180",
+    "onmk_flare": "onmk-flare-smoke",
+    "onmk-glow": "onmk-glow-radius-guards",
+    "particlekit": "particlekit-cache-budget-20261005",
+    "lattice_lab_plugin": "lattice-lab-axis-checkpoint",
+    "path-array": "path-array-edge-fixed-20261005",
+    "prism-warp": "prism-current-binary-20261005",
+    "refraction-dispersion": "refraction-blur-boundary",
+    "rio-grade": "rio-grade-in-place",
+    "scatter-map": "scatter-map-core-guards",
+    "shape-plus": "shape-plus-fixed-smoke",
+    "starglow": "starglow-map-errors",
+    "tui_image_renderer": "tui-image-color-tone-checkpoint",
+    "uv-project": "uv-project-world-access"
+  },
+  "supplemental_evidence": {
+    "starglow": [],
+    "onmk-glow": ["onmk-glow-controls-244", "onmk-glow-channels-245"],
+    "refraction-dispersion": ["refraction-aux-layers-neutral", "refraction-spatial-aux"],
+    "adaptive_filter": ["adaptive-spatial-host-238"],
+    "celglow": ["celglow-edt-guards"],
+    "prism-warp": ["prism-warp-checkin", "prism-warp-constant-aux", "prism-warp-spatial-matte", "prism-warp-ramp-lens", "prism-current-binary-retry-20261005"],
+    "scatter-map": ["scatter-map-spatial-oracle", "scatter-map-fractional-oracle", "scatter-map-mix-oracle"],
+    "lattice_lab_plugin": ["lattice-lab-native16-lowbits", "lattice-lab-lowbits-refresh-142"],
+    "luma-normal": ["luma-normal-field-oracle", "luma-normal-blur-reuse", "luma-normal-boundary-oracle", "luma-normal-boundary-rebuilt", "luma-normal-provenance"],
+    "median_pro": ["median-pro-mapped-oracle", "median-pro-weighted-oracle", "median-pro-iterations", "median-pro-fallible-core"],
+    "rio-grade": ["rio-grade-controls"],
+    "minimax-map": ["minimax-map-aux-fractional", "minimax-map-directions", "minimax-map-result-bounds", "minimax-map-alpha-channels"],
+    "uv-project": ["uv-project-aux-texture-relative", "uv-project-aux-spatial", "uv-project-texture-role", "uv-project-uv-alpha-host-premult", "uv-project-alpha-input-proof", "uv-project-wrap"],
+    "celglow2": ["celglow2-checkout", "celglow2-gpu-dimensions", "celglow2-core-error-transport", "celglow2-roi-copy"],
+    "frame-slice": ["frame-slice-tile-fastpath", "frame-slice-gpu-guards", "frame-slice-mix-rounding", "frame-slice-temporal-empty", "frame-slice-core-allocation", "frame-slice-gpu-cache"],
+    "luma-grain": ["luma-grain-color-corrected", "luma-grain-checkin", "luma-grain-hash-oracle"],
+    "onmk_film_ae": ["onmk-film-alpha-check", "onmk-film-checkin", "onmk-film-windows-fallback", "onmk-film-readback-fallback"]
+  },
+  "declared_depths": {
+    "adaptive_filter": ["argb8", "argb16", "argb32f"],
+    "celglow": ["argb8", "argb16", "argb32f"],
+    "celglow2": ["argb8", "argb16", "argb32f"],
+    "depthonnxae": ["argb8", "argb16", "argb32f"],
+    "edge-smith": ["argb8", "argb16", "argb32f"],
+    "frame-slice": ["argb8"],
+    "luma-grain": ["argb8"],
+    "luma-normal": ["argb8"],
+    "mask-offset": ["argb8"],
+    "mask-transform": ["argb8"],
+    "median_pro": ["argb8"],
+    "minimax-map": ["argb8"],
+    "onmk_film_ae": ["argb8", "argb16", "argb32f"],
+    "onmk_flare": ["argb8", "argb16"],
+    "onmk-glow": ["argb8", "argb16", "argb32f"],
+    "particlekit": ["argb8"],
+    "lattice_lab_plugin": ["argb8", "argb16"],
+    "path-array": ["argb8"],
+    "prism-warp": ["argb8", "argb16", "argb32f"],
+    "refraction-dispersion": ["argb8", "argb16", "argb32f"],
+    "rio-grade": ["argb8"],
+    "scatter-map": ["argb8", "argb16", "argb32f"],
+    "shape-plus": ["argb8", "argb16", "argb32f"],
+    "starglow": ["argb8", "argb16", "argb32f"],
+    "tui_image_renderer": ["argb8"],
+    "uv-project": ["argb8", "argb16", "argb32f"]
+  },
+  "depth_declaration_scope": "Source PiPL build.rs declarations reviewed in wave184, not runtime capability certification. A passed depth case alone does not prove low-bit preservation, native input precision, or all render paths.",
+  "host_input_precision_review": {
+    "scope": "Current Windows --render-fixture path only; not every lower-level AEXCompat API",
+    "harness_sha256": "13fcf1171143f2203bb59d7bd7a52fadcbe4e8ca66e54b85974d4cbe7fdcece1",
+    "source_repository": "D:/Projects/01_Project/04_Tools/AEXCompat",
+    "source_chain": [
+      "broker/crates/broker/src/render_fixture.rs:83 DeclarativeRenderFixture: primary_layer path, no raw input-world field; deny_unknown_fields",
+      "broker/crates/broker/src/image_render/declarative_fixture.rs:165 render_experimental_artifact_at_time receives primary path",
+      "broker/crates/broker/src/image_render/session.rs:146 decoded.into_rgba8() before transport; selected layers and masks similarly converted"
+    ],
+    "session_source_sha256": "b9b3329965358f115f495914fd03134c200dcfbdece2d4b443277b4235a97038",
+    "fixture_source_sha256": "56700bfba6118957264ef9d0d4fde35df2f8a631579378b89932475d61bc6743",
+    "consequence": "Changing input PNG to16bit or selecting raw final output cannot establish native16 low-bit or signed HDR input preservation through this fixture path. Direct plugin typed-buffer tests remain separate evidence. Source hashes do not prove source/binary build correspondence. No host changes made."
+  },
+  "host_spatial_fixture_review": {
+    "scope": "Current --render-fixture schema, not all lower-level host APIs",
+    "source": "D:/Projects/01_Project/04_Tools/AEXCompat/broker/crates/broker/src/render_fixture.rs",
+    "sha256": "56700bfba6118957264ef9d0d4fde35df2f8a631579378b89932475d61bc6743",
+    "evidence": "DeclarativeRenderFixture lists paths/parameters/format/render path/premultiplication/timing/artifacts/checkpoints with deny_unknown_fields. InteractiveParameter provides layer_path, but canonical parameter validation admits no origin/transform fields. No requested ROI field exists.",
+    "consequence": "Existing fixture path cannot request translated auxiliary worlds or custom output ROI. Zero-origin size-mismatch fixtures and direct offset helper tests remain separate; neither proves native AE ROI transport. No host edits. Source review does not establish source/binary correspondence."
+  },
+  "host_temporal_fixture_review": {
+    "scope": "Current declarative --render-fixture source path, not every lower-level API",
+    "sources": {
+      "broker/crates/broker/src/image_render/declarative_fixture.rs": "781187a50cee3b1541e553ea61671d19127ec9e3248f4490af877b3cda88822d",
+      "broker/crates/broker/src/image_render/session.rs": "b9b3329965358f115f495914fd03134c200dcfbdece2d4b443277b4235a97038"
+    },
+    "evidence": "Fixture has one primary_layer plus timing; passes primary path and timing to render_experimental_artifact_at_time. Session decodes that input image to one RGBA buffer. No time-indexed image sequence field exists in canonical schema.",
+    "consequence": "Static fixtures cannot prove distinct temporal frame checkout. Direct time-selection and varied-frame CPU/GPU tests are separate evidence, not native host temporal proof. Source/binary identity not established; no host changes."
+  },
+  "maskoffset_control_host_verification": {
+    "scope": "Existing Smart ARGB8 typed-request route,opaque17x31pattern,closed rectangle(4,6)-(12,24),MaskAlpha,Feather2 and Invert0/1",
+    "evidence_directory": "maskoffset-controls-20261005",
+    "plugin_sha256": "4c28a253138c55ba9210231927adc23b04ae6628bd258a9d3df133d8e56fc925",
+    "output_sha256": ["e23d38ddadb59a52b54df3752f3f30bb101ffd464fb4e0f2f3aed0fd6ca90393", "ad89cb635075afd7d0521cf61b8a900bb977321c8a40a2a94526e129c29a3b1d"],
+    "oracle": "Independent rectangle edge distance at pixel centers,coverage=clamp(distance/2,0,1)inside and0outside. Full RGBA error<=1integer code;normal+inverted RGBA reconstructs original within1code. Outside exactlyzero;interior x[6,10),y[8,22)exactlysource. Edge alpha63,interior255. Guards/lifetimes pass,nohostwarning.",
+    "limitations": "Two separate renders,not same-instance parameter invalidation. Opaque8bit input and rectangular geometry only;no deep-input/nativeAE/fill-mode/curved-mask certification. No production changes."
+  },
+  "median_optional_map_policy_review": {
+    "decision": "Do not automatically change optional-map fallback into a fatal render error. README explicitly documents invalid auxiliary maps using no-map behavior; this differs from PathArray discarding primary PreRender errors.",
+    "source_sha256": "6b4136ef21cdaf308bb47a4772c8720fcab0d5ab436febb1ed3f5cd885b725cf",
+    "readme_sha256": "757ac87b87fefaa09c67a5e4314692da48b6f57df34cb289f0746c9b646d2c6b",
+    "test_executable_sha256": "516cbdb3e30758bf99357fadbdffb042bbebf6a5e4dc6d23a2b498612fe2979f",
+    "verification": "Existing release --lib suite8passed. Empty/truncated/overflow map helpers returnNone; valid black map yields zero-radius and inverted map yields1. Cleanup tests establish Result error precedence and nested map/input release. No production changes.",
+    "limitations": "Helper tests do not inject malformed host checkout worlds, allocation failure or callback errors. Whether distinct allocation/host failures should override the documented fallback is a product policy question, not established as a bug by a discarded Result alone."
+  },
+  "path_array_vector_host_verification": {
+    "scope": "Smart ARGB8, 17x31 opaque source layer, open two-vertex straight mask, copies1, orientation/composite-original disabled",
+    "evidence_directory": "path-array-vector-20261005",
+    "plugin_sha256": "d3a57058a606358ee39039716d7bf196ad644c00632dd8622348a9d78ccc1c12",
+    "result": "center.json path(8.5,15.5)-(12.5,15.5) places single copy at midpoint(10.5,15.5): source translated+2x. shift.json path(4.5,7.5)-(8.5,7.5) places at(6.5,7.5):source translated-2x,-8y. Both exactly match independent clipped-translation RGBA arrays;0different pixels. Guards intact,world lifetimes balanced,host warning false.",
+    "center_png_sha256": "72e9a0381f811fb6aa2e98fbd6aeddaF1e0de196489c3a7964fc3bb98a9cf6fc",
+    "shift_png_sha256": "e739ed19da8333fffd264f020cbba073a34af694e7cb2d0ee34e1e60eeee01bb",
+    "limitations": "Initial first-vertex oracle failed; source confirms open-path copies1 uses fraction0.5, so midpoint oracle is correct. No plugin change. Does not certify arbitrary curves, rotation, temporal source changes, expansion, deep input, same-instance redraw or native AE. PNG evidence stays separate from raw smoke counts."
+  },
+  "celglow_direct_cache_verification": {
+    "scope": "Legacy CelGlow GPU processor, not CelGlow2 or AE instance lifecycle",
+    "command": "cargo test --manifest-path plugins/cel-glow/rust/celglow/Cargo.toml --release --locked --offline --target-dir tools/target/quality-build-legacy --lib gpu::tests:: -- --include-ignored --test-threads=1",
+    "result": "5 passed,0 failed,0 ignored; real GPU tests included. Same processor handles thin/odd size transitions, same-size seed-location A/B/A, max_d change and exact restoration, CPU-distance/GPU-distance analytic comparisons, allocation budget/entry cap and invalid-shape/readback cleanup tests.",
+    "source_sha256": "199b1effd2fa815e488f5f6791f47c3ba21609321e5e8955898724044f050270",
+    "test_executable_sha256": "4c33062b411c6e719b404dadf9dd5aea6a07c03a17332e2335e87f068a72e1f7",
+    "limitations": "Tests exercise distance debug view and one normalization parameter, not every glow control, arbitrary multi-seed EDT, concurrent MFR or native AE GPU-world transport. Only test code changed; deployed/build DLL unchanged."
+  },
+  "host_resize_session_review": {
+    "scope": "Existing public CLI session wrapper and broker InteractiveImageSession source; not every native/internal transport API",
+    "sources": {
+      "broker/crates/harness/src/windows/cli.rs": "a5ac0e13eb0acb34ac09e055c38b9a2c5a02c2a7c13ea968acfc49f37d10d1e6",
+      "broker/crates/broker/src/image_render/session.rs": "b9b3329965358f115f495914fd03134c200dcfbdece2d4b443277b4235a97038"
+    },
+    "evidence": "CLI --render-experimental-session dispatches a length-one image wrapper. InteractiveSessionOpen explicitly fixes dimensions for session lifetime and requires close/reopen when they change; InteractiveImageSession::render accepts pixels/time/parameters/output but no dimensions. Output expansion capacity is not primary-input resize.",
+    "consequence": "No verified same-instance input-resize route through these APIs. Independent size renders remain valid layout tests but not cache-invalidation proof. Per-frame parameter updates are a separate supported API capability and must not be conflated with resize. No host edits or plugin workaround added; source/binary correspondence not established."
+  },
+  "completion_gate_review": {
+    "verdict": "not_complete",
+    "method": "Self-review under long-horizon-goal-guard; original scope retained, no delegated review authorized. Counts and passing defaults are not all-control certification.",
+    "inventory_and_records": "26 targets have indexed primary summaries, declared-depth inventory and evidence limitations. Recent rebuilds and direct mask/cache evidence are recorded separately. This proves inventory/record presence, not complete quality coverage.",
+    "depth_precision": "PNG8-derived host runs cannot establish native16 low-bit/HDR input preservation. Direct typed-buffer regressions are separate evidence; no all-target native host certification claimed.",
+    "inputs_and_dimensions": "Black/transparent/thin/odd inputs recorded in runner evidence. Independent workers do not prove same-instance resize; known host session dimension constraint remains. Direct cache tests cover named processors only.",
+    "parameters_and_redraw": "Known CelGlow2 blend/placement and Depth Fixed range gaps are still present in current source. No verified CLI route for MaskTransform Apply. Actual AE event/redraw coverage remains incomplete.",
+    "gpu_memory_fallback": "Internal GPU tests and retained-buffer budgets are not native AE GPU-world/MFR or total-process-memory proof. FrameSlice high-concurrency stall and Prism OS access-denied cause remain unresolved.",
+    "asset_or_policy_dependencies": ["Depth model/runtime for real inference; Fixed range bounds/policy", "CelGlow2 documented blend semantics versus existing partial-alpha look"],
+    "independent_next_check": "PathArray reproduced expansion defect repaired and rechecked:sampled contour edge offsets now give pixel(2,4) forExpansion2,zero remains(4,6). See path-array-expansion-20261005/*-fixed.png. Arbitrary topology changes remain outside verified coverage; no all-geometry claim.",
+    "scope_boundary": "No new host implementation, GUI, dependency install, deployment or product compatibility redesign. Existing known limitations do not justify relabeling the entire goal complete or blocked while independent checks remain."
+  },
+  "frame_slice_shared_processor_verification": {
+    "serial_suite_checkpoint": "Full current lib suite:24 passed,0 failed,0 ignored in6.15s with --test-threads=1. Includes new shared-processor test and existing worker-churn/actual-buffer-size cache test. No new cache mechanism needed: get_state evicts before admission at8entries or512MiB accounted buffer payload. Driver allocations, host staging vectors and actual native AE MFR remain outside this bound. Earlier independently initialized parallel-suite stall remains unresolved; this checkpoint does not resolve it. Close this bounded FrameSlice investigation rather than repeat the same passing cases.",
+    "command": "cargo test --manifest-path plugins/frame-slice/Cargo.toml --release --locked --offline --target-dir tools/target/quality-build --lib shared_processor_concurrent_workers_keep_frame_data_separate -- --test-threads=1",
+    "result": "1 passed,23 filtered;1.16s. Two concurrent callers share one processor and render six distinct images with size changes/restoration. All channels match CPU within one code. A single start barrier avoids blocking the surviving worker after an assertion failure.",
+    "source_sha256": "086ac9dea2ce28e595b4e23b58f06035520cd1589c9dc2fcb869f482e58f3103",
+    "test_executable_sha256": "c52826b188dc8ceef88cf9b66d91e9836a03e13a041a0d2d1a303a1a3b499445",
+    "limitations": "Test-only change; product DLL unchanged. Shared processor locking serializes rendering/readback. This proves isolated results for concurrent callers, not simultaneous GPU execution, native AE MFR certification or the cause/resolution of the earlier independently initialized GPU test-suite stall."
+  },
+  "starglow_rendered_alpha_verification": {
+    "gpu_toggle_checkpoint": {
+      "command": "cargo test --manifest-path plugins/starglow/Cargo.toml --release --locked --offline --target-dir tools/target/quality-build --lib native_gpu_weak_glow_and_composite_modes -- --test-threads=1",
+      "result": "1 passed,16 filtered in1.02s. Existing native16 weak-glow test now switches AffectAlpha on/off/on through same GPU processor: off exactly preserves input alpha without changing glow RGB; restoring on exactly restores all output channels. Existing13float blend-mode comparisons against CPU also pass below2e-6 absolute error.",
+      "source_sha256": "420a7136947ece6250a7e79ba761d426e35dcd984945b06a4966520e9eee6b8d",
+      "test_executable_sha256": "bf056add8c0893ccd5229a00da7ffc944fd1828a94d87a7cecfe3a5773ae1831",
+      "limits": "Actual internal GPU dispatch, no CPU fallback; native16 transparent/opaque three-pixel input. Does not certify AE event transport/redraw or native GPU worlds. Test-only change, product DLL unchanged. Prior CPU test executable hash identifies its earlier build, not this rebuilt executable."
+    },
+    "change": "Replaced two formula-only alpha tests with one test invoking production process_channels. Six renders cover source alpha0,0.25,1 with AffectAlpha off/on; adjacent pixels must contain nonzero unsaturated glow, RGB must remain unchanged by switch, off preserves source alpha, on matches source-over coverage derived from emitted Add RGB.",
+    "command": "cargo test --manifest-path plugins/starglow/Cargo.toml --release --locked --offline --target-dir tools/target/quality-build --lib glow::tests:: -- --test-threads=1",
+    "result": "6 passed,0 failed,11 filtered. Existing native16 identity, threshold low-bit and sub-byte glow tests also pass. Existing unused process warning retained.",
+    "source_sha256": "e91e85b8af76aa87ec929b1dfa7bcbb30355ebfaef3707b1a37bc465ee9499e7",
+    "test_executable_sha256": "9fd4ce37f24284b2480107ccea03f006bac2fa15b0d73e2b443865753a71f1c3",
+    "limits": "Test-only change; product DLL unchanged. Direct float CPU core with horizontal white streak and Add; not native host input precision, GPU alpha parity, every blend mode or AE redraw certification. Existing formula-only tests were insufficient production evidence."
+  },
+  "prism_failure_phase_review": {
+    "evidence": "Failed pattern-63x65 has saved input and fixture, but no report.json or renders/pattern-63x65 artifact directory. Summary stores only access-denied text. Current quality_smoke invoke raises on nonzero harness exit before report serialization.",
+    "conclusion": "Saved evidence cannot distinguish worker launch, plugin loading, rendering or artifact creation failures. Missing report is not proof that plugin code never ran. Preserve failed_unclassified and the separate successful retry; do not label this a plugin crash or resolved infrastructure failure.",
+    "next_action": "No unchanged blind rerun or plugin workaround. Root-cause work needs failure-stage evidence from a recurrence. Known CelGlow2 compatibility and Depth model/fixed-range dependencies remain separate; no whole-goal completion claim.",
+    "review": "Self-review under long-horizon-goal-guard; previous turn progressed GPU parameter restoration coverage. This review establishes evidence limits, not a newly passing render or a repaired defect."
+  },
+  "open_requirements": [
+    "PathArray expansion repaired with sampled contour edge offsets and recomputed spacing/tangents.13unit tests pass; real rectangle2px displacement now pixel(2,4),zero remains(4,6),both independent expected images exact. Open paths use right-hand normal;closed paths outward independent of winding. Current basic smoke19checks pass. Large contractions/concave splits/self-intersection cleanup remain unverified, not a general topology solver. Evidence:path-array-expansion-20261005/*-fixed.png and path-array-edge-fixed-20261005.",
+    "PathArray Time Offset arithmetic and PreRender error propagation repaired.10unit tests pass. AEXCompat frame21473,step100000,offset1000 gives PreRender516 when Layer2 enabled and success when disabled; two vector-mask placement images unchanged after rebuild. Existing smoke passes. Actual differing-time source pixels and native AE event behavior remain unverified. Evidence:path-array-time-20261005 and path-array-time-fixed-20261005.",
+    "ParticleKit sparse and multi-frame source-cache defects repaired: full active ARGB8 hashing detects edits; each requested time is checked out before reusing per-frame preprocessing. Sprite/emitter cache admission now caps each map at128MiB accounted payload/256entries, excluding active render references and map/allocator bookkeeping. Direct tests cover content edits, restoration,1000admissions,capacity/entry limits and live ownership after eviction.82plugin+24engine tests pass; updated DLL20host checks pass,19images unchanged. Default host fixtures do not certify actual differing-time source checkout, AE redraw events or total process memory.",
+    "MaskOffset edge expansion repaired: real vector-mask Smart ARGB8 render of rectangle(4,6)-(12,24), Expansion2px now exactly matches bounds(2,4)-(14,26),264pixels. Zero expansion remains identical. Unit regressions cover winding, contraction, XY, diamond and duplicate vertices. Concave topology changes, arbitrary curved/animated masks and native AE integration remain unverified. Evidence:maskoffset-vector-20261005/*-fixed.png; current smoke:mask-offset-edge-fixed-20261005.",
+    "Prism Warp current binary rechecked:96passed/1OS access-denied failure; the one failed case passed in a separate retry. Keep original run nonpassing and retry evidence separate; execution failure cause is unresolved. No pixel mismatches were found in compared historical cases.",
+    "Source-confirmed parameter gap: DepthONNX registers Normalization / Fixed range but always calls per-frame normalize_depth; fixed bounds/policy are undefined (crates/depth-onnx-ae/src/lib.rs). Do not count fallback renders as inference proof.",
+    "Source-confirmed parameter gap: CelGlow2 reads blend_mode and placement, but celglow-core/src/render.rs composite_with_options always calls additive composite_preview without either field. Existing CPU/GPU agreement cannot validate those controls.",
+    "FrameSlice Classic passthrough repaired: temporal/map orchestration has a direct distinct-frame regression and28passing host checks. Actual differing-frame AE checkout remains unverified; static host fixtures cannot prove temporal equivalence. Default-parallel suite stalled; serial23tests and two-worker GPU-module8tests passed. High-concurrency stall root cause remains unresolved, not proof that all simultaneous GPU use fails.",
+    "Repair reproduced native-depth failures without 8-bit quantization",
+    "Complete auxiliary-layer, temporal and mask-specific host fixtures",
+    "Validate native 16-bit low-bit preservation beyond PNG8 fixtures",
+    "Check same-instance resizing, cache invalidation, resource bounds and fallback per applicable plugin",
+    "Separate internal GPU execution from actual AE native GPU-world support",
+    "Depth ONNX inference and expected-error transport remain unverified. Source cleanup was rebuilt and retested:core5+adapter16tests pass;8/16/32f missing-model outputs unchanged, all3remain blocked_error_notification_unverified. Current DLLc77fdcad2916e084425e60c44864623c252b4622169b9fefc7d6808d455c1c70. Existing compiler warnings retained; no models/runtime added."
+  ]
+}

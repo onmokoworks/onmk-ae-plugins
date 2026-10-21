@@ -46,6 +46,7 @@ struct GpuParams {
 }
 
 struct BufferState {
+    packed_byte: bool,
     width: u32,
     height: u32,
     source_buf: Buffer,
@@ -61,6 +62,8 @@ struct BufferState {
 }
 
 pub struct GpuProcessor {
+    cache_budget: u64,
+    cache_entries: usize,
     device: Device,
     queue: Queue,
     threshold_pipeline: ComputePipeline,
@@ -129,6 +132,8 @@ impl GpuProcessor {
         };
 
         Self {
+            cache_budget: 1024 * 1024 * 1024,
+            cache_entries: 8,
             threshold_pipeline: mk("threshold_pass"),
             streak_pipeline: mk("streak_pass"),
             accumulate_pipeline: mk("accumulate_pass"),
@@ -138,19 +143,20 @@ impl GpuProcessor {
         }
     }
 
-    fn create_buffers(&self, w: u32, h: u32) -> BufferState {
-        let n = (w * h) as u64;
+    fn create_buffers(&self, w: u32, h: u32, packed_byte: bool) -> BufferState {
+        let n = u64::from(w) * u64::from(h);
+        let pixel_bytes = if packed_byte { 4 } else { 16 };
         let mk = |sz: u64, usage: BufferUsages| {
             self.device.create_buffer(&BufferDescriptor { size: sz, usage, label: None, mapped_at_creation: false })
         };
 
         let rw = BufferUsages::STORAGE | BufferUsages::COPY_DST;
-        let source_buf = mk(n * 4, rw | BufferUsages::COPY_SRC);
+        let source_buf = mk(n * pixel_bytes, rw | BufferUsages::COPY_SRC);
         let buf_a = mk(n * 16, rw);
         let buf_b = mk(n * 16, rw);
         let accum_buf = mk(n * 16, rw);
-        let output_buf = mk(n * 4, rw | BufferUsages::COPY_SRC);
-        let staging_buf = mk(n * 4, BufferUsages::MAP_READ | BufferUsages::COPY_DST);
+        let output_buf = mk(n * pixel_bytes, rw | BufferUsages::COPY_SRC);
+        let staging_buf = mk(n * pixel_bytes, BufferUsages::MAP_READ | BufferUsages::COPY_DST);
         let params_buf = mk(std::mem::size_of::<GpuParams>() as u64, BufferUsages::UNIFORM | BufferUsages::COPY_DST);
         let map_buf = mk((n * 4).max(4), BufferUsages::STORAGE | BufferUsages::COPY_DST); // f32 per pixel
 
@@ -168,28 +174,33 @@ impl GpuProcessor {
         });
 
         BufferState {
+            packed_byte,
             width: w, height: h,
             source_buf, buf_a, buf_b, accum_buf, output_buf, staging_buf, params_buf, map_buf,
             bind_group, last_access: AtomicUsize::new(ts()),
         }
     }
 
-    fn get_state(&self, w: u32, h: u32) -> parking_lot::RwLockUpgradableReadGuard<'_, HashMap<std::thread::ThreadId, BufferState>> {
+    fn get_state(&self, w: u32, h: u32, packed_byte: bool) -> Option<parking_lot::RwLockUpgradableReadGuard<'_, HashMap<std::thread::ThreadId, BufferState>>> {
+        let requested=buffer_bytes(w,h,packed_byte)?;
+        if requested>self.cache_budget || self.cache_entries==0 {return None;}
         let mut lock = self.state.upgradable_read();
         let tid = std::thread::current().id();
-        if lock.get(&tid).map(|s| s.width != w || s.height != h).unwrap_or(true) {
+        if lock.get(&tid).map(|s| s.width != w || s.height != h || s.packed_byte != packed_byte).unwrap_or(true) {
             lock.with_upgraded(|x| {
-                let max = num_cpus::get().max(2) - 1;
-                if x.len() > max {
-                    let mut keys: Vec<_> = x.iter().map(|(k, v)| (*k, v.last_access.load(std::sync::atomic::Ordering::Relaxed))).collect();
-                    keys.sort_by_key(|a| a.1);
-                    for (k, _) in keys.iter().take(x.len() - max) { x.remove(k); }
+                x.remove(&tid);
+                let mut retained:u64=x.values().map(|s|buffer_bytes(s.width,s.height,s.packed_byte).unwrap()).sum();
+                while x.len()>=self.cache_entries || retained>self.cache_budget-requested {
+                    let oldest=x.iter().min_by_key(|(_,s)|s.last_access.load(std::sync::atomic::Ordering::Relaxed)).map(|(id,_)|*id);
+                    let Some(id)=oldest else {break;};
+                    let old=x.remove(&id).unwrap();
+                    retained-=buffer_bytes(old.width,old.height,old.packed_byte).unwrap();
                 }
-                x.insert(tid, self.create_buffers(w, h));
+                x.insert(tid, self.create_buffers(w, h, packed_byte));
             });
         }
         lock.get(&tid).unwrap().last_access.store(ts(), std::sync::atomic::Ordering::Relaxed);
-        lock
+        Some(lock)
     }
 
     /// Submit one compute dispatch. Each call does write_buffer + encode + submit,
@@ -206,25 +217,37 @@ impl GpuProcessor {
         self.queue.submit(Some(enc.finish()));
     }
 
-    /// Process starglow on GPU with feature parity to CPU.
-    pub fn process(&self, ep: &EffectParams, src: &[u8], w: usize, h: usize, luma_map: Option<&[f64]>) -> Vec<u8> {
+    /// GPU-only result. The caller handles CPU fallback explicitly on failure.
+    pub fn process_channels<T: crate::glow::Channel>(&self, ep: &EffectParams, src: &[T], w: usize, h: usize, luma_map: Option<&[f64]>) -> Result<Vec<T>, &'static str> {
+        let n = w.checked_mul(h).ok_or("pixel count overflow")?;
+        if w == 0 || h == 0 || w > u32::MAX as usize || h > u32::MAX as usize
+            || n.checked_mul(4) != Some(src.len()) || luma_map.is_some_and(|m| m.len() != n) {
+            return Err("invalid image dimensions");
+        }
+        let limits = self.device.limits();
+        let buffer_size = n.checked_mul(16).ok_or("buffer size overflow")? as u64;
+        if buffer_size > limits.max_buffer_size || buffer_size > u64::from(limits.max_storage_buffer_binding_size)
+            || w.div_ceil(16) > limits.max_compute_workgroups_per_dimension as usize
+            || h.div_ceil(16) > limits.max_compute_workgroups_per_dimension as usize {
+            return Err("image exceeds GPU limits");
+        }
         let (ww, hh, n) = (w as u32, h as u32, w * h);
-        let lock = self.get_state(ww, hh);
+        let lock = self.get_state(ww, hh, T::PACKED_BYTE).ok_or("GPU cache budget exceeded")?;
         let state = lock.get(&std::thread::current().id()).unwrap();
 
         let cmap = colormap::get_colormap(ep);
 
         // Upload source (ARGB u8 → packed u32)
-        let src_packed: Vec<u32> = (0..n).map(|i| {
-            let o = i * 4;
-            ((src[o] as u32) << 24) | ((src[o+1] as u32) << 16) | ((src[o+2] as u32) << 8) | (src[o+3] as u32)
-        }).collect();
+        let src_packed = pack_source(src, n)?;
+        let transport_bytes = std::mem::size_of_val(src_packed.as_slice()) as u64;
         self.queue.write_buffer(&state.source_buf, 0, as_bytes_slice(&src_packed));
+        drop(src_packed);
 
         // Upload map (f64 → f32)
         let has_map = luma_map.is_some();
         if let Some(map) = luma_map {
-            let map_f32: Vec<f32> = map.iter().map(|&v| v as f32).collect();
+            let mut map_f32 = reserve_vec(map.len())?;
+            map_f32.extend(map.iter().map(|&v| v as f32));
             self.queue.write_buffer(&state.map_buf, 0, as_bytes_slice(&map_f32));
         }
 
@@ -256,7 +279,7 @@ impl GpuProcessor {
             spectrum_offset: ep.spectrum_offset as f32,
             spectrum_density: ep.spectrum_density as f32,
             spectrum_random: ep.spectrum_random as f32,
-            _pad: [0; 2],
+            _pad: [u32::from(!T::PACKED_BYTE), u32::from(ep.affect_alpha)],
         };
 
         let weights = shape_weights(ep.glow_shape);
@@ -288,8 +311,10 @@ impl GpuProcessor {
                 self.dispatch(state, &self.threshold_pipeline, &tp, wg_x, wg_y);
             }
 
-            // Parallel prefix scan: log2(length) passes
-            let num_passes = ((length as f32).log2().ceil() as u32).max(1).min(14);
+            // Visual length sets decay, not a hard cutoff. CPU IIR propagates
+            // through the entire image along this direction, including tails.
+            let span = if dx == 0 { h } else if dy == 0 { w } else { w.min(h) };
+            let num_passes = (usize::BITS - (span - 1).leading_zeros()).max(1);
             let mut read_a = true;
 
             for pass in 0..num_passes {
@@ -314,29 +339,23 @@ impl GpuProcessor {
 
         // Readback
         let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor { label: None });
-        enc.copy_buffer_to_buffer(&state.output_buf, 0, &state.staging_buf, 0, (n * 4) as u64);
+        enc.copy_buffer_to_buffer(&state.output_buf, 0, &state.staging_buf, 0, transport_bytes);
         self.queue.submit(Some(enc.finish()));
 
         let slice = state.staging_buf.slice(..);
         let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
-        slice.map_async(MapMode::Read, move |v| tx.send(v).unwrap());
-        let _ = self.device.poll(PollType::Wait);
+        slice.map_async(MapMode::Read, move |v| { let _ = tx.send(v); });
+        let _unmap = UnmapOnDrop(&state.staging_buf);
+        if self.device.poll(PollType::Wait).is_err() {
+            return Err("GPU poll failed");
+        }
 
-        let mut result = vec![0u8; n * 4];
         if let Some(Ok(())) = pollster::block_on(rx.receive()) {
             let data = slice.get_mapped_range();
-            let packed: &[u32] = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, n) };
-            for i in 0..n {
-                let p = packed[i];
-                result[i*4]   = ((p >> 24) & 0xFF) as u8;
-                result[i*4+1] = ((p >> 16) & 0xFF) as u8;
-                result[i*4+2] = ((p >> 8)  & 0xFF) as u8;
-                result[i*4+3] = ( p        & 0xFF) as u8;
-            }
-            drop(data);
-            state.staging_buf.unmap();
+            decode_readback(&data, n)
+        } else {
+            Err("GPU readback failed")
         }
-        result
     }
 }
 
@@ -357,6 +376,47 @@ fn shape_weights(shape: i32) -> [f64; 8] {
 }
 
 // ---- Helpers ----
+
+struct UnmapOnDrop<'a>(&'a Buffer);
+impl Drop for UnmapOnDrop<'_> {
+    fn drop(&mut self) { self.0.unmap(); }
+}
+
+fn reserve_vec<T>(count: usize) -> Result<Vec<T>, &'static str> {
+    let mut result = Vec::new();
+    result.try_reserve_exact(count).map_err(|_| "GPU transport allocation failed")?;
+    Ok(result)
+}
+
+fn pack_source<T: crate::glow::Channel>(src: &[T], pixels: usize) -> Result<Vec<u32>, &'static str> {
+    if pixels.checked_mul(4) != Some(src.len()) { return Err("invalid source length"); }
+    let mut result = reserve_vec(if T::PACKED_BYTE { pixels } else { src.len() })?;
+    if T::PACKED_BYTE {
+        result.extend(src.chunks_exact(4).map(|p| p.iter().fold(0u32, |v,c|
+            (v << 8) | (c.normalized_f32() * 255.0).round() as u32)));
+    } else {
+        result.extend(src.iter().map(|c| c.normalized_f32().to_bits()));
+    }
+    Ok(result)
+}
+
+fn decode_readback<T: crate::glow::Channel>(data: &[u8], pixels: usize) -> Result<Vec<T>, &'static str> {
+    let channels = pixels.checked_mul(4).ok_or("channel count overflow")?;
+    if pixels.checked_mul(if T::PACKED_BYTE { 4 } else { 16 }) != Some(data.len()) {
+        return Err("invalid readback length");
+    }
+    let mut result = reserve_vec(channels)?;
+    result.resize(channels, T::default());
+    for (i, bytes) in data.chunks_exact(4).enumerate() {
+        let p = u32::from_ne_bytes(bytes.try_into().unwrap());
+        if T::PACKED_BYTE {
+            for c in 0..4 { result[i*4+c] = T::rgb(((p >> (24-c*8)) & 255) as f32 / 255.0); }
+        } else {
+            result[i] = if i % 4 == 0 { T::alpha(f32::from_bits(p)) } else { T::rgb(f32::from_bits(p)) };
+        }
+    }
+    Ok(result)
+}
 
 fn bgl_uniform(binding: u32) -> BindGroupLayoutEntry {
     BindGroupLayoutEntry {
@@ -385,6 +445,206 @@ fn as_bytes_slice<T: Sized>(slice: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice)) }
 }
 
+fn buffer_bytes(w:u32,h:u32,packed_byte:bool)->Option<u64> {
+    if w==0 || h==0 {return None;}
+    // Three transport buffers, three RGBA float planes, scalar map and uniform.
+    u64::from(w).checked_mul(u64::from(h))?
+        .checked_mul(if packed_byte {64} else {100})?
+        .checked_add(std::mem::size_of::<GpuParams>() as u64)
+}
+
 fn ts() -> usize {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_preserves_native_codes_and_rejects_invalid_lengths() {
+        let bytes: Vec<u8> = (0..=255u8).flat_map(|v| [v,v,v,v]).collect();
+        let packed = pack_source(&bytes,256).unwrap();
+        assert_eq!(decode_readback::<u8>(as_bytes_slice(&packed),256).unwrap(),bytes);
+        let deep: Vec<u16> = (0..=32768u16).flat_map(|v| [v,v,v,v]).collect();
+        let packed = pack_source(&deep,32769).unwrap();
+        assert_eq!(decode_readback::<u16>(as_bytes_slice(&packed),32769).unwrap(),deep);
+        let hdr = [0.375f32,-0.25,4.125,0.50001];
+        let packed = pack_source(&hdr,1).unwrap();
+        assert_eq!(decode_readback::<f32>(as_bytes_slice(&packed),1).unwrap(),hdr);
+        for length in [0,3,5,15,17] {
+            assert!(decode_readback::<f32>(&vec![0;length],1).is_err());
+        }
+        assert!(decode_readback::<u8>(&[0;5],1).is_err());
+        assert!(decode_readback::<u16>(&[],usize::MAX).is_err());
+        assert!(pack_source(&[0u8;3],1).is_err());
+        assert!(pack_source::<u16>(&[],usize::MAX).is_err());
+        assert!(reserve_vec::<u32>(usize::MAX).is_err());
+        assert!(decode_readback::<f32>(&[],0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cache_bounds_survive_worker_and_format_turnover() {
+        let mut gpu=GpuProcessor::new();
+        gpu.cache_entries=2;
+        gpu.cache_budget=2000;
+        let ep=EffectParams {source_opacity:1.0,transfer_mode:1,..Default::default()};
+        std::thread::scope(|scope| {
+            for i in 0..12 {
+                let gpu=&gpu;
+                let ep=&ep;
+                scope.spawn(move || {
+                    let (w,h)=[(3,2),(5,3),(1,1)][i%3];
+                    if i%2==0 {
+                        let src=[255u8,7,83,211].repeat(w*h);
+                        assert_eq!(gpu.process_channels(ep,&src,w,h,None).unwrap(),src);
+                    } else {
+                        let src=[0.5f32,-0.25,4.125,0.125].repeat(w*h);
+                        assert_eq!(gpu.process_channels(ep,&src,w,h,None).unwrap(),src);
+                    }
+                    let state=gpu.state.read();
+                    assert!(state.len()<=gpu.cache_entries);
+                    let mut total=0;
+                    for s in state.values() {
+                        let actual=[&s.source_buf,&s.output_buf,&s.staging_buf,&s.buf_a,&s.buf_b,
+                            &s.accum_buf,&s.map_buf,&s.params_buf].iter().map(|b|b.size()).sum::<u64>();
+                        assert_eq!(Some(actual),buffer_bytes(s.width,s.height,s.packed_byte));
+                        total+=actual;
+                    }
+                    assert!(total<=gpu.cache_budget);
+                }).join().unwrap();
+            }
+        });
+        let count=gpu.state.read().len();
+        assert!(gpu.get_state(4000,4000,false).is_none());
+        assert_eq!(gpu.state.read().len(),count);
+        assert!(buffer_bytes(u32::MAX,u32::MAX,false).is_none());
+    }
+
+    #[test]
+    fn streak_tails_match_cpu_beyond_visual_length_with_maps() {
+        let gpu=GpuProcessor::new();
+        let (w,h)=(63,35);
+        let mut src=vec![0.0f32;w*h*4];
+        for (x,y) in [(3,4),(31,17),(57,30)] {
+            src[(y*w+x)*4..(y*w+x)*4+4].copy_from_slice(&[1.0,0.7,0.4,0.2]);
+        }
+        let map:Vec<f64>=(0..w*h).map(|i|[0.25,0.5,1.0][i%3]).collect();
+        let mut ep=EffectParams { source_opacity:0.0,starglow_opacity:1.0,
+            boost_light:0.5,input_channel:4,colors:[[1.0;3];5],
+            lengths:[1.0;8],decay_rate:0.5,transfer_mode:4,affect_alpha:true,
+            ..Default::default() };
+        for (amount,phase) in [(0.0,0.0),(0.35,1.75),(0.8,-2.25)] {
+        ep.shimmer_amount=amount;
+        ep.shimmer_phase=phase;
+        ep.shimmer_detail=7.0;
+        for shape in [1,3,4,5] {
+            ep.glow_shape=shape;
+            for length in [5.0,19.0,41.0] {
+                ep.streak_length=length;
+                for mapped in [false,true] {
+                    let luma=if mapped {Some(map.as_slice())} else {None};
+                    let actual=gpu.process_channels(&ep,&src,w,h,luma).unwrap();
+                    let expected=crate::glow::process_channels(&ep,&src,w,h,luma).unwrap();
+                    let error=actual.iter().zip(&expected).map(|(a,b)|(a-b).abs()).fold(0.0f32,f32::max);
+                    assert!(error<2e-6,"shimmer={amount}, phase={phase}, shape={shape}, length={length}, mapped={mapped}, error={error}");
+                }
+            }
+        }
+        }
+    }
+
+    #[test]
+    fn colored_gradient_tips_and_shimmer_match_cpu() {
+        let gpu=GpuProcessor::new();
+        let (w,h)=(17,9);
+        let mut src=vec![0.0f32;w*h*4];
+        for (x,y) in [(2,2),(8,4),(14,6)] {
+            src[(y*w+x)*4..(y*w+x)*4+4].copy_from_slice(&[1.0,0.8,0.4,0.2]);
+        }
+        let mut ep=EffectParams { source_opacity:0.0,starglow_opacity:1.0,
+            boost_light:0.5,input_channel:4,colors:[[1.0,0.0,0.0],[0.0,1.0,0.0],
+                [0.0,0.0,1.0],[1.0,1.0,0.0],[0.0,1.0,1.0]],
+            glow_shape:1,lengths:[1.0;8],streak_length:19.0,decay_rate:0.5,
+            transfer_mode:4,affect_alpha:true,shimmer_detail:7.0,shimmer_phase:1.75,
+            ..Default::default() };
+        for preset in [1,2,3,5,6,7,8,9,10,11] {
+            ep.colormap_preset=preset;
+            for shimmer in [0.0,0.35] {
+                ep.shimmer_amount=shimmer;
+                let actual=gpu.process_channels(&ep,&src,w,h,None).unwrap();
+                let expected=crate::glow::process_channels(&ep,&src,w,h,None).unwrap();
+                assert!(expected.iter().any(|v|*v>0.01));
+                let error=actual.iter().zip(&expected).map(|(a,b)|(a-b).abs()).fold(0.0f32,f32::max);
+                assert!(error<2e-6,"preset={preset}, shimmer={shimmer}, error={error}");
+            }
+        }
+        ep.colormap_preset=13;
+        for offset in [-0.001,0.0,59.999,60.0,120.0,359.999,360.0,721.0] {
+            ep.spectrum_offset=offset;
+            for density in [0.0,1.0,2.5] {
+                ep.spectrum_density=density;
+                for random in [0.0,0.75] {
+                    ep.spectrum_random=random;
+                    for shimmer in [0.0,0.35] {
+                        ep.shimmer_amount=shimmer;
+                        let actual=gpu.process_channels(&ep,&src,w,h,None).unwrap();
+                        let expected=crate::glow::process_channels(&ep,&src,w,h,None).unwrap();
+                        let error=actual.iter().zip(&expected).map(|(a,b)|(a-b).abs()).fold(0.0f32,f32::max);
+                        assert!(actual.iter().all(|v|v.is_finite()));
+                        assert!(error<2e-6,"spectrum offset={offset}, density={density}, random={random}, shimmer={shimmer}, error={error}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_gpu_identity_and_format_resize() {
+        // No CPU fallback: adapter, shader, dispatch, or readback failures fail this test.
+        let gpu = GpuProcessor::new();
+        let ep = EffectParams { source_opacity: 1.0, transfer_mode: 1, ..Default::default() };
+        let codes: Vec<u16> = (0..=32768u16).flat_map(|v| [32768, v, v, v]).collect();
+        assert_eq!(gpu.process_channels(&ep, &codes, 32769, 1, None).unwrap(), codes);
+        for (w, h) in [(13, 7), (1, 1), (17, 31), (13, 7)] {
+            let floats: Vec<f32> = (0..w*h).flat_map(|_| [0.375, -0.25, 4.125, 0.50001]).collect();
+            assert_eq!(gpu.process_channels(&ep, &floats, w, h, None).unwrap(), floats);
+            let bytes: Vec<u8> = (0..w*h).flat_map(|i| [255, (i % 256) as u8, 127, 3]).collect();
+            assert_eq!(gpu.process_channels(&ep, &bytes, w, h, None).unwrap(), bytes);
+            let deep: Vec<u16> = (0..w*h).flat_map(|_| [32768, 16385, 16387, 1]).collect();
+            assert_eq!(gpu.process_channels(&ep, &deep, w, h, None).unwrap(), deep);
+        }
+        assert!(gpu.process_channels(&ep, &[0u8; 4], 2, 1, None).is_err());
+    }
+
+    #[test]
+    fn native_gpu_weak_glow_and_composite_modes() {
+        let gpu = GpuProcessor::new();
+        let mut ep = EffectParams { source_opacity: 0.0, starglow_opacity: 1.0,
+            boost_light: 0.001, input_channel: 4, colors: [[1.0; 3]; 5],
+            glow_shape: 4, lengths: [1.0; 8], streak_length: 5.0,
+            decay_rate: 0.5, transfer_mode: 4, affect_alpha: true, ..Default::default() };
+        let deep = [0u16,0,0,0,32768,32768,32768,32768,0,0,0,0];
+        let out = gpu.process_channels(&ep, &deep, 3, 1, None).unwrap();
+        assert!(out[1..4].iter().any(|&v| v > 0 && v < 128), "{out:?}");
+        assert!(out[0] > 0, "alpha must include visible glow");
+        ep.affect_alpha = false;
+        let preserved = gpu.process_channels(&ep, &deep, 3, 1, None).unwrap();
+        for i in 0..3 {
+            assert_eq!(preserved[i*4],deep[i*4]);
+            assert_eq!(&preserved[i*4+1..i*4+4],&out[i*4+1..i*4+4]);
+        }
+        ep.affect_alpha = true;
+        assert_eq!(gpu.process_channels(&ep, &deep, 3, 1, None).unwrap(),out);
+        let src = [0.25f32,0.125,0.25,0.375, 1.0,1.0,0.75,0.5, 0.0,0.0,0.0,0.0];
+        ep.source_opacity = 0.75;
+        ep.boost_light = 0.3;
+        for mode in [1,2,4,5,6,7,8,9,11,12,14,15,16] {
+            ep.transfer_mode = mode;
+            let actual = gpu.process_channels(&ep, &src, 3, 1, None).unwrap();
+            let expected = crate::glow::process_channels(&ep, &src, 3, 1, None).unwrap();
+            let error = actual.iter().zip(&expected).map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+            assert!(error < 2e-6, "mode={mode}, error={error}, actual={actual:?}, expected={expected:?}");
+        }
+    }
 }

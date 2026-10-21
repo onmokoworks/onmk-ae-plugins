@@ -49,6 +49,7 @@ onmkが開発・メンテナンスするAdobe After Effectsプラグインのモ
 | [MaskTransform](./plugins/mask-transform/) | マスクパスの反転と回転 | 実験的 |
 | [MaskOffset](./plugins/mask-offset/) | マスクパスのオフセット、塗り、フェザー | 実験的 |
 | [LumaNormal](./plugins/luma-normal/) | 輝度勾配からRGBノーマルマップを生成 | 実験的・8 bpc |
+| [onmk DistanceGradation](./plugins/distance-gradation/) | AA切り替え・元画像保持に対応する距離グラデーション | 開発中・v0.1.0 |
 
 ### 時間・生成・スタイライズ
 
@@ -121,6 +122,7 @@ Experimental and unpublished projects are developed outside this repository and 
 | [MaskTransform](./plugins/mask-transform/) | Flips and rotates mask paths | Experimental |
 | [MaskOffset](./plugins/mask-offset/) | Offsets mask paths with fill and feather controls | Experimental |
 | [LumaNormal](./plugins/luma-normal/) | Generates RGB normal maps from luminance gradients | Experimental / 8 bpc |
+| [onmk DistanceGradation](./plugins/distance-gradation/) | Antialiased distance gradients composited over the original layer | In development / v0.1.0 |
 
 ### Time, Generation, and Stylization
 

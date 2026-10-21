@@ -20,13 +20,13 @@ pub fn preprocess_to_nchw(
     let ys = sh as f32 / size as f32;
 
     for y in 0..size {
-        let fy = (y as f32 + 0.5) * ys - 0.5;
+        let fy = ((y as f32 + 0.5) * ys - 0.5).clamp(0.0, (sh - 1) as f32);
         let y0 = fy.floor().clamp(0.0, (sh - 1) as f32) as i32;
         let y1 = (y0 + 1).min(sh - 1);
         let wy = fy - fy.floor();
 
         for x in 0..size {
-            let fx = (x as f32 + 0.5) * xs - 0.5;
+            let fx = ((x as f32 + 0.5) * xs - 0.5).clamp(0.0, (sw - 1) as f32);
             let x0 = fx.floor().clamp(0.0, (sw - 1) as f32) as i32;
             let x1 = (x0 + 1).min(sw - 1);
             let wx = fx - fx.floor();
@@ -65,5 +65,26 @@ mod tests {
         let src = vec![1.0f32; 4 * 4 * 4];
         let out = preprocess_to_nchw(&src, 2, 2, true, 266);
         assert_eq!(out.len(), 3 * 266 * 266);
+    }
+
+    #[test]
+    fn upscale_replicates_edges_in_both_channel_orders() {
+        for argb in [false, true] {
+            let mut src = Vec::new();
+            for v in [0.0, 0.25, 0.5, 1.0] {
+                if argb { src.extend_from_slice(&[1.0, v, v, v]); }
+                else { src.extend_from_slice(&[v, v, v, 1.0]); }
+            }
+            let output = preprocess_to_nchw(&src, 2, 2, argb, 4);
+            // Independent center-coordinate bilinear interpolation with clamped
+            // neighbors: the four extreme output corners retain source corners.
+            for (index, value) in [(0, 0.0), (3, 0.25), (12, 0.5), (15, 1.0), (5, 0.203125)] {
+                for c in 0..3 {
+                    let expected = (value - IMAGE_NET_MEAN[c]) / IMAGE_NET_STD[c];
+                    assert!((output[c * 16 + index] - expected).abs() < 1e-6,
+                        "argb={argb} pixel={index} channel={c}");
+                }
+            }
+        }
     }
 }

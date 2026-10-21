@@ -14,6 +14,8 @@ const MAX_BIRTH_RATE: f32 = 100_000.0;
 const MAX_LIFESPAN: f32 = 3_600.0;
 const MAX_GRID_RESOLUTION: u32 = 512;
 const MAX_CHILD_COUNT: u32 = 1_024;
+// Match the host's Particle Size range independently of size multipliers.
+const MAX_PARTICLE_SIZE: f32 = 500.0;
 const MAX_SIZE_VALUE: f32 = 64.0;
 const MAX_DISTANCE_VALUE: f32 = 1_000_000.0;
 const MAX_FORCE_VALUE: f32 = 100_000.0;
@@ -188,7 +190,7 @@ impl ParticleEngineConfig {
             self.emitter.initial_size,
             defaults.emitter.initial_size,
             0.01,
-            MAX_SIZE_VALUE,
+            MAX_PARTICLE_SIZE,
         );
         self.emitter.size_variation = finite_clamp(
             self.emitter.size_variation,
@@ -693,6 +695,102 @@ mod tests {
         assert!(normalized.render.camera_projection.is_none());
         assert_eq!(normalized.render.motion_blur, 1.0);
         assert_eq!(normalized.render.image_sampling.alpha_clip, 0.0);
+    }
+
+    #[test]
+    fn particle_size_preserves_the_host_range_and_sanitizes_invalid_values() {
+        for size in [0.1, 16.0, 64.0, 75.0, 100.0, 251.0, 500.0] {
+            let mut engine = ParticleEngineConfig::classic_default();
+            engine.emitter.initial_size = size;
+            assert_eq!(engine.normalized_for_render().emitter.initial_size, size);
+        }
+
+        let default_size = ParticleEngineConfig::classic_default().emitter.initial_size;
+        for (input, expected) in [
+            (501.0, 500.0),
+            (-1.0, 0.01),
+            (f32::NAN, default_size),
+            (f32::INFINITY, default_size),
+        ] {
+            let mut engine = ParticleEngineConfig::classic_default();
+            engine.emitter.initial_size = input;
+            assert_eq!(
+                engine.normalized_for_render().emitter.initial_size,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn image_particles_render_at_sizes_above_64() {
+        for fit in [ImageFitMode::Contain, ImageFitMode::Stretch] {
+            for size in [64.0_f32, 100.0, 251.0, 500.0] {
+                let mut engine = ParticleEngineConfig::classic_default();
+                engine.emitter.position = glam::Vec3::new(320.0, 320.0, 0.0);
+                engine.emitter.birth_rate = 1.0;
+                engine.emitter.emit_all_at_start = true;
+                engine.emitter.lifespan = 10.0;
+                engine.emitter.lifespan_variation = 0.0;
+                engine.emitter.initial_speed = 0.0;
+                engine.emitter.initial_size = size;
+                engine.emitter.size_variation = 0.0;
+                engine.physics.gravity = glam::Vec3::ZERO;
+                engine.physics.wind = glam::Vec3::ZERO;
+                engine.physics.turbulence_strength = 0.0;
+                engine.appearance.size_over_life = [1.0; 4];
+                engine.appearance.opacity_over_life = [1.0; 4];
+                engine.appearance.color_end = [1.0; 4];
+                engine.render.shape = ParticleShape::Image;
+                engine.render.motion_blur = 0.0;
+                engine.render.size_multiplier = 1.0;
+                engine.render.image_fit_mode = fit;
+
+                let mut inputs = runtime(640, 640, 0, 0, 0.25, 1.0 / 30.0);
+                inputs.sprite_images = vec![SpriteImage {
+                    width: 2,
+                    height: 1,
+                    pixels: Arc::new(vec![255; 8]),
+                    mips: Arc::new(Vec::new()),
+                }];
+                let plan = ParticleRenderPlan::new(&engine, inputs);
+                let mut output = vec![0u8; 640 * 640 * 4];
+                let count = render_particle_engine_8bit(engine, plan, &mut output, None, || {
+                    Ok::<(), ()>(())
+                })
+                .unwrap();
+                assert_eq!(count, 1);
+
+                let mut bounds = None;
+                for (index, pixel) in output.chunks_exact(4).enumerate() {
+                    if pixel[0] == 0 {
+                        continue;
+                    }
+                    let x = index % 640;
+                    let y = index / 640;
+                    bounds = Some(match bounds {
+                        Some((left, top, right, bottom)) => {
+                            (x.min(left), y.min(top), x.max(right), y.max(bottom))
+                        }
+                        None => (x, y, x, y),
+                    });
+                }
+                let (left, top, right, bottom) = bounds.expect("sprite must be visible");
+                let width = right - left + 1;
+                let height = bottom - top + 1;
+                let expected_height = match fit {
+                    ImageFitMode::Contain => (size * 0.5).round() as usize,
+                    ImageFitMode::Stretch => size as usize,
+                };
+                assert!(
+                    width.abs_diff(size as usize) <= 1,
+                    "{fit:?} size={size}: rendered width={width}"
+                );
+                assert!(
+                    height.abs_diff(expected_height) <= 1,
+                    "{fit:?} size={size}: rendered height={height}"
+                );
+            }
+        }
     }
 
     #[test]

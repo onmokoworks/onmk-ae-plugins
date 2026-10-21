@@ -30,21 +30,68 @@ fn shape_weights(shape: i32) -> [f64; 8] {
     }
 }
 
-/// Main processing pipeline
-pub fn process(
-    ep: &EffectParams, src: &[u8], w: usize, h: usize,
+pub trait Channel: Copy + Default {
+    const PACKED_BYTE: bool = false;
+    fn normalized(self) -> f64;
+    fn normalized_f32(self) -> f32;
+    fn rgb(v: f32) -> Self;
+    fn alpha(v: f32) -> Self;
+}
+impl Channel for u8 {
+    const PACKED_BYTE: bool = true;
+    fn normalized(self) -> f64 { self as f64 / 255.0 }
+    fn normalized_f32(self) -> f32 { self as f32 / 255.0 }
+    fn rgb(v: f32) -> Self { (v * 255.0).clamp(0.0, 255.0) as u8 }
+    fn alpha(v: f32) -> Self { (v * 255.0 + 0.5).clamp(0.0, 255.0) as u8 }
+}
+impl Channel for u16 {
+    fn normalized(self) -> f64 { self as f64 / 32768.0 }
+    fn normalized_f32(self) -> f32 { self as f32 / 32768.0 }
+    fn rgb(v: f32) -> Self { (v * 32768.0).round().clamp(0.0, 32768.0) as u16 }
+    fn alpha(v: f32) -> Self { Self::rgb(v) }
+}
+impl Channel for f32 {
+    fn normalized(self) -> f64 { self as f64 }
+    fn normalized_f32(self) -> f32 { self }
+    fn rgb(v: f32) -> Self { v }
+    fn alpha(v: f32) -> Self { v.clamp(0.0, 1.0) }
+}
+
+type RenderResult<T> = Result<T, after_effects::Error>;
+
+pub(crate) fn filled<T: Copy + Default>(len: usize) -> RenderResult<Vec<T>> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|_| after_effects::Error::OutOfMemory)?;
+    values.resize(len, T::default());
+    Ok(values)
+}
+
+pub fn process(ep: &EffectParams, src: &[u8], w: usize, h: usize, map: Option<&[f64]>) -> RenderResult<Vec<u8>> {
+    process_channels(ep, src, w, h, map)
+}
+
+/// Native-channel processing; existing byte rounding remains unchanged.
+pub fn process_channels<T: Channel>(
+    ep: &EffectParams, src: &[T], w: usize, h: usize,
     luma_map: Option<&[f64]>,
-) -> Vec<u8> {
-    let n = w * h;
+) -> RenderResult<Vec<T>> {
+    if w == 0 || h == 0 || w > i32::MAX as usize || h > i32::MAX as usize {
+        return Err(after_effects::Error::BadCallbackParameter);
+    }
+    let n = w.checked_mul(h).ok_or(after_effects::Error::BadCallbackParameter)?;
+    let channels = n.checked_mul(4).ok_or(after_effects::Error::BadCallbackParameter)?;
+    if src.len() != channels || luma_map.is_some_and(|map| map.len() != n) {
+        return Err(after_effects::Error::BadCallbackParameter);
+    }
 
     // Step 1: Extract brightness and apply threshold
-    let brightness = extract_channel(src, w, h, ep.input_channel);
-    let thresholded = apply_threshold(&brightness, ep.threshold, ep.threshold_soft);
+    let brightness = extract_channel(src, w, h, ep.input_channel)?;
+    let thresholded = apply_threshold(&brightness, ep.threshold, ep.threshold_soft)?;
 
     // Step 2: Build bright pixel buffer, modulated by map
-    let mut bright_r = vec![0.0f32; n];
-    let mut bright_g = vec![0.0f32; n];
-    let mut bright_b = vec![0.0f32; n];
+    let mut bright_r = filled::<f32>(n)?;
+    let mut bright_g = filled::<f32>(n)?;
+    let mut bright_b = filled::<f32>(n)?;
     for i in 0..n {
         let mut t = thresholded[i] as f32 * ep.boost_light as f32;
 
@@ -54,16 +101,16 @@ pub fn process(
         }
 
         let off = i * 4; // ARGB
-        bright_r[i] = src[off + 1] as f32 / 255.0 * t;
-        bright_g[i] = src[off + 2] as f32 / 255.0 * t;
-        bright_b[i] = src[off + 3] as f32 / 255.0 * t;
+        bright_r[i] = src[off + 1].normalized_f32() * t;
+        bright_g[i] = src[off + 2].normalized_f32() * t;
+        bright_b[i] = src[off + 3].normalized_f32() * t;
     }
 
     // Step 3: Get shape weights and accumulate streaks
     let weights = shape_weights(ep.glow_shape);
-    let mut glow_r = vec![0.0f32; n];
-    let mut glow_g = vec![0.0f32; n];
-    let mut glow_b = vec![0.0f32; n];
+    let mut glow_r = filled::<f32>(n)?;
+    let mut glow_g = filled::<f32>(n)?;
+    let mut glow_b = filled::<f32>(n)?;
 
     let is_spectrum = ep.colormap_preset == 13;
     let cmap = colormap::get_colormap(ep);
@@ -95,7 +142,7 @@ pub fn process(
             ep.spectrum_offset as f32,
             ep.spectrum_density as f32,
             ep.spectrum_random as f32,
-        );
+        )?;
 
         for i in 0..n {
             glow_r[i] += sr[i];
@@ -105,15 +152,15 @@ pub fn process(
     }
 
     // Step 4: Composite
-    let mut output = vec![0u8; n * 4];
+    let mut output = filled::<T>(channels)?;
     let src_a = ep.source_opacity as f32;
     let glow_a = ep.starglow_opacity as f32;
 
     for i in 0..n {
         let off = i * 4;
-        let sr = src[off + 1] as f32 / 255.0;
-        let sg = src[off + 2] as f32 / 255.0;
-        let sb = src[off + 3] as f32 / 255.0;
+        let sr = src[off + 1].normalized_f32();
+        let sg = src[off + 2].normalized_f32();
+        let sb = src[off + 3].normalized_f32();
 
         let gr = glow_r[i] * glow_a;
         let gg = glow_g[i] * glow_a;
@@ -121,50 +168,108 @@ pub fn process(
 
         let (cr, cg, cb) = blend::composite(sr, sg, sb, gr, gg, gb, src_a, ep.transfer_mode);
 
-        let source_alpha = src[off] as f32 / 255.0;
+        let source_alpha = src[off].normalized_f32();
         let glow_alpha = if ep.affect_alpha {
             gr.max(gg).max(gb).clamp(0.0, 1.0)
         } else {
             0.0
         };
         let output_alpha = source_alpha + glow_alpha * (1.0 - source_alpha);
-        output[off] = (output_alpha * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-        output[off + 1] = (cr * 255.0).clamp(0.0, 255.0) as u8;
-        output[off + 2] = (cg * 255.0).clamp(0.0, 255.0) as u8;
-        output[off + 3] = (cb * 255.0).clamp(0.0, 255.0) as u8;
+        output[off] = T::alpha(output_alpha);
+        output[off + 1] = T::rgb(cr);
+        output[off + 2] = T::rgb(cg);
+        output[off + 3] = T::rgb(cb);
     }
 
-    output
+    Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn glow_alpha_extends_beyond_transparent_source() {
-        let source_alpha = 0.0f32;
-        let glow_alpha = 0.4f32;
-        let output_alpha = source_alpha + glow_alpha * (1.0 - source_alpha);
-        assert!((output_alpha - 0.4).abs() < 1.0e-6);
+    use super::*;
+
+    fn params() -> EffectParams {
+        EffectParams { source_opacity: 1.0, transfer_mode: 4,
+            input_channel: 4, colors: [[1.0; 3]; 5], ..Default::default() }
     }
 
     #[test]
-    fn glow_alpha_does_not_exceed_opaque_source() {
-        let source_alpha = 1.0f32;
-        let glow_alpha = 0.8f32;
-        let output_alpha = source_alpha + glow_alpha * (1.0 - source_alpha);
-        assert_eq!(output_alpha, 1.0);
+    fn invalid_geometry_and_capacity_are_errors() {
+        for (w,h) in [(0,1),(1,0),(usize::MAX,2),(i32::MAX as usize+1,1),(2,1)] {
+            assert_eq!(process_channels(&params(), &[0u8;4], w,h,None), Err(after_effects::Error::BadCallbackParameter));
+        }
+        for map in [&[][..], &[0.0,1.0][..]] {
+            assert_eq!(process_channels(&params(), &[0u8;4],1,1,Some(map)), Err(after_effects::Error::BadCallbackParameter));
+        }
+        assert_eq!(filled::<f64>(usize::MAX), Err(after_effects::Error::OutOfMemory));
+    }
+
+    #[test]
+    fn native_cpu_identity_preserves_every_16bit_level() {
+        let mut src = Vec::new();
+        for value in 0u16..=32768 { src.extend([32768, value, value, value]); }
+        assert_eq!(process_channels(&params(), &src, 32769, 1, None).unwrap(), src);
+    }
+
+    #[test]
+    fn float_cpu_identity_retains_hdr_and_negative_rgb() {
+        let src = [1.0f32, -0.25, 2.5, 0.5000305];
+        assert_eq!(process_channels(&params(), &src, 1, 1, None).unwrap(), src);
+    }
+
+    #[test]
+    fn threshold_distinguishes_sub_byte_input_levels() {
+        let src = [32768u16,16384,0,0,32768,16385,0,0];
+        let brightness = extract_channel(&src,2,1,4).unwrap();
+        let mask = apply_threshold(&brightness,0.5,0.001).unwrap();
+        assert!(mask[1] > mask[0]);
+    }
+
+    #[test]
+    fn deep_streak_generates_sub_byte_glow() {
+        let ep = EffectParams { source_opacity: 0.0, starglow_opacity: 1.0,
+            boost_light: 0.001, threshold: 0.0, threshold_soft: 0.0,
+            glow_shape: 4, lengths: [1.0;8], streak_length: 5.0,
+            decay_rate: 0.5, ..params() };
+        let src = [32768u16,0,0,0,32768,32768,32768,32768,32768,0,0,0];
+        let out = process_channels(&ep,&src,3,1,None).unwrap();
+        assert!(out[1..4].iter().any(|&v| v>0 && v<128), "real low-level glow: {out:?}");
+    }
+
+    #[test]
+    fn rendered_glow_alpha_obeys_switch_and_source_coverage() {
+        let mut ep = EffectParams { source_opacity: 0.0, starglow_opacity: 1.0,
+            boost_light: 0.1, threshold: 0.0, threshold_soft: 0.0,
+            glow_shape: 4, lengths: [1.0;8], streak_length: 5.0,
+            decay_rate: 0.5, ..params() };
+        for alpha in [0.0f32, 0.25, 1.0] {
+            let src = [alpha,0.0,0.0,0.0, 1.0,1.0,1.0,1.0, alpha,0.0,0.0,0.0];
+            ep.affect_alpha = false;
+            let preserved = process_channels(&ep,&src,3,1,None).unwrap();
+            ep.affect_alpha = true;
+            let extended = process_channels(&ep,&src,3,1,None).unwrap();
+            for offset in [0,8] {
+                // Add with source opacity zero exposes the actual generated glow RGB.
+                let glow = extended[offset+1..offset+4].iter().copied().fold(0.0f32,f32::max);
+                assert!(glow>0.0 && glow<1.0,"expected a non-saturated neighboring streak");
+                assert_eq!(preserved[offset],alpha);
+                assert_eq!(&preserved[offset+1..offset+4],&extended[offset+1..offset+4]);
+                let expected = alpha+(1.0-alpha)*glow;
+                assert!((extended[offset]-expected).abs()<1e-6);
+            }
+        }
     }
 }
 
-fn extract_channel(src: &[u8], w: usize, h: usize, channel: i32) -> Vec<f64> {
+fn extract_channel<T: Channel>(src: &[T], w: usize, h: usize, channel: i32) -> RenderResult<Vec<f64>> {
     let n = w * h;
-    let mut out = vec![0.0f64; n];
+    let mut out = filled::<f64>(n)?;
     for i in 0..n {
         let off = i * 4;
-        let a = src[off] as f64 / 255.0;
-        let r = src[off + 1] as f64 / 255.0;
-        let g = src[off + 2] as f64 / 255.0;
-        let b = src[off + 3] as f64 / 255.0;
+        let a = src[off].normalized();
+        let r = src[off + 1].normalized();
+        let g = src[off + 2].normalized();
+        let b = src[off + 3].normalized();
         out[i] = match channel {
             1 => { let mx = r.max(g).max(b); let mn = r.min(g).min(b); (mx + mn) * 0.5 }
             2 => 0.2126 * r + 0.7152 * g + 0.0722 * b,
@@ -175,11 +280,11 @@ fn extract_channel(src: &[u8], w: usize, h: usize, channel: i32) -> Vec<f64> {
             _ => 0.2126 * r + 0.7152 * g + 0.0722 * b,
         };
     }
-    out
+    Ok(out)
 }
 
-fn apply_threshold(brightness: &[f64], threshold: f64, soft: f64) -> Vec<f64> {
-    let mut out = vec![0.0f64; brightness.len()];
+fn apply_threshold(brightness: &[f64], threshold: f64, soft: f64) -> RenderResult<Vec<f64>> {
+    let mut out = filled::<f64>(brightness.len())?;
     let soft_range = soft.max(0.001);
     let low = threshold - soft_range * 0.5;
     let high = threshold + soft_range * 0.5;
@@ -193,7 +298,7 @@ fn apply_threshold(brightness: &[f64], threshold: f64, soft: f64) -> Vec<f64> {
             t * t * (3.0 - 2.0 * t)
         };
     }
-    out
+    Ok(out)
 }
 
 /// Additive IIR streak generation with diagonal correction and decay rate control.
@@ -212,11 +317,11 @@ fn generate_streak(
     spectrum_offset: f32,
     spectrum_density: f32,
     spectrum_random: f32,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+) -> RenderResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {
     let n = w * h;
-    let mut streak_r = vec![0.0f32; n];
-    let mut streak_g = vec![0.0f32; n];
-    let mut streak_b = vec![0.0f32; n];
+    let mut streak_r = filled::<f32>(n)?;
+    let mut streak_g = filled::<f32>(n)?;
+    let mut streak_b = filled::<f32>(n)?;
 
     // Diagonal correction: each pixel step covers √2 distance
     let step_distance = if is_diagonal { std::f64::consts::SQRT_2 } else { 1.0 };
@@ -235,12 +340,11 @@ fn generate_streak(
     };
 
     // Iteration order: (x - dx, y - dy) must be already processed
-    let x_iter: Vec<usize> = if dx > 0 { (0..w).collect() } else { (0..w).rev().collect() };
-    let y_iter: Vec<usize> = if dy > 0 { (0..h).collect() } else { (0..h).rev().collect() };
-
     // Pass 1: IIR propagation
-    for &y in &y_iter {
-        for &x in &x_iter {
+    for row in 0..h {
+        let y = if dy > 0 { row } else { h - 1 - row };
+        for col in 0..w {
+            let x = if dx > 0 { col } else { w - 1 - col };
             let i = y * w + x;
             let sx = x as i32 - dx;
             let sy = y as i32 - dy;
@@ -274,9 +378,9 @@ fn generate_streak(
     }
 
     // Pass 2: Extract glow (subtract source bright), apply colormap
-    let mut out_r = vec![0.0f32; n];
-    let mut out_g = vec![0.0f32; n];
-    let mut out_b = vec![0.0f32; n];
+    let mut out_r = filled::<f32>(n)?;
+    let mut out_g = filled::<f32>(n)?;
+    let mut out_b = filled::<f32>(n)?;
 
     for i in 0..n {
         let sr = streak_r[i];
@@ -318,7 +422,7 @@ fn generate_streak(
         out_b[i] = glow_lum * cb;
     }
 
-    (out_r, out_g, out_b)
+    Ok((out_r, out_g, out_b))
 }
 
 fn value_noise(x: f32, y: f32, phase: f32) -> f32 {

@@ -26,7 +26,7 @@ fn main() {
             build: 1,
         },
         Property::AE_Effect_Info_Flags(0),
-        Property::AE_Effect_Global_OutFlags(OutFlags::empty()),
+        Property::AE_Effect_Global_OutFlags(OutFlags::WideTimeInput),
         Property::AE_Effect_Global_OutFlags_2(OutFlags2::SupportsSmartRender),
         Property::AE_Effect_Match_Name("FrameSlice"),
         Property::AE_Reserved_Info(10),

@@ -23,7 +23,7 @@ fn main() {
             subversion: 0,
             bugversion: 0,
             stage: Stage::Develop,
-            build: 1,
+            build: 2,
         },
         Property::AE_Effect_Info_Flags(0),
         Property::AE_Effect_Global_OutFlags(

@@ -566,4 +566,22 @@ mod tests {
             assert!(pixel[3] <= pixel[0]);
         }
     }
+
+    #[test]
+    fn roi_needs_neighbor_halo_to_match_full_frame_crop() {
+        for amount in [-1.0, 1.0] {
+            let background = if amount > 0.0 { 0 } else { 255 };
+            let neighbor = 255-background;
+            let mut src = [255,background,background,background].repeat(7);
+            src[2*4+1..2*4+4].fill(neighbor);
+            let p = params(amount,CH_COLOR);
+            let full = minimax(&p,&src,7,1,None);
+            let expected = &full[3*4..5*4];
+            let cropped_only = minimax(&p,&src[3*4..5*4],2,1,None);
+            assert_ne!(cropped_only,expected,
+                "a requested-output-only checkout loses the neighbor at x=2");
+            let with_halo = minimax(&p,&src[2*4..6*4],4,1,None);
+            assert_eq!(&with_halo[4..3*4],expected);
+        }
+    }
 }

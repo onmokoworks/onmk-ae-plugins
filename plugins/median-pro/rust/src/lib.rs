@@ -192,52 +192,89 @@ fn get_params(params: &ae::Parameters<Params>) -> Result<FilterParams, ae::Error
 
 // ---- Copy layer pixels to flat buffer ----
 
-fn layer_to_flat(layer: &ae::Layer) -> (Vec<u8>, usize, usize) {
-    let w = layer.width() as usize;
-    let h = layer.height() as usize;
-    let stride = layer.buffer_stride();
-    let buf = layer.buffer();
-    let mut flat = vec![0u8; w * h * 4];
-    for y in 0..h {
-        let src_off = y * stride;
-        let dst_off = y * w * 4;
-        let row_len = w * 4;
-        if src_off + row_len <= buf.len() && dst_off + row_len <= flat.len() {
-            flat[dst_off..dst_off + row_len].copy_from_slice(&buf[src_off..src_off + row_len]);
-        }
-    }
-    (flat, w, h)
+fn checked_extent(w: usize, h: usize, stride: usize) -> Result<usize, ae::Error> {
+    if w == 0 || h == 0 { return Ok(0); }
+    let row = w.checked_mul(4).ok_or(ae::Error::OutOfMemory)?;
+    if stride < row { return Err(ae::Error::BadCallbackParameter); }
+    (h-1).checked_mul(stride).and_then(|v|v.checked_add(row)).ok_or(ae::Error::OutOfMemory)
 }
 
-fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
-    let stride = layer.buffer_stride();
-    let buf = layer.buffer_mut();
+fn copy_rows(src: &[u8], dst: &mut [u8], w: usize, h: usize,
+    src_stride: usize, dst_stride: usize, src_reverse: bool, dst_reverse: bool) -> Result<(), ae::Error> {
+    let src_extent = checked_extent(w,h,src_stride)?;
+    let dst_extent = checked_extent(w,h,dst_stride)?;
+    if src.len()<src_extent || dst.len()<dst_extent { return Err(ae::Error::BadCallbackParameter); }
+    if w==0 || h==0 { return Ok(()); }
+    let row=w*4;
     for y in 0..h {
-        let src_off = y * w * 4;
-        let dst_off = y * stride;
-        let row_len = w * 4;
-        if src_off + row_len <= flat.len() && dst_off + row_len <= buf.len() {
-            buf[dst_off..dst_off + row_len].copy_from_slice(&flat[src_off..src_off + row_len]);
-        }
+        let s=(if src_reverse {h-1-y} else {y})*src_stride;
+        let d=(if dst_reverse {h-1-y} else {y})*dst_stride;
+        dst[d..d+row].copy_from_slice(&src[s..s+row]);
     }
+    Ok(())
+}
+
+fn validate_world(layer: &ae::Layer) -> Result<(), ae::Error> {
+    if layer.width()>i32::MAX as usize || layer.height()>i32::MAX as usize
+        || layer.row_bytes()==i32::MIN as isize { return Err(ae::Error::BadCallbackParameter); }
+    if layer.width()==0 || layer.height()==0 { return Ok(()); }
+    checked_extent(layer.width(),layer.height(),layer.buffer_stride())?;
+    // Layer::buffer constructs a slice covering stride * height.
+    let len=layer.buffer_stride().checked_mul(layer.height()).ok_or(ae::Error::OutOfMemory)?;
+    if len>isize::MAX as usize || unsafe {layer.data_ptr()}.is_null()
+        || layer.pixel_format()?!=ae::PixelFormat::Argb32 { return Err(ae::Error::BadCallbackParameter); }
+    Ok(())
+}
+
+fn layer_to_flat(layer: &ae::Layer) -> Result<(Vec<u8>, usize, usize), ae::Error> {
+    validate_world(layer)?;
+    let w = layer.width() as usize; let h = layer.height() as usize; let stride = layer.buffer_stride();
+    if w==0 || h==0 { return Ok((Vec::new(),w,h)); }
+    let row=w.checked_mul(4).ok_or(ae::Error::OutOfMemory)?;
+    let count=row.checked_mul(h).ok_or(ae::Error::OutOfMemory)?;
+    let mut flat=Vec::new();
+    flat.try_reserve_exact(count).map_err(|_|ae::Error::OutOfMemory)?;
+    flat.resize(count,0);
+    copy_rows(layer.buffer(),&mut flat,w,h,stride,row,layer.row_bytes()<0,false)?;
+    Ok((flat, w, h))
+}
+
+fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) -> Result<(), ae::Error> {
+    if (w,h)!=(layer.width(),layer.height()) { return Err(ae::Error::BadCallbackParameter); }
+    validate_world(layer)?;
+    if w==0 || h==0 { return Ok(()); }
+    let stride=layer.buffer_stride(); let reverse=layer.row_bytes()<0;
+    let row=w.checked_mul(4).ok_or(ae::Error::OutOfMemory)?;
+    copy_rows(flat,layer.buffer_mut(),w,h,row,stride,false,reverse)
 }
 
 // ---- Build luminance map from a flat ARGB buffer ----
 
-fn build_luminance_map(buf: &[u8], w: usize, h: usize, invert: bool) -> Vec<f64> {
-    let mut map = vec![0.0f64; w * h];
-    for i in 0..(w * h) {
+fn build_luminance_map(buf: &[u8], w: usize, h: usize, invert: bool) -> Option<Vec<f64>> {
+    if w==0 || h==0 { return None; }
+    let count=w.checked_mul(h)?;
+    if buf.len()<count.checked_mul(4)? { return None; }
+    let mut map = Vec::new();
+    map.try_reserve_exact(count).ok()?;
+    for i in 0..count {
         let off = i * 4;
         let r = buf[off + 1] as f64;
         let g = buf[off + 2] as f64;
         let b = buf[off + 3] as f64;
         let luma = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
-        map[i] = if invert { 1.0 - luma } else { luma };
+        map.push(if invert { 1.0 - luma } else { luma });
     }
-    map
+    Some(map)
 }
 
 // ---- Process filters on flat buffer ----
+
+fn copy_buffer(src: &[u8]) -> Result<Vec<u8>,ae::Error> {
+    let mut copy=Vec::new();
+    copy.try_reserve_exact(src.len()).map_err(|_|ae::Error::OutOfMemory)?;
+    copy.extend_from_slice(src);
+    Ok(copy)
+}
 
 fn process_filters(
     fp: &FilterParams,
@@ -245,17 +282,22 @@ fn process_filters(
     w: usize,
     h: usize,
     luma_map: Option<&[f64]>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>,ae::Error> {
+    let count=w.checked_mul(h).and_then(|n|n.checked_mul(4)).ok_or(ae::Error::OutOfMemory)?;
+    if original.len()!=count { return Err(ae::Error::BadCallbackParameter); }
+    if count==0 { return Ok(Vec::new()); }
     if fp.radius == 0 || fp.mix <= f64::EPSILON {
-        return original.to_vec();
+        return copy_buffer(original);
     }
 
     // AE effect worlds are premultiplied ARGB. Median filtering must operate
     // on straight RGB, otherwise transparent black becomes a valid color
     // sample and creates dark fringes around alpha edges.
-    let straight_original = unpremultiply_buffer(original);
-    let mut buf_a = straight_original.clone();
-    let mut buf_b = vec![0u8; w * h * 4];
+    let straight_original = unpremultiply_buffer(original)?;
+    let mut buf_a = copy_buffer(&straight_original)?;
+    let mut buf_b = Vec::new();
+    buf_b.try_reserve_exact(count).map_err(|_|ae::Error::OutOfMemory)?;
+    buf_b.resize(count,0);
 
     for _ in 0..fp.iterations {
         filters::dispatch_filter(
@@ -271,9 +313,10 @@ fn process_filters(
         std::mem::swap(&mut buf_a, &mut buf_b);
     }
 
-    let mut straight_result = vec![0u8; w * h * 4];
-    filters::mix_buffers(&straight_original, &buf_a, &mut straight_result, fp.mix);
-    premultiply_buffer(&straight_result)
+    // buf_b is the obsolete previous iteration after the last swap.
+    filters::mix_buffers(&straight_original, &buf_a, &mut buf_b, fp.mix);
+    premultiply_buffer(&mut buf_b);
+    Ok(buf_b)
 }
 
 fn update_filter_ui(params: &ae::Parameters<Params>) -> Result<(), ae::Error> {
@@ -299,26 +342,24 @@ fn premultiply_channel(channel: u8, alpha: u8) -> u8 {
     ((channel as u16 * alpha as u16 + 127) / 255) as u8
 }
 
-fn unpremultiply_buffer(src: &[u8]) -> Vec<u8> {
-    let mut out = src.to_vec();
+fn unpremultiply_buffer(src: &[u8]) -> Result<Vec<u8>,ae::Error> {
+    let mut out = copy_buffer(src)?;
     for pixel in out.chunks_exact_mut(4) {
         let alpha = pixel[0];
         pixel[1] = unpremultiply_channel(pixel[1], alpha);
         pixel[2] = unpremultiply_channel(pixel[2], alpha);
         pixel[3] = unpremultiply_channel(pixel[3], alpha);
     }
-    out
+    Ok(out)
 }
 
-fn premultiply_buffer(src: &[u8]) -> Vec<u8> {
-    let mut out = src.to_vec();
-    for pixel in out.chunks_exact_mut(4) {
+fn premultiply_buffer(pixels: &mut [u8]) {
+    for pixel in pixels.chunks_exact_mut(4) {
         let alpha = pixel[0];
         pixel[1] = premultiply_channel(pixel[1], alpha);
         pixel[2] = premultiply_channel(pixel[2], alpha);
         pixel[3] = premultiply_channel(pixel[3], alpha);
     }
-    out
 }
 
 // ---- Legacy Render path ----
@@ -330,12 +371,12 @@ fn render_cpu(
     out_layer: &mut ae::Layer,
 ) -> Result<(), ae::Error> {
     let fp = get_params(params)?;
-    let (original, w, h) = layer_to_flat(in_layer);
+    let (original, w, h) = layer_to_flat(in_layer)?;
 
     let luma_map = get_map_layer_luma(params, in_data, w, h, fp.invert_map);
 
-    let result = process_filters(&fp, &original, w, h, luma_map.as_deref());
-    flat_to_layer(&result, out_layer, w, h);
+    let result = process_filters(&fp, &original, w, h, luma_map.as_deref())?;
+    flat_to_layer(&result, out_layer, w, h)?;
     Ok(())
 }
 
@@ -352,11 +393,11 @@ fn get_map_layer_luma(
         .ok()?;
     let layer_def = checkout.as_layer().ok()?;
     let layer = layer_def.value()?;
-    let (flat, mw, mh) = layer_to_flat(&layer);
+    let (flat, mw, mh) = layer_to_flat(&layer).ok()?;
     if mw == w && mh == h {
-        Some(build_luminance_map(&flat, w, h, invert))
+        build_luminance_map(&flat, w, h, invert)
     } else {
-        Some(build_luminance_map_resample(&flat, mw, mh, w, h, invert))
+        build_luminance_map_resample(&flat, mw, mh, w, h, invert)
     }
 }
 
@@ -368,17 +409,22 @@ fn build_luminance_map_resample(
     w: usize,
     h: usize,
     invert: bool,
-) -> Vec<f64> {
-    let src_map = build_luminance_map(buf, mw, mh, invert);
-    let mut map = vec![0.0f64; w * h];
+) -> Option<Vec<f64>> {
+    if w==0 || h==0 { return Some(Vec::new()); }
+    let count=w.checked_mul(h)?;
+    (w-1).checked_mul(mw)?;
+    (h-1).checked_mul(mh)?;
+    let src_map = build_luminance_map(buf, mw, mh, invert)?;
+    let mut map = Vec::new();
+    map.try_reserve_exact(count).ok()?;
     for y in 0..h {
         let sy = (y * mh / h).min(mh - 1);
         for x in 0..w {
             let sx = (x * mw / w).min(mw - 1);
-            map[y * w + x] = src_map[sy * mw + sx];
+            map.push(src_map[sy * mw + sx]);
         }
     }
-    map
+    Some(map)
 }
 
 // ---- SmartFX PreRender ----
@@ -435,6 +481,14 @@ fn smart_pre_render(
 
 // ---- SmartFX CPU Render ----
 
+// Preserve the render error if cleanup also fails, but never skip cleanup on
+// a Result error. This does not provide panic/OOM unwinding guarantees.
+fn with_checkin<T,E>(render: impl FnOnce()->Result<T,E>, checkin: impl FnOnce()->Result<(),E>) -> Result<T,E> {
+    let result=render();
+    let cleanup=checkin();
+    match result { Err(error)=>Err(error), Ok(value)=>cleanup.map(|_|value) }
+}
+
 fn smart_render_cpu(
     extra: &ae::pf::SmartRenderExtra,
     params: &ae::Parameters<Params>,
@@ -443,35 +497,97 @@ fn smart_render_cpu(
     let cb = extra.callbacks();
 
     let input_world = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
+    with_checkin(|| {
     let mut output_world = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
 
-    let (original, w, h) = layer_to_flat(&input_world);
+    let (original, w, h) = layer_to_flat(&input_world)?;
 
     let invert = fp.invert_map;
     let luma_map = if let Ok(Some(map_world)) = cb.checkout_layer_pixels(MAP_CHECKOUT_ID as u32) {
-        let (map_flat, mw, mh) = layer_to_flat(&map_world);
-        if mw == w && mh == h {
-            Some(build_luminance_map(&map_flat, w, h, invert))
+        with_checkin(|| {
+        let Ok((map_flat, mw, mh)) = layer_to_flat(&map_world) else { return Ok(None); };
+        Ok(if mw == w && mh == h {
+            build_luminance_map(&map_flat, w, h, invert)
         } else {
-            Some(build_luminance_map_resample(
+            build_luminance_map_resample(
                 &map_flat, mw, mh, w, h, invert,
-            ))
-        }
+            )
+        })
+        }, ||cb.checkin_layer_pixels(MAP_CHECKOUT_ID as u32))?
     } else {
         None
     };
 
-    let result = process_filters(&fp, &original, w, h, luma_map.as_deref());
-    flat_to_layer(&result, &mut output_world, w, h);
+    let result = process_filters(&fp, &original, w, h, luma_map.as_deref())?;
+    flat_to_layer(&result, &mut output_world, w, h)?;
 
-    cb.checkin_layer_pixels(0)?;
-    let _ = cb.checkin_layer_pixels(MAP_CHECKOUT_ID as u32);
     Ok(())
+    }, ||cb.checkin_layer_pixels(0))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_copy_validates_every_row_before_writing() {
+        let src=[1,2,3,4,5,6,7,8];
+        let mut short=[99;7];
+        assert!(copy_rows(&src,&mut short,1,2,4,4,false,false).is_err());
+        assert_eq!(short,[99;7]);
+        let mut padded=[99;10];
+        assert!(copy_rows(&src[..7],&mut padded,1,2,4,6,false,false).is_err());
+        assert_eq!(padded,[99;10]);
+        assert!(copy_rows(&src,&mut padded,2,1,4,8,false,false).is_err());
+        assert!(copy_rows(&src,&mut padded,usize::MAX,2,4,4,false,false).is_err());
+        assert_eq!(padded,[99;10]);
+        copy_rows(&src,&mut padded,1,2,4,6,false,true).unwrap();
+        assert_eq!(padded,[5,6,7,8,99,99,1,2,3,4]);
+        let mut restored=[0;8];
+        copy_rows(&padded,&mut restored,1,2,6,4,true,false).unwrap();
+        assert_eq!(restored,src);
+        copy_rows(&[],&mut [],0,3,0,0,false,false).unwrap();
+    }
+
+    #[test]
+    fn empty_primary_does_not_panic() {
+        let result=std::panic::catch_unwind(||process_filters(&median_params(),&[],0,3,None));
+        assert!(result.is_ok());
+        assert!(result.unwrap().unwrap().is_empty());
+        assert!(process_filters(&median_params(),&[],usize::MAX,2,None).is_err());
+        assert!(process_filters(&median_params(),&[0;7],2,1,None).is_err());
+    }
+
+    #[test]
+    fn cleanup_runs_on_every_result_and_retains_primary_error() {
+        for render_ok in [false,true] {
+            for cleanup_ok in [false,true] {
+                let mut calls=0;
+                let result=with_checkin(||if render_ok {Ok(7)} else {Err("render")},|| {
+                    calls+=1;
+                    if cleanup_ok {Ok(())} else {Err("cleanup")}
+                });
+                assert_eq!(calls,1);
+                assert_eq!(result,if !render_ok {Err("render")} else if !cleanup_ok {Err("cleanup")} else {Ok(7)});
+            }
+        }
+        let order=std::cell::RefCell::new(Vec::new());
+        let result: Result<(),&str>=with_checkin(||with_checkin(||Ok(()),||{order.borrow_mut().push("map");Err("map cleanup")}),||{order.borrow_mut().push("input");Ok(())});
+        assert_eq!(result,Err("map cleanup"));
+        assert_eq!(*order.borrow(),["map","input"]);
+    }
+
+    #[test]
+    fn empty_radius_map_does_not_panic() {
+        let result=std::panic::catch_unwind(||build_luminance_map_resample(&[],0,0,17,31,false));
+        assert!(result.is_ok(), "empty checked-out map must not panic");
+        assert!(result.unwrap().is_none());
+        assert!(build_luminance_map(&[0;7],2,1,false).is_none());
+        assert!(build_luminance_map(&[],usize::MAX,2,false).is_none());
+        assert!(build_luminance_map_resample(&[255,0,0,0],1,1,usize::MAX,2,false).is_none());
+        assert_eq!(build_luminance_map_resample(&[255,0,0,0],1,1,2,3,false).unwrap(),[0.0;6]);
+        assert_eq!(build_luminance_map_resample(&[255,0,0,0],1,1,2,3,true).unwrap(),[1.0;6]);
+    }
 
     fn median_params() -> FilterParams {
         FilterParams {
@@ -490,7 +606,7 @@ mod tests {
         let center = (1 * 3 + 1) * 4;
         src[center..center + 4].copy_from_slice(&[255, 255, 0, 0]);
 
-        let out = process_filters(&median_params(), &src, 3, 3, None);
+        let out = process_filters(&median_params(), &src, 3, 3, None).unwrap();
 
         assert_eq!(&out[center..center + 4], &[255, 255, 0, 0]);
         for pixel in out.chunks_exact(4) {
@@ -508,7 +624,7 @@ mod tests {
         let mut params = median_params();
         params.filter_type = 2;
 
-        let out = process_filters(&params, &src, 3, 3, None);
+        let out = process_filters(&params, &src, 3, 3, None).unwrap();
 
         assert_eq!(&out[center..center + 4], &[255, 0, 255, 0]);
     }
@@ -516,7 +632,7 @@ mod tests {
     #[test]
     fn half_transparent_color_stays_premultiplied() {
         let src = [128, 128, 0, 0].repeat(9);
-        let out = process_filters(&median_params(), &src, 3, 3, None);
+        let out = process_filters(&median_params(), &src, 3, 3, None).unwrap();
 
         assert!(out.chunks_exact(4).all(|pixel| pixel == [128, 128, 0, 0]));
     }
@@ -530,7 +646,7 @@ mod tests {
         params.radius = 0;
         params.iterations = 10;
 
-        let out = process_filters(&params, &src, 2, 2, None);
+        let out = process_filters(&params, &src, 2, 2, None).unwrap();
 
         assert_eq!(out, src);
     }

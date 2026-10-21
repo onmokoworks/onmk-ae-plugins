@@ -125,21 +125,17 @@ fn read_params(params: &ae::Parameters<Params>) -> Result<NormalParams, ae::Erro
     })
 }
 
-fn box_blur(src: &[f32], w: usize, h: usize, radius: usize) -> Result<Vec<f32>, ae::Error> {
-    if radius == 0 {
-        return Ok(src.to_vec());
-    }
+fn box_blur(mut src: Vec<f32>, w: usize, h: usize, radius: usize) -> Result<Vec<f32>, ae::Error> {
     let n = w.checked_mul(h).ok_or(ae::Error::OutOfMemory)?;
+    if src.len()!=n { return Err(ae::Error::BadCallbackParameter); }
+    if radius == 0 || n==0 { return Ok(src); }
     let mut tmp = Vec::new();
     tmp.try_reserve_exact(n)?;
     tmp.resize(n, 0.0);
-    let mut out = Vec::new();
-    out.try_reserve_exact(n)?;
-    out.resize(n, 0.0);
     for y in 0..h {
         for x in 0..w {
             let a = x.saturating_sub(radius);
-            let b = (x + radius).min(w - 1);
+            let b = x.saturating_add(radius).min(w - 1);
             let mut s = 0.0;
             for xx in a..=b {
                 s += src[y * w + xx];
@@ -150,15 +146,15 @@ fn box_blur(src: &[f32], w: usize, h: usize, radius: usize) -> Result<Vec<f32>, 
     for y in 0..h {
         for x in 0..w {
             let a = y.saturating_sub(radius);
-            let b = (y + radius).min(h - 1);
+            let b = y.saturating_add(radius).min(h - 1);
             let mut s = 0.0;
             for yy in a..=b {
                 s += tmp[yy * w + x];
             }
-            out[y * w + x] = s / (b - a + 1) as f32;
+            src[y * w + x] = s / (b - a + 1) as f32;
         }
     }
-    Ok(out)
+    Ok(src)
 }
 
 fn normal_from_height(
@@ -187,27 +183,44 @@ fn normal_from_height(
     [encode(nx * inv), encode(ny * inv), encode(inv)]
 }
 
+fn normal_pixel(normal: [u8;3], alpha: u8) -> [u8;4] {
+    let premultiply=|channel:u8| ((channel as u16*alpha as u16+127)/255) as u8;
+    [alpha,premultiply(normal[0]),premultiply(normal[1]),premultiply(normal[2])]
+}
+
+fn checked_geometry(w:usize,h:usize,rowbytes:isize) -> Result<usize,ae::Error> {
+    if w>i32::MAX as usize || h>i32::MAX as usize || rowbytes==i32::MIN as isize {
+        return Err(ae::Error::BadCallbackParameter);
+    }
+    let stride=rowbytes.checked_abs().ok_or(ae::Error::BadCallbackParameter)? as usize;
+    if w==0 || h==0 { return Ok(stride); }
+    let row=w.checked_mul(4).ok_or(ae::Error::OutOfMemory)?;
+    let extent=stride.checked_mul(h).ok_or(ae::Error::OutOfMemory)?;
+    if stride<row || extent>isize::MAX as usize { return Err(ae::Error::BadCallbackParameter); }
+    Ok(stride)
+}
+
+fn row_offset(y:usize,h:usize,stride:usize,reverse:bool) -> usize {
+    (if reverse {h-1-y} else {y})*stride
+}
+
 fn geometry(layer: &ae::Layer) -> Result<(usize, usize, usize), ae::Error> {
     let w = layer.width();
     let h = layer.height();
-    let stride = layer.buffer_stride();
-    if w == 0 || h == 0 || stride < w.saturating_mul(4) {
-        return Err(ae::Error::BadCallbackParameter);
-    }
-    let need = stride.checked_mul(h).ok_or(ae::Error::OutOfMemory)?;
-    if layer.buffer().len() < need {
+    let stride = checked_geometry(w,h,layer.row_bytes())?;
+    if w==0 || h==0 { return Ok((w,h,stride)); }
+    if unsafe {layer.data_ptr()}.is_null() || layer.pixel_format()?!=ae::PixelFormat::Argb32 {
         return Err(ae::Error::BadCallbackParameter);
     }
     Ok((w, h, stride))
 }
 fn render(p: &NormalParams, input: &ae::Layer, output: &mut ae::Layer) -> Result<(), ae::Error> {
-    if input.bit_depth() != 8 || output.bit_depth() != 8 {
-        return Err(ae::Error::BadCallbackParameter);
-    }
     let (w, h, ss) = geometry(input)?;
     let (ow, oh, ds) = geometry(output)?;
-    let w = w.min(ow);
-    let h = h.min(oh);
+    if (w,h)!=(ow,oh) { return Err(ae::Error::BadCallbackParameter); }
+    if w==0 || h==0 { return Ok(()); }
+    let src_reverse=input.row_bytes()<0;
+    let dst_reverse=output.row_bytes()<0;
     let src = input.buffer();
     let n = w.checked_mul(h).ok_or(ae::Error::OutOfMemory)?;
     let mut lum = Vec::new();
@@ -215,24 +228,22 @@ fn render(p: &NormalParams, input: &ae::Layer, output: &mut ae::Layer) -> Result
     lum.resize(n, 0.0);
     for y in 0..h {
         for x in 0..w {
-            let s = y * ss + x * 4;
+            let s = row_offset(y,h,ss,src_reverse) + x * 4;
             lum[y * w + x] = (0.2126 * src[s + 1] as f32
                 + 0.7152 * src[s + 2] as f32
                 + 0.0722 * src[s + 3] as f32)
                 / 255.0;
         }
     }
-    let lum = box_blur(&lum, w, h, p.blur)?;
+    let lum = box_blur(lum, w, h, p.blur)?;
     let dst = output.buffer_mut();
     for y in 0..h {
         for x in 0..w {
-            let s = y * ss + x * 4;
-            let d = y * ds + x * 4;
+            let s = row_offset(y,h,ss,src_reverse) + x * 4;
+            let d = row_offset(y,h,ds,dst_reverse) + x * 4;
             let n = normal_from_height(&lum, w, h, x, y, p);
-            dst[d] = if p.alpha_source { src[s] } else { 255 };
-            dst[d + 1] = n[0];
-            dst[d + 2] = n[1];
-            dst[d + 3] = n[2];
+            let alpha=if p.alpha_source {src[s]} else {255};
+            dst[d..d+4].copy_from_slice(&normal_pixel(n,alpha));
         }
     }
     Ok(())
@@ -269,6 +280,27 @@ fn smart_render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn geometry_rejects_short_rows_and_handles_reverse_orientation() {
+        assert!(checked_geometry(2,3,4).is_err());
+        assert!(checked_geometry(usize::MAX,2,4).is_err());
+        assert!(checked_geometry(1,2,i32::MIN as isize).is_err());
+        assert!(checked_geometry(1,2,isize::MAX).is_err());
+        assert_eq!(checked_geometry(0,3,0).unwrap(),0);
+        assert_eq!(checked_geometry(2,3,-12).unwrap(),12);
+        assert_eq!((0..3).map(|y|row_offset(y,3,12,true)).collect::<Vec<_>>(),[24,12,0]);
+        assert_eq!((0..3).map(|y|row_offset(y,3,12,false)).collect::<Vec<_>>(),[0,12,24]);
+    }
+    #[test]
+    fn encoded_normal_preserves_alpha_without_colour_leak() {
+        assert_eq!(normal_pixel([128,128,255],255),[255,128,128,255]);
+        assert_eq!(normal_pixel([128,128,255],0),[0,0,0,0]);
+        assert_eq!(normal_pixel([128,128,255],128),[128,64,64,128]);
+        for alpha in 0..=255 {
+            let pixel=normal_pixel([255,127,0],alpha);
+            assert!(pixel[1..].iter().all(|&c|c<=alpha));
+        }
+    }
     fn p() -> NormalParams {
         NormalParams {
             strength: 4.0,
@@ -293,6 +325,19 @@ mod tests {
     }
     #[test]
     fn blur_preserves_constant() {
-        assert_eq!(box_blur(&[0.25; 9], 3, 3, 4).unwrap(), vec![0.25; 9]);
+        assert_eq!(box_blur(vec![0.25; 9], 3, 3, 4).unwrap(), vec![0.25; 9]);
+    }
+    #[test]
+    fn blur_reuses_input_allocation_and_validates_shape() {
+        for radius in [0,1,usize::MAX] {
+            let source=vec![0.25;9];
+            let pointer=source.as_ptr();
+            let result=box_blur(source,3,3,radius).unwrap();
+            assert_eq!(result.as_ptr(),pointer);
+            assert_eq!(result,vec![0.25;9]);
+        }
+        assert!(box_blur(vec![0.0;8],3,3,0).is_err());
+        assert!(box_blur(Vec::new(),usize::MAX,2,0).is_err());
+        assert!(box_blur(Vec::new(),0,3,1).unwrap().is_empty());
     }
 }

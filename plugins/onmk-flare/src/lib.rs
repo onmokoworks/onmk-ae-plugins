@@ -1,26 +1,24 @@
 use after_effects as ae;
 
+mod bloom_gpu;
 mod flare;
+mod ghost_gpu;
 mod gpu;
 mod lens;
 mod ocular;
 mod physical;
+mod pixel;
+mod rich;
+mod resident_gpu;
+mod runtime;
+mod scratch;
+mod source_gpu;
 mod source_optics;
 mod viewer;
 
 use std::sync::OnceLock;
 
-static GPU: OnceLock<Option<gpu::GpuProcessor>> = OnceLock::new();
-
-fn get_gpu() -> Option<&'static gpu::GpuProcessor> {
-    GPU.get_or_init(
-        || match std::panic::catch_unwind(|| gpu::GpuProcessor::new()) {
-            Ok(g) => Some(g),
-            Err(_) => None,
-        },
-    )
-    .as_ref()
-}
+static GPU: OnceLock<parking_lot::Mutex<runtime::Runtime>> = OnceLock::new();
 
 #[derive(Eq, PartialEq, Hash, Clone, Copy, Debug)]
 enum Params {
@@ -119,6 +117,11 @@ enum Params {
     SourceOpacity,
     FlareOpacity,
     TransferMode,
+    ApertureBlades,
+    ApertureRoundness,
+    ApertureRotation,
+    PupilEdgeBias,
+    SpectralQuality,
 }
 
 #[derive(Default)]
@@ -177,6 +180,13 @@ impl AdobePluginGlobal for Plugin {
                     "Legacy / Dream Bloom",
                     "Legacy / Ocular Night",
                     "Legacy / Solar Blast",
+                    "Cooke Triplet / Ghosts Only",
+                    "Reference / Cooke Triplet",
+                    "Reference / Double Gauss",
+                    "Reference / Canon",
+                    "Rich / Cooke Triplet",
+                    "Rich / Double Gauss",
+                    "Rich / Canon",
                 ]);
                 f.set_default(2);
             }),
@@ -583,7 +593,7 @@ impl AdobePluginGlobal for Plugin {
                 f.set_precision(1);
             }),
         )?;
-        params.add(
+        params.add_with_flags(
             Params::GhostCount,
             "Ghost Count",
             ae::FloatSliderDef::setup(|f| {
@@ -594,8 +604,9 @@ impl AdobePluginGlobal for Plugin {
                 f.set_default(7.0);
                 f.set_precision(0);
             }),
+            ae::ParamFlag::empty(), ae::ParamUIFlags::DISABLED,
         )?;
-        params.add(
+        params.add_with_flags(
             Params::GhostSpread,
             "Ghost Spread",
             ae::FloatSliderDef::setup(|f| {
@@ -606,8 +617,9 @@ impl AdobePluginGlobal for Plugin {
                 f.set_default(100.0);
                 f.set_precision(1);
             }),
+            ae::ParamFlag::empty(), ae::ParamUIFlags::DISABLED,
         )?;
-        params.add(
+        params.add_with_flags(
             Params::GhostSize,
             "Ghost Size",
             ae::FloatSliderDef::setup(|f| {
@@ -618,8 +630,9 @@ impl AdobePluginGlobal for Plugin {
                 f.set_default(25.0);
                 f.set_precision(1);
             }),
+            ae::ParamFlag::empty(), ae::ParamUIFlags::DISABLED,
         )?;
-        params.add(
+        params.add_with_flags(
             Params::GhostColor,
             "Ghost Color",
             ae::ColorDef::setup(|f| {
@@ -630,8 +643,9 @@ impl AdobePluginGlobal for Plugin {
                     blue: 255,
                 });
             }),
+            ae::ParamFlag::empty(), ae::ParamUIFlags::DISABLED,
         )?;
-        params.add(
+        params.add_with_flags(
             Params::GhostChromatic,
             "Ghost Chromatic",
             ae::FloatSliderDef::setup(|f| {
@@ -642,6 +656,7 @@ impl AdobePluginGlobal for Plugin {
                 f.set_default(55.0);
                 f.set_precision(1);
             }),
+            ae::ParamFlag::empty(), ae::ParamUIFlags::DISABLED,
         )?;
 
         params.add(
@@ -669,10 +684,10 @@ impl AdobePluginGlobal for Plugin {
             "Ray Grid",
             ae::FloatSliderDef::setup(|f| {
                 f.set_valid_min(4.0);
-                f.set_valid_max(96.0);
+                f.set_valid_max(128.0);
                 f.set_slider_min(4.0);
-                f.set_slider_max(64.0);
-                f.set_default(40.0);
+                f.set_slider_max(128.0);
+                f.set_default(64.0);
                 f.set_precision(0);
             }),
         )?;
@@ -713,7 +728,7 @@ impl AdobePluginGlobal for Plugin {
             "Optical Gain",
             ae::FloatSliderDef::setup(|f| {
                 f.set_valid_min(0.0);
-                f.set_valid_max(20000.0);
+                f.set_valid_max(200000.0);
                 f.set_slider_min(0.0);
                 f.set_slider_max(10000.0);
                 f.set_default(3000.0);
@@ -1061,6 +1076,21 @@ impl AdobePluginGlobal for Plugin {
             }),
         )?;
 
+        // Append only: existing AE parameter slots remain stable.
+        for (id,name,default,min,max) in [
+            (Params::ApertureBlades,"Rich Aperture Blades",7.0,3.0,16.0),
+            (Params::ApertureRoundness,"Rich Aperture Roundness",35.0,0.0,100.0),
+            (Params::ApertureRotation,"Rich Aperture Rotation",0.0,-180.0,180.0),
+            (Params::PupilEdgeBias,"Rich Pupil Edge Bias",45.0,0.0,100.0),
+        ] {
+            params.add(id,name,ae::FloatSliderDef::setup(|f| {
+                f.set_valid_min(min); f.set_valid_max(max); f.set_slider_min(min);
+                f.set_slider_max(max); f.set_default(default); f.set_precision(0);
+            }))?;
+        }
+        params.add(Params::SpectralQuality,"Rich Spectral Samples",ae::PopupDef::setup(|f| {
+            f.set_options(&["3 / RGB", "9 / Spectral", "15 / Spectral"]); f.set_default(2);
+        }))?;
         Ok(())
     }
 
@@ -1072,6 +1102,11 @@ impl AdobePluginGlobal for Plugin {
         params: &mut ae::Parameters<Params>,
     ) -> Result<(), ae::Error> {
         match cmd {
+            ae::Command::GlobalSetdown => {
+                if let Some(runtime) = GPU.get() {
+                    *runtime.lock() = Default::default();
+                }
+            }
             ae::Command::About => {
                 out_data.set_return_msg(
                     "onmkFlare v2.0\rCinematic lens flare generator.\rHotspot, glow, streaks, stripe, rings,\rstarburst, ghosts, edge trigger, atmosphere.\rGPU-accelerated. Written in Rust.",
@@ -1091,9 +1126,7 @@ impl AdobePluginGlobal for Plugin {
                 mut out_layer,
             } => {
                 let ep = get_params(params, &in_data)?;
-                let (original, w, h) = layer_to_flat(&in_layer);
-                let result = render_flare(&ep, &original, w, h);
-                flat_to_layer(&result, &mut out_layer, w, h);
+                render_layers(&ep, &in_layer, &mut out_layer);
             }
 
             ae::Command::SmartPreRender { mut extra } => {
@@ -1127,9 +1160,7 @@ impl AdobePluginGlobal for Plugin {
                 let cb = extra.callbacks();
                 let input_world = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
                 let mut output_world = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
-                let (original, w, h) = layer_to_flat(&input_world);
-                let result = render_flare(&ep, &original, w, h);
-                flat_to_layer(&result, &mut output_world, w, h);
+                render_layers(&ep, &input_world, &mut output_world);
                 cb.checkin_layer_pixels(0)?;
             }
 
@@ -1144,6 +1175,11 @@ impl AdobePluginGlobal for Plugin {
 #[cfg_attr(test, derive(Default))]
 #[derive(Clone, PartialEq)]
 pub struct EffectParams {
+    pub aperture_blades: usize,
+    pub aperture_roundness: f64,
+    pub aperture_rotation: f64,
+    pub pupil_edge_bias: f64,
+    pub spectral_quality: usize,
     pub style_preset: i32,
     pub ghost_complexity: f64,
     pub unified_diffraction: f64,
@@ -1253,6 +1289,11 @@ fn get_params(
 ) -> Result<EffectParams, ae::Error> {
     let (px, py) = params.get(Params::LightSource)?.as_point()?.value();
     let mut effect = EffectParams {
+        aperture_blades: params.get(Params::ApertureBlades)?.as_float_slider()?.value().round().clamp(3.0,16.0) as usize,
+        aperture_roundness: params.get(Params::ApertureRoundness)?.as_float_slider()?.value()/100.0,
+        aperture_rotation: params.get(Params::ApertureRotation)?.as_float_slider()?.value(),
+        pupil_edge_bias: params.get(Params::PupilEdgeBias)?.as_float_slider()?.value()/100.0,
+        spectral_quality: params.get(Params::SpectralQuality)?.as_popup()?.value() as usize,
         style_preset: params.get(Params::StylePreset)?.as_popup()?.value() as i32,
         ghost_complexity: params
             .get(Params::GhostComplexity)?
@@ -1374,7 +1415,7 @@ fn get_params(
             .get(Params::PhysicalGain)?
             .as_float_slider()?
             .value()
-            .clamp(0.0, 20_000.0) as f32,
+            .clamp(0.0, 200_000.0) as f32,
         ghost_normalize: params.get(Params::GhostNormalize)?.as_checkbox()?.value(),
         max_area_boost: params
             .get(Params::MaxAreaBoost)?
@@ -1485,16 +1526,15 @@ fn apply_style_preset(p: &mut EffectParams) {
     p.physical_enabled = true;
     let complexity = p.ghost_complexity.clamp(0.0, 1.0);
     let diffraction = p.unified_diffraction.clamp(0.0, 1.0);
-    // Triangle reconstruction preserves the aperture silhouette at a much
-    // lower sampling density than the old point splats.  Spend samples on
-    // shape, not redundant rays.
-    p.ray_grid = (14.0 + 20.0 * complexity) as usize;
+    // Use a coherent, denser pupil mesh for moving aperture silhouettes.
+    // No frame-dependent jitter or resolution-dependent sample count.
+    p.ray_grid = (32.0 + 64.0 * complexity) as usize;
     // Keep the user-facing optical gain authoritative.  Character presets
     // only shape its balance; replacing it with six-figure values caused the
     // reconstructed ghost surfaces to saturate into frame-sized polygons.
     p.physical_gain *= (0.7 + 0.8 * complexity) as f32;
     p.physical_ghost_blur = (0.009 - 0.0055 * complexity) as f32;
-    p.ghost_intensity = 1.25 + 2.75 * complexity;
+    p.ghost_intensity *= 1.25 + 2.75 * complexity;
     p.bloom_strength *= (0.7 + 0.6 * complexity) as f32;
     p.bloom_octaves = (3.0 + 3.0 * complexity) as usize;
     p.ocular_enabled = false;
@@ -1554,7 +1594,44 @@ fn apply_style_preset(p: &mut EffectParams) {
 }
 
 fn apply_legacy_preset(p: &mut EffectParams) {
+    if rich::enabled(p) {
+        let saved=(p.style_preset,p.hotspot_intensity,p.glow_intensity,p.starburst_intensity);
+        p.style_preset-=3;
+        apply_legacy_preset(p);
+        (p.style_preset,p.hotspot_intensity,p.glow_intensity,p.starburst_intensity)=saved;
+        return;
+    }
     match p.style_preset {
+        14..=17 => {
+            // Inspection preset: retain physical gain/blur/ray controls while
+            // excluding all independent source and artistic layers.
+            p.physical_enabled = true;
+            p.lens_preset = match p.style_preset {16 => 1, 17 => 3, _ => 0};
+            // The isolated physical layer needs exposure without the source
+            // core and bloom. Keep the user's gain proportional, including 0.
+            p.physical_gain *= 40.0;
+            p.source_mode = 1;
+            p.source_opacity = 0.0;
+            p.hotspot_intensity = 0.0;
+            p.glow_intensity = 0.0;
+            p.streak_intensity = 0.0;
+            p.stripe_intensity = 0.0;
+            p.ring_intensity = 0.0;
+            p.starburst_intensity = 0.0;
+            if p.style_preset == 14 {
+                p.bloom_strength = 0.0;
+            } else {
+                // Reference image: default .6 -> 2.5 bloom, .018 -> .012.
+                // Preserve zero and retain proportional user controls.
+                p.bloom_strength *= 25.0 / 6.0;
+                p.bloom_radius *= 2.0 / 3.0;
+                p.edge_brightness = 1.0;
+                p.edge_scale = 1.0;
+            }
+            p.ocular_enabled = false;
+            p.atmosphere_amount = 0.0;
+            p.chromatic_amount = 0.0;
+        }
         7 => {
             p.global_brightness = 1.2;
             p.glow_intensity = 0.72;
@@ -1638,6 +1715,71 @@ fn apply_legacy_preset(p: &mut EffectParams) {
 }
 
 // ---- Pixel buffer helpers ----
+
+#[cfg(test)]
+mod preset_tests {
+    use super::*;
+    #[test]
+    fn modern_presets_respect_zero_ghost_intensity() {
+        for style_preset in 1..=5 {
+            let mut p = EffectParams { style_preset, ghost_intensity: 0.0, ghost_complexity: 0.6, ..Default::default() };
+            apply_style_preset(&mut p);
+            assert_eq!(p.ghost_intensity, 0.0);
+        }
+    }
+    #[test]
+    fn cooke_only_keeps_optical_controls_and_excludes_other_layers() {
+        let mut p = EffectParams {
+            style_preset: 14,
+            lens_preset: 3,
+            source_mode: 3,
+            source_opacity: 1.0,
+            hotspot_intensity: 1.0,
+            glow_intensity: 1.0,
+            streak_intensity: 1.0,
+            stripe_intensity: 1.0,
+            ring_intensity: 1.0,
+            starburst_intensity: 1.0,
+            bloom_strength: 1.0,
+            ocular_enabled: true,
+            atmosphere_amount: 1.0,
+            chromatic_amount: 1.0,
+            physical_gain: 1234.0,
+            physical_ghost_blur: 0.007,
+            ray_grid: 24,
+            ghost_intensity: 0.75,
+            ..Default::default()
+        };
+        apply_style_preset(&mut p);
+        assert!(p.physical_enabled);
+        assert_eq!((p.lens_preset, p.source_mode), (0, 1));
+        assert_eq!(
+            [
+                p.source_opacity,
+                p.hotspot_intensity,
+                p.glow_intensity,
+                p.streak_intensity,
+                p.stripe_intensity,
+                p.ring_intensity,
+                p.starburst_intensity,
+                p.atmosphere_amount,
+                p.chromatic_amount
+            ],
+            [0.0; 9]
+        );
+        assert_eq!(p.bloom_strength, 0.0);
+        assert!(!p.ocular_enabled);
+        assert_eq!(
+            (
+                p.physical_gain,
+                p.physical_ghost_blur,
+                p.ray_grid,
+                p.ghost_intensity
+            ),
+            (49360.0, 0.007, 24, 0.75)
+        );
+    }
+}
 
 fn layer_to_flat(layer: &ae::Layer) -> (Vec<u8>, usize, usize) {
     let w = layer.width() as usize;
@@ -1724,10 +1866,19 @@ fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
     }
 }
 
-fn render_flare(ep: &EffectParams, original: &[u8], w: usize, h: usize) -> Vec<u8> {
-    if let Some(gpu) = get_gpu() {
-        gpu.process(ep, original, w, h)
-    } else {
-        flare::process(ep, original, w, h)
+fn render_layers(ep: &EffectParams, input: &ae::Layer, output: &mut ae::Layer) {
+    // Acquire before allocating our flat input/output copies, not only before
+    // GPU submission. AE checkout/checkin callbacks remain outside this lock.
+    let mut runtime = GPU.get_or_init(Default::default).lock();
+    if input.bit_depth() == 16 || input.bit_depth() == 32 {
+        let (w,h)=(input.width() as usize,input.height() as usize);
+        let original = pixel::read_float(input.buffer(),w,h,input.buffer_stride(),input.bit_depth() as u16);
+        let result = runtime.render_pixels(ep,&original,w,h);
+        let (stride,depth)=(output.buffer_stride(),output.bit_depth() as u16);
+        pixel::write_float(&result,output.buffer_mut(),w,h,stride,depth);
+        return;
     }
+    let (original, w, h) = layer_to_flat(input);
+    let result = runtime.render(ep, &original, w, h);
+    flat_to_layer(&result, output, w, h);
 }

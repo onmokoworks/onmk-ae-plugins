@@ -261,6 +261,25 @@ fn sample_bilinear_rgb(buf: &[f32], w: usize, h: usize, fx: f32, fy: f32) -> (f3
     )
 }
 
+// Exercise the real decode/interpolation/encode path with native low-bit input.
+#[test]
+fn native16_bilinear_half_pixel_keeps_low_bit_signal() {
+    for base in 0..=32765u16 {
+        let source:Vec<u8>=(0..4u16).flat_map(|offset|
+            [32768,base+offset,base+3-offset,base].into_iter().flat_map(u16::to_ne_bytes)).collect();
+        let mut decoded=[0.0f32;16];
+        crate::decode_row(&source,16,&mut decoded).unwrap();
+        let (r,g,b)=sample_bilinear_rgb(&decoded,2,2,0.5,0.5);
+        assert_eq!(r,(base as f32+1.5)/32768.0);
+        assert_eq!(g,r);
+        assert_eq!(b,base as f32/32768.0);
+        let mut encoded=[0u8;8];
+        crate::encode_row(&mut encoded,16,&[1.0,r,g,b]);
+        let values:Vec<u16>=encoded.chunks_exact(2).map(|b|u16::from_ne_bytes([b[0],b[1]])).collect();
+        assert_eq!(values,[32768,base+2,base+2,base]);
+    }
+}
+
 /// Brightness is kept on a 0..255 scale even though colours are 0..1, so that the
 /// Threshold parameters and the displacement produced by the gradient keep the same
 /// magnitude they had when the whole pipeline was 8bpc.

@@ -49,10 +49,15 @@ fn distance_field(
 ) -> (Vec<f32>, Vec<Seed>) {
     let mut d = vec![INF; w * h];
     let mut seed = vec![Seed { x: -1, y: -1 }; w * h];
+    fill_distance_field(|i|alpha[i],w,h,feature_inside,&mut d,&mut seed);
+    (d,seed)
+}
+
+fn fill_distance_field(alpha:impl Fn(usize)->f32,w:usize,h:usize,feature_inside:bool,d:&mut[f32],seed:&mut[Seed]) {
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
-            if (alpha[i] >= 0.5) == feature_inside {
+            if (alpha(i) >= 0.5) == feature_inside {
                 d[i] = 0.0;
                 seed[i] = Seed {
                     x: x as i32,
@@ -94,7 +99,31 @@ fn distance_field(
             }
         }
     }
-    (d, seed)
+}
+
+/// Preserve the CPU's scan-order tie selection without changing GPU alpha/noise.
+pub(crate) fn restore_propagated_rgb(input:&[f32],w:usize,h:usize,out:&mut[f32])->Result<(),String> {
+    let n=w.checked_mul(h).ok_or("color field dimensions overflow")?;
+    let len=n.checked_mul(4).ok_or("color field channels overflow")?;
+    if input.len()!=len || out.len()!=len || w>i32::MAX as usize || h>i32::MAX as usize {
+        return Err("invalid color field shape".into());
+    }
+    if n==0 || !input.chunks_exact(4).any(|p|p[3]<=1e-5) {return Ok(());}
+    fn plane<T:Clone>(n:usize,value:T)->Result<Vec<T>,String> {
+        let mut v=Vec::new();v.try_reserve_exact(n).map_err(|_|"color field allocation failed")?;
+        v.resize(n,value);Ok(v)
+    }
+    let mut d=plane(n,INF)?;
+    let mut seed=plane(n,Seed{x:-1,y:-1})?;
+    fill_distance_field(|i|input[i*4+3].clamp(0.0,1.0),w,h,true,&mut d,&mut seed);
+    for i in 0..n {
+        if input[i*4+3].clamp(0.0,1.0)<=1e-5 {
+            let s=seed[i];
+            let source=if s.x>=0 {s.y as usize*w+s.x as usize} else {i};
+            out[i*4..i*4+3].copy_from_slice(&input[source*4..source*4+3]);
+        }
+    }
+    Ok(())
 }
 
 fn hash(mut x: u32) -> f32 {
@@ -200,6 +229,40 @@ pub fn render_rgba(input: &[f32], w: usize, h: usize, p: &EdgeParams) -> Vec<f32
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "explicit 1080p correction timing; not an end-to-end benchmark"]
+    fn correction_1080p_timing() {
+        let (w,h)=(1920,1080);
+        let input:Vec<f32>=(0..w*h).flat_map(|i| {
+            let (x,y)=(i%w,i/w);
+            [0.2,0.4,0.8,if (320..1600).contains(&x)&&(180..900).contains(&y){1.0}else{0.0}]
+        }).collect();
+        let mut output=input.clone();
+        restore_propagated_rgb(&input,w,h,&mut output).unwrap();
+        let start=std::time::Instant::now();
+        for _ in 0..5 {restore_propagated_rgb(std::hint::black_box(&input),w,h,std::hint::black_box(&mut output)).unwrap();}
+        eprintln!("1080p RGB correction mean_ms={:.3}",start.elapsed().as_secs_f64()*1000.0/5.0);
+    }
+    #[test]
+    fn propagated_color_correction_preserves_alpha_and_checks_shape() {
+        let mut out=vec![0.37;4];
+        assert!(restore_propagated_rgb(&[1.;3],1,1,&mut out).is_err());
+        assert_eq!(out,[0.37;4]);
+        for seed in 1..=4u32 {
+            let (w,h)=(7,5);let mut rng=seed;
+            let input:Vec<f32>=(0..w*h).flat_map(|i| {
+                rng=rng.wrapping_mul(1664525).wrapping_add(1013904223);
+                [i as f32,-(i as f32),0.8,if rng%4==0 {1.0} else {0.0}]
+            }).collect();
+            let reference=render_rgba(&input,w,h,&EdgeParams::default());
+            let mut output=input.clone();
+            for p in output.chunks_exact_mut(4){p[3]=0.37;}
+            restore_propagated_rgb(&input,w,h,&mut output).unwrap();
+            for (p,r) in output.chunks_exact(4).zip(reference.chunks_exact(4)) {
+                assert_eq!(&p[..3],&r[..3]);assert_eq!(p[3],0.37);
+            }
+        }
+    }
     #[test]
     fn deterministic() {
         let p = EdgeParams::default();

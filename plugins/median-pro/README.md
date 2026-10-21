@@ -114,6 +114,16 @@ cargo test
 cargo build --release
 ```
 
+## Map validation
+
+Empty or truncated luminance maps fall back to the existing no-map behavior instead of indexing invalid pixels. Map sizes and allocations are checked. A valid black map remains a zero-radius map; inversion is preserved. Unit tests cover these cases; full-frame AEXCompat smoke checks do not establish cropped-region or host-injected malformed-world correctness.
+
+Smart Render releases acquired input/map pixels on normal `Result` error paths, including output checkout failures. Cleanup tests cover error precedence; panic/OOM and actual host callback fault injection remain unverified.
+
+Final mixing reuses the inactive iteration buffer and premultiplication runs in place. This removes two full ARGB8 scratch buffers from active filtering (16,588,800 bytes at 1920×1080), without changing the filter formula. This is an allocation reduction, not a measured host-process memory bound.
+
+The filter core validates pixel counts, returns empty images without entering neighborhood loops, and uses fallible scratch allocations. World conversion validates 8-bit format, pointer and row geometry; row copies check all ranges before writing and preserve padding/reversed orientation. Bad primary/output geometry returns an error; invalid auxiliary maps use no-map behavior. Output extent mismatch is rejected, not implemented as ROI support. Actual malformed host worlds and allocator exhaustion have not been injected; no total memory budget is claimed.
+
 ## License
 
 MIT License. See [LICENSE](LICENSE).

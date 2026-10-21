@@ -4,6 +4,10 @@ use crate::EffectParams;
 const PI: f64 = std::f64::consts::PI;
 
 pub fn process(ep: &EffectParams, src: &[u8], w: usize, h: usize) -> Vec<u8> {
+    process_pixels(ep,src,w,h)
+}
+
+pub(crate) fn process_pixels<T: crate::pixel::Channel>(ep: &EffectParams, src: &[T], w: usize, h: usize) -> Vec<T> {
     let mut out = src.to_vec();
     let n = w * h;
 
@@ -18,7 +22,8 @@ pub fn process(ep: &EffectParams, src: &[u8], w: usize, h: usize) -> Vec<u8> {
     let streak_angle_rad = ep.streak_rotation * PI / 180.0;
 
     let physical_cfg = physical::Config {
-        ray_grid: ep.ray_grid.min(32),
+        wavelengths: [650.0,550.0,450.0],
+        ray_grid: ep.ray_grid.clamp(4, 128),
         min_ghost: 1e-7,
         gain: ep.physical_gain,
         normalize: ep.ghost_normalize,
@@ -46,12 +51,13 @@ pub fn process(ep: &EffectParams, src: &[u8], w: usize, h: usize) -> Vec<u8> {
         sources.push(physical::BrightSource {
             angle_x: (lx / w as f64 - 0.5) * fov_h,
             angle_y: (ly / h as f64 - 0.5) * fov_v,
-            rgb: [1.0; 3],
+            rgb: if (15..=20).contains(&ep.style_preset) { [1.0, 0.92, 0.78] } else { [1.0; 3] },
         });
     }
     let (physical_ghosts, physical_bloom) = if ep.physical_enabled {
         let lens = physical::bundled_lens(ep.lens_preset);
-        let ghosts = physical::render(&lens, &sources, w, h, physical_cfg);
+        let ghosts = if crate::rich::enabled(ep) {crate::rich::ghosts(ep,&sources,w,h,physical_cfg)}
+            else {physical::render(&lens, &sources, w, h, physical_cfg)};
         let bloom_source = physical::source_layer(&sources, w, h);
         let bloom = physical::bloom(&bloom_source, w, h, physical_cfg);
         (ghosts, bloom)
@@ -75,7 +81,7 @@ pub fn process(ep: &EffectParams, src: &[u8], w: usize, h: usize) -> Vec<u8> {
         let mut flare_b = 0.0;
 
         // 1. Hotspot — small intense bright core
-        if ep.style_preset >= 6 && ep.hotspot_intensity > 0.0 {
+        if ep.style_preset >= 6 && !crate::rich::enabled(ep) && ep.hotspot_intensity > 0.0 {
             let r = (ep.hotspot_size * scale).max(0.5);
             let hotspot = ep.hotspot_intensity * (-dist * dist / (2.0 * r * r)).exp();
             flare_r += hotspot;
@@ -84,7 +90,7 @@ pub fn process(ep: &EffectParams, src: &[u8], w: usize, h: usize) -> Vec<u8> {
         }
 
         // 2. Glow — multi-scale bloom (core, body, halo, veiling glare)
-        if ep.style_preset >= 6 && ep.glow_intensity > 0.0 {
+        if ep.style_preset >= 6 && !crate::rich::enabled(ep) && ep.glow_intensity > 0.0 {
             let r = ep.glow_radius * scale;
             if r > 0.0 {
                 let t = dist / r;
@@ -145,7 +151,7 @@ pub fn process(ep: &EffectParams, src: &[u8], w: usize, h: usize) -> Vec<u8> {
         }
 
         // 6. Starburst
-        if ep.style_preset >= 6 && ep.starburst_intensity > 0.0 && ep.starburst_blades >= 3 {
+        if ep.style_preset >= 6 && !crate::rich::enabled(ep) && ep.starburst_intensity > 0.0 && ep.starburst_blades >= 3 {
             let r = ep.starburst_radius * scale;
             if r > 0.0 {
                 let s = compute_starburst(dist, angle, r, ep.starburst_blades, ep.flare_angle);
@@ -169,7 +175,7 @@ pub fn process(ep: &EffectParams, src: &[u8], w: usize, h: usize) -> Vec<u8> {
             flare_g += eye[1] as f64;
             flare_b += eye[2] as f64;
         }
-        if ep.style_preset < 6 {
+        if ep.style_preset < 6 || crate::rich::enabled(ep) {
             let source = source_optics[i];
             flare_r += finite(source[0] as f64);
             flare_g += finite(source[1] as f64);
@@ -188,26 +194,36 @@ pub fn process(ep: &EffectParams, src: &[u8], w: usize, h: usize) -> Vec<u8> {
         // The manual emitter is independent of plate luminance and of the
         // traced-ghost buffers.  Keeping a compact analytic core here also
         // prevents one bad optical sample from erasing the visible source.
-        if ep.source_mode == 1 || ep.source_mode == 3 {
+        if !crate::rich::enabled(ep) && (ep.source_mode == 1 || ep.source_mode == 3) && ep.hotspot_intensity > 0.0 {
             let sigma = (2.2 * scale).max(0.75);
-            let manual_core = 3.5 * (-dist * dist / (2.0 * sigma * sigma)).exp()
-                + 0.22 / (1.0 + (dist / (18.0 * scale.max(0.1))).powi(3));
+            let manual_core = (3.5 * (-dist * dist / (2.0 * sigma * sigma)).exp()
+                + 0.22 / (1.0 + (dist / (18.0 * scale.max(0.1))).powi(3)))
+                * (ep.hotspot_intensity / 1.6);
             flare_r = finite(flare_r) + manual_core;
             flare_g = finite(flare_g) + manual_core * 0.92;
             flare_b = finite(flare_b) + manual_core * 0.76;
         }
 
         // Apply global brightness and flare opacity
+        if (15..=20).contains(&ep.style_preset) {
+            // A linear toe below 1e-5 prevents the reference gamma's infinite
+            // slope at black from magnifying floating-point blur residue.
+            let map = |x:f64| {let x=finite(x).max(0.0); let v=x/(1.0+x);
+                if v<1e-5 {v*1e-5_f64.powf(1.0/2.2-1.0)} else {v.powf(1.0/2.2)}};
+            flare_r=map(flare_r);
+            flare_g=map(flare_g);
+            flare_b=map(flare_b);
+        }
         flare_r = finite(flare_r * brightness * ep.flare_opacity);
         flare_g = finite(flare_g * brightness * ep.flare_opacity);
         flare_b = finite(flare_b * brightness * ep.flare_opacity);
 
         // Composite
         let off = i * 4;
-        let sa = src[off] as f64 / 255.0;
-        let sr = src[off + 1] as f64 / 255.0;
-        let sg = src[off + 2] as f64 / 255.0;
-        let sb = src[off + 3] as f64 / 255.0;
+        let sa = src[off].unit();
+        let sr = src[off + 1].unit();
+        let sg = src[off + 2].unit();
+        let sb = src[off + 3].unit();
 
         let (br, bg, bb) = apply_blend(sr, sg, sb, flare_r, flare_g, flare_b, ep.transfer_mode);
 
@@ -215,10 +231,10 @@ pub fn process(ep: &EffectParams, src: &[u8], w: usize, h: usize) -> Vec<u8> {
         let og = (sg * ep.source_opacity + bg).min(1.0);
         let ob = (sb * ep.source_opacity + bb).min(1.0);
 
-        out[off] = (sa * 255.0) as u8;
-        out[off + 1] = (finite(or) * 255.0).clamp(0.0, 255.0) as u8;
-        out[off + 2] = (finite(og) * 255.0).clamp(0.0, 255.0) as u8;
-        out[off + 3] = (finite(ob) * 255.0).clamp(0.0, 255.0) as u8;
+        out[off] = T::from_unit(sa);
+        out[off + 1] = T::from_unit(finite(or));
+        out[off + 2] = T::from_unit(finite(og));
+        out[off + 3] = T::from_unit(finite(ob));
     }
 
     out

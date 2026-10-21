@@ -417,6 +417,10 @@ struct SmartRenderData {
 
 const DEBUG_MODULE: &str = "ParticleKit";
 const MAX_RENDER_BYTES: usize = 256 * 1024 * 1024;
+// Retained payload only: live render references and HashMap bookkeeping are
+// separate. Two maps share a 256 MiB ceiling via equal independent budgets.
+const SOURCE_CACHE_BYTES: usize = 128 * 1024 * 1024;
+const SOURCE_CACHE_ENTRIES: usize = 256;
 const MAX_OUTPUT_PIXELS: i64 = 20_000_000; // ~4472x4472 max
 const MIN_SMART_PRE_RENDER_MARGIN: i32 = 256;
 const MAX_SMART_PRE_RENDER_MARGIN: i32 = 4096;
@@ -4751,6 +4755,30 @@ fn emitter_cache() -> &'static RwLock<EmitterPointCacheMap> {
     EMITTER_CACHE.get_or_init(|| RwLock::new(EmitterPointCacheMap::default()))
 }
 
+fn insert_source_cache<V>(
+    entries: &mut rustc_hash::FxHashMap<ImageCacheKey, V>, key: ImageCacheKey,
+    value: V, budget: usize, bytes: impl Fn(&V) -> usize,
+) {
+    let incoming = bytes(&value);
+    if incoming > budget { return; } // Render it, but don't retain it.
+    entries.remove(&key);
+    let retained = entries.values().fold(0usize, |sum, value| sum.saturating_add(bytes(value)));
+    if entries.len() >= SOURCE_CACHE_ENTRIES || retained > budget - incoming {
+        entries.clear();
+    }
+    entries.insert(key, value);
+}
+
+fn sprite_cache_bytes(sprites: &Arc<Vec<SpriteImage>>) -> usize {
+    sprites.iter().fold(sprites.capacity().saturating_mul(std::mem::size_of::<SpriteImage>()), |sum, sprite| {
+        let mips = sprite.mips.iter().fold(
+            sprite.mips.capacity().saturating_mul(std::mem::size_of::<renderer::MipLevel>()),
+            |sum, mip| sum.saturating_add(mip.pixels.capacity()));
+        sum.saturating_add(sprite.pixels.capacity()).saturating_add(mips)
+    })
+}
+
+#[cfg(test)]
 fn image_cache_has_entries() -> bool {
     IMAGE_CACHE_POPULATED.load(Ordering::Acquire)
 }
@@ -4787,32 +4815,44 @@ fn layer_signature(layer: &ae::Layer) -> u64 {
     let height = layer.height() as usize;
     let stride = layer.buffer_stride();
     let buf = layer.buffer();
+    source_pixel_signature(buf, width, height, stride)
+}
+
+fn source_pixel_signature(buf: &[u8], width: usize, height: usize, stride: usize) -> u64 {
     if width == 0 || height == 0 || buf.is_empty() {
         return 0;
     }
 
-    let sample_cols = width.min(8);
-    let sample_rows = height.min(8);
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-
-    for sy in 0..sample_rows {
-        let y = sy * height / sample_rows;
-        for sx in 0..sample_cols {
-            let x = sx * width / sample_cols;
-            let idx = y.saturating_mul(stride).saturating_add(x.saturating_mul(4));
-            if idx + 3 >= buf.len() {
-                continue;
-            }
-
-            let sample = [buf[idx], buf[idx + 1], buf[idx + 2], buf[idx + 3]];
-            for byte in sample {
-                hash ^= u64::from(byte);
-                hash = hash.wrapping_mul(0x100_0000_01b3);
-            }
-        }
+    use std::hash::Hasher;
+    let mut hash = rustc_hash::FxHasher::default();
+    // This plugin consumes ARGB8 source pixels. Sparse sampling misses edits
+    // between sample points and can reuse stale sprites/emitter points.
+    // Hash active bytes only; host row padding is not image content.
+    let active_bytes = width.saturating_mul(4);
+    for row in buf.chunks(stride.max(1)).take(height) {
+        hash.write(&row[..active_bytes.min(row.len())]);
     }
+    hash.finish()
+}
 
-    hash
+#[test]
+fn source_signature_detects_changes_between_sparse_samples() {
+    let original = vec![0u8; 16 * 16 * 4];
+    let mut changed = original.clone();
+    changed[(1 * 16 + 1) * 4] = 255;
+    assert_ne!(source_pixel_signature(&original, 16, 16, 64),
+        source_pixel_signature(&changed, 16, 16, 64));
+    let mut padded = vec![0u8; 16 * 68];
+    for row in padded.chunks_exact_mut(68) { row[64..].fill(123); }
+    assert_eq!(source_pixel_signature(&original, 16, 16, 64),
+        source_pixel_signature(&padded, 16, 16, 68));
+    // Every pixel/channel can affect a cached image, including the last row.
+    for byte in 0..original.len() {
+        let mut edited = original.clone();
+        edited[byte] = 1;
+        assert_ne!(source_pixel_signature(&original, 16, 16, 64),
+            source_pixel_signature(&edited, 16, 16, 64), "byte {byte}");
+    }
 }
 
 fn source_cache_key(
@@ -5147,7 +5187,8 @@ fn populate_layer_alpha_emitter(
 
     let points = Arc::new(build_emitter_points(&source_layer, key.proxy_divisor));
     if let Ok(mut cache) = emitter_cache().write() {
-        cache.insert(key, points.clone());
+        insert_source_cache(&mut cache, key, points.clone(), SOURCE_CACHE_BYTES,
+            |points| points.capacity().saturating_mul(std::mem::size_of::<glam::Vec3>()));
         EMITTER_CACHE_POPULATED.store(true, Ordering::Release);
     }
     Ok(Some(points))
@@ -5324,6 +5365,100 @@ fn cubic_bezier(
     p0 * (uu * u) + p1 * (3.0 * uu * t) + p2 * (3.0 * u * tt) + p3 * (tt * t)
 }
 
+#[test]
+fn source_cache_admission_bounds_payload_entries_and_preserves_live_images() {
+    let key = |generation| ImageCacheKey {
+        instance_id: 1, time: 0, time_step: 1, time_scale: 30,
+        proxy_divisor: 1, source_width: 1, source_height: 1,
+        source_origin_x: 0, source_origin_y: 0, source_signature: 0, generation,
+    };
+    let mut entries = rustc_hash::FxHashMap::default();
+    for generation in 0..1000 {
+        insert_source_cache(&mut entries, key(generation), 3usize, 8, |bytes| *bytes);
+        assert!(entries.values().sum::<usize>() <= 8);
+    }
+    insert_source_cache(&mut entries, key(999), 1, 8, |bytes| *bytes);
+    assert_eq!(entries[&key(999)], 1);
+    insert_source_cache(&mut entries, key(1001), usize::MAX, 8, |bytes| *bytes);
+    assert!(!entries.contains_key(&key(1001)));
+    for generation in 0..1000 {
+        insert_source_cache(&mut entries, key(generation), 0, 8, |bytes| *bytes);
+        assert!(entries.len() <= SOURCE_CACHE_ENTRIES);
+    }
+    let image = Arc::new(vec![finish_sprite(2, 2, vec![255; 16])]);
+    let cost = sprite_cache_bytes(&image);
+    assert!(cost >= 20); // base pixels plus 1x1 mip; capacity overhead also counted.
+    let mut sprites = SpriteCacheMap::default();
+    insert_source_cache(&mut sprites, key(0), image.clone(), cost, sprite_cache_bytes);
+    insert_source_cache(&mut sprites, key(1), image.clone(), cost, sprite_cache_bytes);
+    assert_eq!(sprites.len(), 1);
+    assert_eq!(image[0].pixels.as_slice(), &[255; 16]); // eviction doesn't alter live data
+    insert_source_cache(&mut sprites, key(2), image.clone(), cost - 1, sprite_cache_bytes);
+    assert!(!sprites.contains_key(&key(2)));
+}
+
+fn cached_sprite(
+    cache: &RwLock<SpriteCacheMap>,
+    key: ImageCacheKey,
+    build: impl FnOnce() -> SpriteImage,
+) -> SpriteImage {
+    if let Ok(entries) = cache.read() {
+        if let Some(sprite) = entries.get(&key).and_then(|sprites| sprites.first()) {
+            return sprite.clone();
+        }
+    }
+    let sprite = build();
+    if let Ok(mut entries) = cache.write() {
+        insert_source_cache(&mut entries, key, Arc::new(vec![sprite.clone()]),
+            SOURCE_CACHE_BYTES, sprite_cache_bytes);
+    }
+    sprite
+}
+
+#[test]
+fn sprite_cache_rechecks_each_frame_and_reuses_unchanged_content() {
+    let cache = RwLock::new(SpriteCacheMap::default());
+    let builds = std::cell::Cell::new(0);
+    let frame = |value: u8| {
+        let pixels = vec![255, value, 0, 0];
+        let key = ImageCacheKey {
+            instance_id: 1, time: 0, time_step: 1, time_scale: 30,
+            proxy_divisor: 1, source_width: 1, source_height: 1,
+            source_origin_x: 0, source_origin_y: 0,
+            source_signature: source_pixel_signature(&pixels, 1, 1, 4), generation: 1,
+        };
+        cached_sprite(&cache, key, || {
+            builds.set(builds.get() + 1);
+            finish_sprite(1, 1, pixels)
+        })
+    };
+    let first = [frame(10), frame(20)];
+    let edited = [frame(10), frame(30)];
+    assert!(Arc::ptr_eq(&first[0].pixels, &edited[0].pixels));
+    assert_eq!(edited[1].pixels[1], 30);
+    assert_ne!(first[1].pixels, edited[1].pixels);
+    let restored = [frame(10), frame(20)];
+    assert!(Arc::ptr_eq(&first[1].pixels, &restored[1].pixels));
+    assert_eq!(builds.get(), 3);
+}
+
+fn cached_source_sprite(
+    in_data: &ae::InData,
+    layer: &ae::Layer,
+    divisor: u8,
+    premultiplied: bool,
+) -> SpriteImage {
+    let mut key = source_cache_key(in_data, divisor, layer);
+    // Content is checked after each time-specific checkout. Identical frames
+    // can share preprocessing without hiding edits at another checkout time.
+    key.time = 0;
+    if premultiplied { key.source_signature ^= 0xA8D7_EF31_5B2C_49D0; }
+    let sprite = cached_sprite(image_cache(), key,
+        || build_sprite_image(layer, divisor, premultiplied));
+    IMAGE_CACHE_POPULATED.store(true, Ordering::Release);
+    sprite
+}
+
 fn populate_image_sprite(
     params: &ae::Parameters<Params>,
     in_data: &ae::InData,
@@ -5341,47 +5476,18 @@ fn populate_image_sprite(
     let is_multi_frame =
         frame_count > 1 && render_cfg.time_sampling != TimeSamplingMode::CurrentTime;
     let pdiv = proxy_divisor(params)?;
-    let checked_out = params.checkout(Params::SpriteSourceLayer)?;
-    let Some(source_layer) = checked_out.as_layer()?.value() else {
-        return Ok(Vec::new());
-    };
-    let mut key = source_cache_key(in_data, pdiv, &source_layer);
-    // Pin time to 0 for cache stability — source layer content is captured by
-    // source_signature and doesn't change with composition time.
-    key.time = 0;
-    if render_cfg.image_sampling.source_premultiplied {
-        key.source_signature ^= 0xA8D7_EF31_5B2C_49D0;
-    }
-    if is_multi_frame {
-        key.source_signature ^= (frame_count as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-
-    if image_cache_has_entries() {
-        if let Ok(cache) = image_cache().read() {
-            if let Some(sprites) = cache.get(&key) {
-                return Ok((**sprites).clone());
-            }
-        }
-    }
-
     if !is_multi_frame {
-        let sprite = build_sprite_image(
-            &source_layer,
-            pdiv,
-            render_cfg.image_sampling.source_premultiplied,
-        );
-        let sprites = Arc::new(vec![sprite]);
-        if let Ok(mut cache) = image_cache().write() {
-            cache.insert(key, sprites.clone());
-            IMAGE_CACHE_POPULATED.store(true, Ordering::Release);
-        }
-        return Ok((*sprites).clone());
+        let checked_out = params.checkout(Params::SpriteSourceLayer)?;
+        let Some(source_layer) = checked_out.as_layer()?.value() else {
+            return Ok(Vec::new());
+        };
+        return Ok(vec![cached_source_sprite(in_data, &source_layer, pdiv,
+            render_cfg.image_sampling.source_premultiplied)]);
     }
 
     // Multi-frame: checkout source layer at different times
     let time_step = in_data.time_step();
     let time_scale = in_data.time_scale();
-    drop(checked_out);
 
     let mut sprites = Vec::with_capacity(frame_count as usize);
     for i in 0..frame_count {
@@ -5396,7 +5502,8 @@ fn populate_image_sprite(
             Ok(checked) => {
                 if let Ok(layer_ref) = checked.as_layer() {
                     if let Some(layer) = layer_ref.value() {
-                        sprites.push(build_sprite_image(
+                        sprites.push(cached_source_sprite(
+                            in_data,
                             &layer,
                             pdiv,
                             render_cfg.image_sampling.source_premultiplied,
@@ -5415,12 +5522,7 @@ fn populate_image_sprite(
         }
     }
 
-    let sprites = Arc::new(sprites);
-    if let Ok(mut cache) = image_cache().write() {
-        cache.insert(key, sprites.clone());
-        IMAGE_CACHE_POPULATED.store(true, Ordering::Release);
-    }
-    Ok((*sprites).clone())
+    Ok(sprites)
 }
 
 fn collect_particle_runtime_inputs(

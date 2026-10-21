@@ -16,25 +16,176 @@
 ///        + Blinn-Phong specular (diffuse+spec) modulated by Fresnel
 ///   4. Composite result over input using mask alpha, then Mix slider
 ///
-/// Pixel format: flat ARGB u8, 4 bytes per pixel (same convention as DistortChroma).
+/// Pixel format: native-depth ARGB. Arithmetic retains historical 0..255 units.
 use crate::RefractParams;
+use after_effects::Error;
+type RenderResult<T> = Result<T,Error>;
+
+fn filled<T: Copy>(count: usize,value: T) -> RenderResult<Vec<T>> {
+    let mut data=Vec::new();
+    data.try_reserve_exact(count).map_err(|_|Error::OutOfMemory)?;
+    data.resize(count,value);
+    Ok(data)
+}
+fn copied<T: Copy + Default>(src: &[T]) -> RenderResult<Vec<T>> {
+    let mut data=filled(src.len(),T::default())?;
+    data.copy_from_slice(src);
+    Ok(data)
+}
+
+pub trait Channel: Copy + Default + Send + Sync {
+    const PACKED_BYTE: bool = false;
+    fn units(self) -> f32;
+    fn from_units(value: f32) -> Self;
+}
+impl Channel for u8 {
+    const PACKED_BYTE: bool = true;
+    fn units(self) -> f32 { self as f32 }
+    fn from_units(value: f32) -> Self { value.clamp(0.0, 255.0) as u8 }
+}
+impl Channel for u16 {
+    fn units(self) -> f32 { self as f32 * (255.0 / 32768.0) }
+    fn from_units(value: f32) -> Self { (value * (32768.0 / 255.0)).round().clamp(0.0, 32768.0) as u16 }
+}
+impl Channel for f32 {
+    fn units(self) -> f32 { self * 255.0 }
+    fn from_units(value: f32) -> Self { value / 255.0 }
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+
+    #[test]
+    fn large_blurs_preserve_constant_native_fields_through_complete_render() {
+        for (w,h) in [(1,1),(1,31),(17,1),(9,7)] {
+            for sigma in [0.0,2.0,40.0] {
+                let p=RefractParams {samples:1,ior_mode:1,base_ior:1.5,
+                    ior_r:1.5,ior_g:1.5,ior_b:1.5,fresnel_power:2.0,shininess:32.0,
+                    saturation:1.0,coverage_source:3,mix:1.0,output_mode:1,
+                    map_blur:sigma,bg_blur:sigma,height_blur:sigma,edge_blur:sigma,
+                    affected_blur:sigma,..Default::default()};
+                let deep:Vec<u16>=(0..w*h).flat_map(|_|[32768,16385,16387,1]).collect();
+                assert_eq!(render(&p,&deep,None,None,w,h).unwrap(),deep,"{w}x{h} sigma={sigma}");
+                let hdr:Vec<f32>=(0..w*h).flat_map(|_|[1.0,-0.25,4.125,0.50001]).collect();
+                let actual=render(&p,&hdr,None,None,w,h).unwrap();
+                let error=actual.iter().zip(&hdr).map(|(a,b)|(a-b).abs()).fold(0.0f32,f32::max);
+                assert!(error<0.000005,"{w}x{h} sigma={sigma} error={error}");
+            }
+        }
+    }
+
+    #[test]
+    fn blur_boundary_matches_direct_clamped_taps() {
+        for (w,h) in [(1,1),(1,31),(17,1),(9,7),(17,31)] {
+            for radius in [0,1,2,8,33] {
+                for constant in [false,true] {
+                    let src:Vec<f32>=(0..w*h).map(|i|if constant {0.75} else {((i*37+11)%97) as f32/16.0-1.25}).collect();
+                    let mut expected=src.clone();
+                    for horizontal in [true,false] {
+                        expected=(0..w*h).map(|i| {
+                            let (x,y)=(i%w,i/w);
+                            let sum:f64=(-(radius as isize)..=radius as isize).map(|delta| {
+                                let sx=if horizontal {(x as isize+delta).clamp(0,w as isize-1) as usize} else {x};
+                                let sy=if horizontal {y} else {(y as isize+delta).clamp(0,h as isize-1) as usize};
+                                expected[sy*w+sx] as f64
+                            }).sum();
+                            (sum/(2*radius+1) as f64) as f32
+                        }).collect();
+                    }
+                    let mut actual=vec![0.0;w*h];
+                    let mut scratch=vec![0.0;w*h];
+                    box_blur_pass(&src,&mut actual,&mut scratch,w,h,radius);
+                    let error=actual.iter().zip(&expected).map(|(a,b)|(a-b).abs()).fold(0.0f32,f32::max);
+                    assert!(error<0.000005,"{w}x{h} r={radius} constant={constant} error={error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_geometry_and_capacity_fail_before_rendering() {
+        let p=RefractParams::default();
+        for (w,h) in [(0,1),(1,0),(usize::MAX,2),(i32::MAX as usize+1,1)] {
+            assert_eq!(render::<u8>(&p,&[],None,None,w,h),Err(Error::BadCallbackParameter));
+        }
+        assert_eq!(render(&p,&[0u16;3],None,None,1,1),Err(Error::BadCallbackParameter));
+        assert_eq!(render(&p,&[0u16;4],Some(&[0;3]),None,1,1),Err(Error::BadCallbackParameter));
+        assert_eq!(render(&p,&[0u16;4],None,Some(&[0;5]),1,1),Err(Error::BadCallbackParameter));
+        assert_eq!(filled::<f32>(usize::MAX,0.0),Err(Error::OutOfMemory));
+    }
+
+    #[test]
+    fn cpu_workspace_paths_remain_finite_and_repeatable() {
+        let (w,h)=(9,7);
+        let src:Vec<f32>=(0..w*h).flat_map(|i|[1.0,(i%9) as f32/8.0,-0.25,2.0]).collect();
+        let mask:Vec<f32>=(0..w*h).flat_map(|i| {
+            let a=if i%w>1 && i%w<7 && i/w>0 && i/w<6 {1.0} else {0.0};
+            [a,0.25,0.5,0.75]
+        }).collect();
+        for bevel_mode in [BEVEL_HEIGHT_ADD,BEVEL_SDF] {
+            for output_mode in 1..=5 {
+                let p=RefractParams {samples:2,coverage_source:1,saturation:1.0,
+                    ior_r:1.5,ior_g:1.5,ior_b:1.5,base_ior:1.5,fresnel_power:2.0,
+                    mix:0.75,bg_blur:1.5,map_blur:1.5,height_blur:1.5,edge_blur:1.5,
+                    affected_blur:1.5,edge_enable:true,edge_width:2.0,edge_rim_blur:1.0,
+                    rim_frost:1.0,bevel_height:1.0,bevel_mode,output_mode,..Default::default()};
+                let a=render(&p,&src,Some(&mask),Some(&src),w,h).unwrap();
+                assert_eq!(a.len(),src.len());
+                assert!(a.iter().all(|v|v.is_finite()));
+                assert_eq!(a,render(&p,&src,Some(&mask),Some(&src),w,h).unwrap());
+                if output_mode==2 {assert_eq!(a,src);}
+            }
+        }
+    }
+
+    #[test]
+    fn all_nominal_deep_levels_survive_processing() {
+        let p = RefractParams { samples: 1, coverage_source: 3, saturation: 1.0,
+            ior_r: 1.5, ior_g: 1.5, ior_b: 1.5, base_ior: 1.5,
+            fresnel_power: 2.0, mix: 0.0, ..Default::default() };
+        let src: Vec<u16> = (0..=32768).flat_map(|v| [32768, v, v, v]).collect();
+        assert_eq!(render(&p, &src, None, None, 32769, 1).unwrap(), src);
+        let hdr = [1.0f32, -0.25, 4.125, 0.50001];
+        let out = render(&p, &hdr, None, None, 1, 1).unwrap();
+        for (a,b) in out.iter().zip(hdr) { assert!((a-b).abs() < 1e-6, "{out:?}"); }
+    }
+
+    #[test]
+    fn bilinear_sampling_resolves_sub_byte_values() {
+        let src = [32768u16,16385,16385,16385,32768,16387,16387,16387];
+        let (r,g,b) = sample_bilinear_rgb(&src, 2, 1, 0.5, 0.0);
+        for c in [r,g,b] { assert_eq!(u16::from_units(c),16386); }
+    }
+
+    #[test]
+    fn blur_retains_deep_low_bits_and_signed_hdr() {
+        let src: Vec<u16> = (0..15).flat_map(|_| [32768,16385,16387,1]).collect();
+        assert_eq!(blur_rgba_3pass(&src,5,3,2.0).unwrap(),src);
+        let hdr: Vec<f32> = (0..15).flat_map(|_| [1.0,-0.25,4.125,0.50001]).collect();
+        let out = blur_rgba_3pass(&hdr,5,3,2.0).unwrap();
+        for (a,b) in out.iter().zip(hdr) { assert!((a-b).abs() < 2e-6, "{a} != {b}"); }
+    }
+}
+
 use rayon::prelude::*;
 
 // ---- Box blur (3-pass Gaussian approximation), operating on an f32 plane ----
 
-fn box_blur_3pass(src: &[f32], w: usize, h: usize, sigma: f64) -> Vec<f32> {
+fn box_blur_3pass(src: &[f32], w: usize, h: usize, sigma: f64) -> RenderResult<Vec<f32>> {
     if sigma < 0.5 {
-        return src.to_vec();
+        return copied(src);
     }
     let boxes = boxes_for_gauss(sigma);
-    let mut buf_a = src.to_vec();
-    let mut buf_b = vec![0.0f32; w * h];
+    let mut buf_a = copied(src)?;
+    let mut buf_b = filled(w*h,0.0f32)?;
+    let mut tmp = filled(w*h,0.0f32)?;
 
     for &box_r in &boxes {
-        box_blur_pass(&buf_a, &mut buf_b, w, h, box_r);
+        box_blur_pass(&buf_a, &mut buf_b, &mut tmp, w, h, box_r);
         std::mem::swap(&mut buf_a, &mut buf_b);
     }
-    buf_a
+    Ok(buf_a)
 }
 
 fn boxes_for_gauss(sigma: f64) -> [usize; 3] {
@@ -63,12 +214,11 @@ fn boxes_for_gauss(sigma: f64) -> [usize; 3] {
     sizes
 }
 
-fn box_blur_pass(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
+fn box_blur_pass(src: &[f32], dst: &mut [f32], tmp: &mut [f32], w: usize, h: usize, r: usize) {
     if r == 0 {
         dst.copy_from_slice(src);
         return;
     }
-    let mut tmp = vec![0.0f32; w * h];
 
     let diam = (2 * r + 1) as f32;
     let inv = 1.0 / diam;
@@ -81,6 +231,9 @@ fn box_blur_pass(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
             running += src[row + i];
         }
         running += r as f32 * src[row];
+        if r >= w {
+            running += (r-w+1) as f32 * src[row+w-1];
+        }
 
         for x in 0..w {
             tmp[row + x] = running * inv;
@@ -97,6 +250,9 @@ fn box_blur_pass(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
             running += tmp[i * w + x];
         }
         running += r as f32 * tmp[x];
+        if r >= h {
+            running += (r-h+1) as f32 * tmp[(h-1)*w+x];
+        }
 
         for y in 0..h {
             dst[y * w + x] = running * inv;
@@ -114,14 +270,14 @@ fn box_blur_pass(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
 /// pixel INSIDE the shape (`mask >= 0.5`) returns the true distance (px) to the
 /// nearest outside pixel; outside pixels return 0. O(npx), implemented from the
 /// published algorithm (not copied from any plugin source).
-fn inner_distance(mask: &[f32], w: usize, h: usize) -> Vec<f32> {
+fn inner_distance(mask: &[f32], w: usize, h: usize) -> RenderResult<Vec<f32>> {
     let n = w * h;
     if n == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let inf = (w + h) as f32; // larger than any in-frame distance
                               // Phase 1: vertical 1-D distance g(x,y) to nearest "outside" pixel in column.
-    let mut g = vec![0.0f32; n];
+    let mut g = filled(n,0.0f32)?;
     for x in 0..w {
         g[x] = if mask[x] < 0.5 { 0.0 } else { inf };
         for y in 1..h {
@@ -142,9 +298,9 @@ fn inner_distance(mask: &[f32], w: usize, h: usize) -> Vec<f32> {
     }
 
     // Phase 2: per-row lower envelope of parabolas f(x,i) = (x-i)^2 + g(i)^2.
-    let mut d = vec![0.0f32; n];
-    let mut s = vec![0usize; w];
-    let mut t = vec![0usize; w];
+    let mut d = filled(n,0.0f32)?;
+    let mut s = filled(w,0usize)?;
+    let mut t = filled(w,0usize)?;
     for y in 0..h {
         let row = y * w;
         let gf = |i: usize| g[row + i] as f64;
@@ -182,7 +338,7 @@ fn inner_distance(mask: &[f32], w: usize, h: usize) -> Vec<f32> {
             }
         }
     }
-    d
+    Ok(d)
 }
 
 #[inline]
@@ -208,8 +364,8 @@ fn edge_band_from_dist(
     h: usize,
     width: f32,
     blur: f64,
-) -> Vec<f32> {
-    let mut band = vec![0.0f32; w * h];
+) -> RenderResult<Vec<f32>> {
+    let mut band = filled(w*h,0.0f32)?;
     let width = width.max(0.5);
     for i in 0..(w * h) {
         let cov = mask[i].clamp(0.0, 1.0);
@@ -218,74 +374,78 @@ fn edge_band_from_dist(
         }
     }
     if blur < 0.5 {
-        return band;
+        return Ok(band);
     }
     // The box blur softens the rim, but blurring against the empty (0) outside
     // pulls the band down at the very edge, leaving a few-px strip where the
     // effect barely reaches. Take the max of the blurred and the raw band so the
     // rim stays anchored at the silhouette while only the inner side softens.
-    let blurred = box_blur_3pass(&band, w, h, blur);
+    let blurred = box_blur_3pass(&band, w, h, blur)?;
     for i in 0..(w * h) {
         band[i] = band[i].max(blurred[i]);
     }
-    band
+    Ok(band)
 }
 
 /// Blur all four channels (A,R,G,B) of an ARGB buffer. Used to pre-soften the
 /// mask/map layer so the derived height AND coverage become gentle together.
 /// The four channel blurs are independent, so they run in parallel (otherwise
 /// this is ~4x the cost of a single-plane blur like Height Blur).
-fn blur_rgba_3pass(src: &[u8], w: usize, h: usize, sigma: f64) -> Vec<u8> {
+fn blur_rgba_3pass<T: Channel>(src: &[T], w: usize, h: usize, sigma: f64) -> RenderResult<Vec<T>> {
     if sigma < 0.5 {
-        return src.to_vec();
+        return copied(src);
     }
     let npx = w * h;
-    let mut planes: Vec<Vec<f32>> = (0..4)
-        .map(|c| (0..npx).map(|i| src[i * 4 + c] as f32).collect())
-        .collect();
+    let mut planes: [Vec<f32>;4] = std::array::from_fn(|_|Vec::new());
+    for (c,plane) in planes.iter_mut().enumerate() {
+        *plane=filled(npx,0.0)?;
+        for i in 0..npx {plane[i]=src[i*4+c].units();}
+    }
     planes
         .par_iter_mut()
-        .for_each(|p| *p = box_blur_3pass(p, w, h, sigma));
-    let mut dst = vec![0u8; npx * 4];
+        .try_for_each(|p| -> RenderResult<()> {*p = box_blur_3pass(p,w,h,sigma)?; Ok(())})?;
+    let mut dst = filled(npx*4,T::default())?;
     for i in 0..npx {
         let off = i * 4;
         for c in 0..4 {
-            dst[off + c] = planes[c][i].clamp(0.0, 255.0) as u8;
+            dst[off + c] = T::from_units(planes[c][i]);
         }
     }
-    dst
+    Ok(dst)
 }
 
-fn blur_rgb_3pass(src: &[u8], w: usize, h: usize, sigma: f64) -> Vec<u8> {
+fn blur_rgb_3pass<T: Channel>(src: &[T], w: usize, h: usize, sigma: f64) -> RenderResult<Vec<T>> {
     if sigma < 0.5 {
-        return src.to_vec();
+        return copied(src);
     }
 
     let npx = w * h;
     // Blur R/G/B independently in parallel (alpha is left untouched).
-    let mut planes: Vec<Vec<f32>> = (1..4)
-        .map(|c| (0..npx).map(|i| src[i * 4 + c] as f32).collect())
-        .collect();
+    let mut planes: [Vec<f32>;3] = std::array::from_fn(|_|Vec::new());
+    for (c,plane) in planes.iter_mut().enumerate() {
+        *plane=filled(npx,0.0)?;
+        for i in 0..npx {plane[i]=src[i*4+c+1].units();}
+    }
     planes
         .par_iter_mut()
-        .for_each(|p| *p = box_blur_3pass(p, w, h, sigma));
+        .try_for_each(|p| -> RenderResult<()> {*p = box_blur_3pass(p,w,h,sigma)?; Ok(())})?;
 
-    let mut dst = src.to_vec();
+    let mut dst = copied(src)?;
     for i in 0..npx {
         let off = i * 4;
-        dst[off + 1] = planes[0][i].clamp(0.0, 255.0) as u8;
-        dst[off + 2] = planes[1][i].clamp(0.0, 255.0) as u8;
-        dst[off + 3] = planes[2][i].clamp(0.0, 255.0) as u8;
+        dst[off + 1] = T::from_units(planes[0][i]);
+        dst[off + 2] = T::from_units(planes[1][i]);
+        dst[off + 3] = T::from_units(planes[2][i]);
     }
-    dst
+    Ok(dst)
 }
 
-fn apply_affected_blur(out: &mut [u8], w: usize, h: usize, sigma: f64, mask: &[f32]) {
+fn apply_affected_blur<T: Channel>(out: &mut [T], w: usize, h: usize, sigma: f64, mask: &[f32]) -> RenderResult<()> {
     if sigma < 0.5 {
-        return;
+        return Ok(());
     }
 
-    let blurred = blur_rgb_3pass(out, w, h, sigma);
+    let blurred = blur_rgb_3pass(out, w, h, sigma)?;
     for i in 0..(w * h) {
         let m = mask[i].clamp(0.0, 1.0);
         if m <= 1e-4 {
@@ -295,37 +455,38 @@ fn apply_affected_blur(out: &mut [u8], w: usize, h: usize, sigma: f64, mask: &[f
         let off = i * 4;
         let inv = 1.0 - m;
         out[off + 1] =
-            (out[off + 1] as f32 * inv + blurred[off + 1] as f32 * m).clamp(0.0, 255.0) as u8;
+            T::from_units(out[off + 1].units() * inv + blurred[off + 1].units() * m);
         out[off + 2] =
-            (out[off + 2] as f32 * inv + blurred[off + 2] as f32 * m).clamp(0.0, 255.0) as u8;
+            T::from_units(out[off + 2].units() * inv + blurred[off + 2].units() * m);
         out[off + 3] =
-            (out[off + 3] as f32 * inv + blurred[off + 3] as f32 * m).clamp(0.0, 255.0) as u8;
+            T::from_units(out[off + 3].units() * inv + blurred[off + 3].units() * m);
     }
+    Ok(())
 }
 
-fn mask_map(src: &[u8], mask: &[f32], w: usize, h: usize) -> Vec<u8> {
-    let mut out = vec![0u8; w * h * 4];
+fn mask_map<T: Channel>(src: &[T], mask: &[f32], w: usize, h: usize) -> RenderResult<Vec<T>> {
+    let mut out = filled(w*h*4,T::default())?;
     for i in 0..(w * h) {
         let off = i * 4;
-        let v = (mask[i].clamp(0.0, 1.0) * 255.0) as u8;
+        let v = T::from_units(mask[i].clamp(0.0, 1.0) * 255.0);
         out[off] = src[off];
         out[off + 1] = v;
         out[off + 2] = v;
         out[off + 3] = v;
     }
-    out
+    Ok(out)
 }
 
-fn delta_map(src: &[u8], out: &[u8], w: usize, h: usize) -> Vec<u8> {
-    let mut map = vec![0u8; w * h * 4];
+fn delta_map<T: Channel>(src: &[T], out: &[T], w: usize, h: usize) -> RenderResult<Vec<T>> {
+    let mut map = filled(w*h*4,T::default())?;
     for i in 0..(w * h) {
         let off = i * 4;
         map[off] = src[off];
-        map[off + 1] = out[off + 1].abs_diff(src[off + 1]);
-        map[off + 2] = out[off + 2].abs_diff(src[off + 2]);
-        map[off + 3] = out[off + 3].abs_diff(src[off + 3]);
+        map[off + 1] = T::from_units((out[off + 1].units() - src[off + 1].units()).abs());
+        map[off + 2] = T::from_units((out[off + 2].units() - src[off + 2].units()).abs());
+        map[off + 3] = T::from_units((out[off + 3].units() - src[off + 3].units()).abs());
     }
-    map
+    Ok(map)
 }
 
 /// Diagnostic: visualise the region AE actually handed us and where the mask
@@ -334,17 +495,17 @@ fn delta_map(src: &[u8], out: &[u8], w: usize, h: usize) -> Vec<u8> {
 /// a partial ROI it appears as a rectangle INSIDE the comp (and will jump as the
 /// ROI moves frame-to-frame). MAGENTA = mask coverage (where the effect applies
 /// / how the mask layer was placed).
-fn debug_regions(src: &[u8], mask: &[f32], w: usize, h: usize) -> Vec<u8> {
-    let mut out = vec![0u8; w * h * 4];
+fn debug_regions<T: Channel>(src: &[T], mask: &[f32], w: usize, h: usize) -> RenderResult<Vec<T>> {
+    let mut out = filled(w*h*4,T::default())?;
     let border = if w.min(h) > 8 { 3 } else { 1 };
     for y in 0..h {
         for x in 0..w {
             let i = y * w + x;
             let off = i * 4;
             // Dimmed source as backdrop.
-            let mut r = src[off + 1] as f32 * 0.3;
-            let mut g = src[off + 2] as f32 * 0.3;
-            let mut b = src[off + 3] as f32 * 0.3;
+            let mut r = src[off + 1].units() * 0.3;
+            let mut g = src[off + 2].units() * 0.3;
+            let mut b = src[off + 3].units() * 0.3;
             // Mask coverage -> magenta tint.
             let m = mask[i].clamp(0.0, 1.0);
             if m > 1e-3 {
@@ -358,12 +519,12 @@ fn debug_regions(src: &[u8], mask: &[f32], w: usize, h: usize) -> Vec<u8> {
                 b = 0.0;
             }
             out[off] = src[off];
-            out[off + 1] = r.clamp(0.0, 255.0) as u8;
-            out[off + 2] = g.clamp(0.0, 255.0) as u8;
-            out[off + 3] = b.clamp(0.0, 255.0) as u8;
+            out[off + 1] = T::from_units(r);
+            out[off + 2] = T::from_units(g);
+            out[off + 3] = T::from_units(b);
         }
     }
-    out
+    Ok(out)
 }
 
 #[inline]
@@ -448,7 +609,7 @@ fn outside_dist(w: usize, h: usize, fx: f32, fy: f32) -> f32 {
 }
 
 #[inline]
-fn sample_bilinear_rgb(buf: &[u8], w: usize, h: usize, fx: f32, fy: f32) -> (f32, f32, f32) {
+fn sample_bilinear_rgb<T: Channel>(buf: &[T], w: usize, h: usize, fx: f32, fy: f32) -> (f32, f32, f32) {
     let fx = clamp_coord(fx, w as f32);
     let fy = clamp_coord(fy, h as f32);
 
@@ -472,18 +633,18 @@ fn sample_bilinear_rgb(buf: &[u8], w: usize, h: usize, fx: f32, fy: f32) -> (f32
     let o11 = (y1 * w + x1) * 4;
 
     (
-        buf[o00 + 1] as f32 * w00
-            + buf[o10 + 1] as f32 * w10
-            + buf[o01 + 1] as f32 * w01
-            + buf[o11 + 1] as f32 * w11,
-        buf[o00 + 2] as f32 * w00
-            + buf[o10 + 2] as f32 * w10
-            + buf[o01 + 2] as f32 * w01
-            + buf[o11 + 2] as f32 * w11,
-        buf[o00 + 3] as f32 * w00
-            + buf[o10 + 3] as f32 * w10
-            + buf[o01 + 3] as f32 * w01
-            + buf[o11 + 3] as f32 * w11,
+        buf[o00 + 1].units() * w00
+            + buf[o10 + 1].units() * w10
+            + buf[o01 + 1].units() * w01
+            + buf[o11 + 1].units() * w11,
+        buf[o00 + 2].units() * w00
+            + buf[o10 + 2].units() * w10
+            + buf[o01 + 2].units() * w01
+            + buf[o11 + 2].units() * w11,
+        buf[o00 + 3].units() * w00
+            + buf[o10 + 3].units() * w10
+            + buf[o01 + 3].units() * w01
+            + buf[o11 + 3].units() * w11,
     )
 }
 
@@ -491,8 +652,8 @@ fn sample_bilinear_rgb(buf: &[u8], w: usize, h: usize, fx: f32, fy: f32) -> (f32
 /// return real pixel data). Mirror reflects the coordinate; Clamp lets the
 /// bilinear sampler clamp to the edge.
 #[inline]
-fn sample_edge(
-    buf: &[u8],
+fn sample_edge<T: Channel>(
+    buf: &[T],
     w: usize,
     h: usize,
     fx: f32,
@@ -539,23 +700,31 @@ fn refract(ix: f32, iy: f32, iz: f32, nx: f32, ny: f32, nz: f32, eta: f32) -> (f
 
 // ---- Main render ----
 
-pub fn render(
+pub fn render<T: Channel>(
     rp: &RefractParams,
-    src: &[u8],
-    mask: Option<&[u8]>,
-    bg: Option<&[u8]>,
+    src: &[T],
+    mask: Option<&[T]>,
+    bg: Option<&[T]>,
     w: usize,
     h: usize,
-) -> Vec<u8> {
-    let npx = w * h;
+) -> RenderResult<Vec<T>> {
+    if w == 0 || h == 0 || w > i32::MAX as usize || h > i32::MAX as usize {
+        return Err(Error::BadCallbackParameter);
+    }
+    let npx = w.checked_mul(h).ok_or(Error::OutOfMemory)?;
+    let channels = npx.checked_mul(4).ok_or(Error::OutOfMemory)?;
+    if src.len()!=channels || mask.is_some_and(|m|m.len()!=channels)
+        || bg.is_some_and(|b|b.len()!=channels) {
+        return Err(Error::BadCallbackParameter);
+    }
 
     // Background texture: dedicated layer if provided, else the input layer.
     // Optionally pre-blur it so the refraction samples a softened backdrop
     // (frosted-glass look), independent of any mask.
     let bg_src = bg.unwrap_or(src);
-    let bg_blurred_storage: Vec<u8>;
-    let bg_buf: &[u8] = if rp.bg_blur >= 0.5 {
-        bg_blurred_storage = blur_rgb_3pass(bg_src, w, h, rp.bg_blur);
+    let bg_blurred_storage: Vec<T>;
+    let bg_buf: &[T] = if rp.bg_blur >= 0.5 {
+        bg_blurred_storage = blur_rgb_3pass(bg_src, w, h, rp.bg_blur)?;
         &bg_blurred_storage
     } else {
         bg_src
@@ -569,22 +738,22 @@ pub fn render(
     let mask_src = mask.unwrap_or(src);
     // Optional pre-blur of the map layer itself (softens height AND coverage
     // together, so the whole effect applies more gradually).
-    let mask_blurred_storage: Vec<u8>;
-    let mask_buf: &[u8] = if rp.map_blur >= 0.5 {
-        mask_blurred_storage = blur_rgba_3pass(mask_src, w, h, rp.map_blur);
+    let mask_blurred_storage: Vec<T>;
+    let mask_buf: &[T] = if rp.map_blur >= 0.5 {
+        mask_blurred_storage = blur_rgba_3pass(mask_src, w, h, rp.map_blur)?;
         &mask_blurred_storage
     } else {
         mask_src
     };
-    let mut height = vec![0.0f32; npx];
-    let mut mask_a = vec![0.0f32; npx];
+    let mut height = filled(npx,0.0f32)?;
+    let mut mask_a = filled(npx,0.0f32)?;
     let invert = rp.height_invert;
     for i in 0..npx {
         let off = i * 4;
-        let a = mask_buf[off] as f32 / 255.0;
-        let r = mask_buf[off + 1] as f32 / 255.0;
-        let g = mask_buf[off + 2] as f32 / 255.0;
-        let b = mask_buf[off + 3] as f32 / 255.0;
+        let a = mask_buf[off].units() / 255.0;
+        let r = mask_buf[off + 1].units() / 255.0;
+        let g = mask_buf[off + 2].units() / 255.0;
+        let b = mask_buf[off + 3].units() / 255.0;
         let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
 
         // Height source (see lib.rs popup order).
@@ -614,8 +783,8 @@ pub fn render(
     //     highlight, and a localized frosted blur. Computed from the coverage
     //     mask so it follows the silhouette.
     let (glass_band, glass_dist) = if rp.edge_enable {
-        let dist = inner_distance(&mask_a, w, h);
-        let band = edge_band_from_dist(&dist, &mask_a, w, h, rp.edge_width, rp.edge_rim_blur);
+        let dist = inner_distance(&mask_a, w, h)?;
+        let band = edge_band_from_dist(&dist, &mask_a, w, h, rp.edge_width, rp.edge_rim_blur)?;
         if rp.bevel_mode == BEVEL_SDF {
             // SDF Normal mode: the rim normal is synthesized from the distance
             // gradient. The raw EDT is quantized (staircase) and has gradient
@@ -623,7 +792,7 @@ pub fn render(
             // refraction — jagged. Smooth the distance field first so the
             // gradient is clean. Always smooth a little, even at rim blur 0.
             let smooth = rp.edge_rim_blur.max(2.0);
-            let dist_smooth = box_blur_3pass(&dist, w, h, smooth);
+            let dist_smooth = box_blur_3pass(&dist, w, h, smooth)?;
             (Some(band), Some(dist_smooth))
         } else {
             // Height-add mode: fold the bevel into the height field BEFORE the
@@ -643,9 +812,9 @@ pub fn render(
     //    OPTIONALLY blur the compositing mask (for soft silhouettes).
     //    We keep these as two separate blurs so height normal scale is
     //    independent of silhouette softness.
-    let h_blurred = box_blur_3pass(&height, w, h, rp.height_blur);
+    let h_blurred = box_blur_3pass(&height, w, h, rp.height_blur)?;
     let composite_mask = if rp.edge_blur >= 0.5 {
-        box_blur_3pass(&mask_a, w, h, rp.edge_blur)
+        box_blur_3pass(&mask_a, w, h, rp.edge_blur)?
     } else {
         mask_a
     };
@@ -666,7 +835,7 @@ pub fn render(
     let sdf_dist = glass_dist.as_deref();
     let sdf_width = rp.edge_width.max(0.5);
     let sdf_amount = rp.bevel_height;
-    let mut normals = vec![(0.0f32, 0.0f32, 1.0f32); npx];
+    let mut normals = filled(npx,(0.0f32,0.0f32,1.0f32))?;
     normals.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         let y0 = if y > 0 { y - 1 } else { 0 };
         let y1 = if y + 1 < h { y + 1 } else { h - 1 };
@@ -745,12 +914,12 @@ pub fn render(
     const SEP_SCALE: f32 = 0.1; // symmetric R<->B separation per chroma
     const BLUR_SCALE: f32 = 0.2; // shared per-channel blur width per chroma
     let sep = [-1.0f32, 0.0, 1.0]; // r, g, b around green
-    let mut strength_r_x = vec![0.0f32; samples];
-    let mut strength_g_x = vec![0.0f32; samples];
-    let mut strength_b_x = vec![0.0f32; samples];
-    let mut strength_r_y = vec![0.0f32; samples];
-    let mut strength_g_y = vec![0.0f32; samples];
-    let mut strength_b_y = vec![0.0f32; samples];
+    let mut strength_r_x = filled(samples,0.0f32)?;
+    let mut strength_g_x = filled(samples,0.0f32)?;
+    let mut strength_b_x = filled(samples,0.0f32)?;
+    let mut strength_r_y = filled(samples,0.0f32)?;
+    let mut strength_g_y = filled(samples,0.0f32)?;
+    let mut strength_b_y = filled(samples,0.0f32)?;
     for i in 0..samples {
         let slide = (i as f32 + 0.5) / samples as f32 - 0.5; // [-0.5, 0.5)
         let blur_x = slide * BLUR_SCALE * chroma_x;
@@ -817,7 +986,7 @@ pub fn render(
     ];
 
     // 6) Main loop — parallelized per row.
-    let mut out = vec![0u8; npx * 4];
+    let mut out = filled(channels,T::default())?;
     let mix = rp.mix;
     let inv_mix = 1.0 - mix;
     let brightness = rp.brightness;
@@ -848,9 +1017,9 @@ pub fn render(
                 let src_off = idx * 4;
 
                 let src_a = src_ref[src_off];
-                let src_r = src_ref[src_off + 1] as f32;
-                let src_g = src_ref[src_off + 2] as f32;
-                let src_b = src_ref[src_off + 3] as f32;
+                let src_r = src_ref[src_off + 1].units();
+                let src_g = src_ref[src_off + 2].units();
+                let src_b = src_ref[src_off + 3].units();
                 let fallback_rgb = (src_r, src_g, src_b);
 
                 let m = composite_mask_ref[idx].clamp(0.0, 1.0);
@@ -1058,24 +1227,24 @@ pub fn render(
                 let fin_b = src_b * inv_mix + comp_b * mix;
 
                 out_row[off] = src_a;
-                out_row[off + 1] = fin_r.clamp(0.0, 255.0) as u8;
-                out_row[off + 2] = fin_g.clamp(0.0, 255.0) as u8;
-                out_row[off + 3] = fin_b.clamp(0.0, 255.0) as u8;
+                out_row[off + 1] = T::from_units(fin_r);
+                out_row[off + 2] = T::from_units(fin_g);
+                out_row[off + 3] = T::from_units(fin_b);
             }
         });
 
-    apply_affected_blur(&mut out, w, h, rp.affected_blur, &composite_mask);
+    apply_affected_blur(&mut out, w, h, rp.affected_blur, &composite_mask)?;
 
     // Localized frosted blur on the rim band (glassmorphism edge).
     if let Some(band) = glass_band.as_ref() {
-        apply_affected_blur(&mut out, w, h, rp.rim_frost, band);
+        apply_affected_blur(&mut out, w, h, rp.rim_frost, band)?;
     }
 
     match rp.output_mode {
-        2 => src.to_vec(),
+        2 => copied(src),
         3 => mask_map(src, &composite_mask, w, h),
         4 => delta_map(src, &out, w, h),
         5 => debug_regions(src, &composite_mask, w, h),
-        _ => out,
+        _ => Ok(out),
     }
 }

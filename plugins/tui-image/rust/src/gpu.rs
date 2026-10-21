@@ -4,6 +4,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use wgpu::*;
 
+// Requested buffer bytes, not driver allocation overhead or total VRAM.
+const CACHE_BYTE_BUDGET:u64=256*1024*1024;
+fn state_bytes(w:u32,h:u32)->u64 {
+    u64::from(w)*u64::from(h)*12 + std::mem::size_of::<GpuParams>() as u64
+}
+fn cache_has_room(bytes:u64,count:usize,incoming:u64,max_count:usize,budget:u64)->bool {
+    count<max_count && incoming<=budget && bytes<=budget-incoming
+}
+
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 struct GpuParams {
@@ -18,9 +27,10 @@ struct GpuParams {
     edge_boost: f32,
     invert: u32,
     source_mix: f32,
-    _pad0: f32,
+    source_flags: u32,
     foreground: [f32; 4],
     background: [f32; 4],
+    glyph_layout: [f32; 4],
 }
 
 struct BufferState {
@@ -40,9 +50,19 @@ pub(crate) struct GpuProcessor {
     pipeline: ComputePipeline,
     bind_group_layout: BindGroupLayout,
     state: RwLock<HashMap<std::thread::ThreadId, BufferState>>,
+    cache_byte_budget:u64,
 }
 
 impl GpuProcessor {
+    #[cfg(test)]
+    pub(crate) fn limit_cache_to_two_small_frames(&mut self,w:u32,h:u32) {
+        self.state.write().clear();
+        self.cache_byte_budget=state_bytes(w,h)*2;
+    }
+    #[cfg(test)]
+    pub(crate) fn cached_layouts(&self)->Vec<(u32,u32)> {
+        self.state.read().values().map(|s|(s.width,s.height)).collect()
+    }
     pub(crate) fn new() -> Result<Self, String> {
         let mut instance_desc = InstanceDescriptor::default();
         if instance_desc.backends.contains(Backends::DX12)
@@ -98,6 +118,7 @@ impl GpuProcessor {
             pipeline,
             bind_group_layout,
             state: RwLock::new(HashMap::new()),
+            cache_byte_budget:CACHE_BYTE_BUDGET,
         })
     }
 
@@ -108,15 +129,17 @@ impl GpuProcessor {
         h: usize,
         ep: &TuiParams,
     ) -> Option<Vec<u8>> {
-        if w == 0 || h == 0 || src.len() < w * h * 4 {
-            return None;
-        }
-
-        let (ww, hh, n) = (w as u32, h as u32, w * h);
+        let (ww,hh,n,bytes)=checked_layout(w,h,src.len(),&self.device.limits())?;
+        if state_bytes(ww,hh)>self.cache_byte_budget {return None;}
         let lock = self.get_state(ww, hh);
         let state = lock.get(&std::thread::current().id())?;
 
-        let src_packed: Vec<u32> = (0..n)
+        let mut result=Vec::new();
+        result.try_reserve_exact(bytes).ok()?;
+        result.resize(bytes,0);
+        let mut src_packed=Vec::new();
+        src_packed.try_reserve_exact(n).ok()?;
+        src_packed.extend((0..n)
             .map(|i| {
                 let o = i * 4;
                 let a = src[o] as u32;
@@ -124,8 +147,7 @@ impl GpuProcessor {
                 let g = src[o + 2] as u32;
                 let b = src[o + 3] as u32;
                 (r << 24) | (g << 16) | (b << 8) | a
-            })
-            .collect();
+            }));
         self.queue
             .write_buffer(&state.source_buf, 0, as_bytes_slice(&src_packed));
 
@@ -141,9 +163,14 @@ impl GpuProcessor {
             edge_boost: ep.edge_boost,
             invert: if ep.invert { 1 } else { 0 },
             source_mix: ep.source_mix,
-            _pad0: 0.0,
+            source_flags: u32::from(ep.use_source_luma) | (u32::from(ep.preserve_source_color) << 1),
             foreground: [ep.foreground[0], ep.foreground[1], ep.foreground[2], 1.0],
             background: [ep.background[0], ep.background[1], ep.background[2], 1.0],
+            glyph_layout: [
+                (ep.glyph_scale_x.clamp(0.1,1.0)*(1.0-ep.column_gap.clamp(0.0,0.8))).clamp(0.05,1.0),
+                ((if ep.uniform_scale {ep.glyph_scale_x} else {ep.glyph_scale_y}).clamp(0.1,1.0)*(1.0-ep.row_gap.clamp(0.0,0.8))).clamp(0.05,1.0),
+                0.0,0.0,
+            ],
         };
         self.queue
             .write_buffer(&state.params_buf, 0, as_bytes(&params));
@@ -155,17 +182,17 @@ impl GpuProcessor {
             let mut cp = enc.begin_compute_pass(&ComputePassDescriptor::default());
             cp.set_pipeline(&self.pipeline);
             cp.set_bind_group(0, &state.bind_group, &[]);
-            cp.dispatch_workgroups((ww + 15) / 16, (hh + 15) / 16, 1);
+            cp.dispatch_workgroups(ww.div_ceil(16), hh.div_ceil(16), 1);
         }
-        enc.copy_buffer_to_buffer(&state.output_buf, 0, &state.staging_buf, 0, (n * 4) as u64);
+        enc.copy_buffer_to_buffer(&state.output_buf, 0, &state.staging_buf, 0, bytes as u64);
         self.queue.submit(Some(enc.finish()));
 
         let slice = state.staging_buf.slice(..);
         let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
-        slice.map_async(MapMode::Read, move |v| tx.send(v).unwrap());
-        let _ = self.device.poll(PollType::Wait);
+        let _unmap=ScopeCleanup(Some(||state.staging_buf.unmap()));
+        slice.map_async(MapMode::Read, move |v| {let _=tx.send(v);});
+        self.device.poll(PollType::Wait).ok()?;
 
-        let mut result = vec![0u8; n * 4];
         if let Some(Ok(())) = pollster::block_on(rx.receive()) {
             let data = slice.get_mapped_range();
             let packed: &[u32] =
@@ -182,7 +209,6 @@ impl GpuProcessor {
                 result[i * 4 + 3] = b;
             }
             drop(data);
-            state.staging_buf.unmap();
             Some(result)
         } else {
             None
@@ -190,7 +216,7 @@ impl GpuProcessor {
     }
 
     fn create_buffers(&self, w: u32, h: u32) -> BufferState {
-        let n = (w * h) as u64;
+        let n = u64::from(w) * u64::from(h);
         let mk = |size: u64, usage: BufferUsages| {
             self.device.create_buffer(&BufferDescriptor {
                 size,
@@ -253,16 +279,15 @@ impl GpuProcessor {
             .unwrap_or(true)
         {
             lock.with_upgraded(|map| {
-                let max = num_cpus::get().max(2) - 1;
-                if map.len() > max {
-                    let mut keys: Vec<_> = map
-                        .iter()
-                        .map(|(k, v)| (*k, v.last_access.load(Ordering::Relaxed)))
-                        .collect();
-                    keys.sort_by_key(|a| a.1);
-                    for (k, _) in keys.iter().take(map.len() - max) {
-                        map.remove(k);
-                    }
+                // Drop the superseded size before allocating its replacement.
+                map.remove(&tid);
+                let max = num_cpus::get().max(2);
+                let incoming=state_bytes(w,h);
+                let mut retained:u64=map.values().map(|s|state_bytes(s.width,s.height)).sum();
+                while !cache_has_room(retained,map.len(),incoming,max,self.cache_byte_budget) {
+                    let oldest=map.iter().min_by_key(|(_,s)|s.last_access.load(Ordering::Relaxed)).map(|(id,_)|*id);
+                    let Some(id)=oldest else {break;};
+                    if let Some(old)=map.remove(&id) {retained-=state_bytes(old.width,old.height);}
                 }
                 map.insert(tid, self.create_buffers(w, h));
             });
@@ -272,6 +297,77 @@ impl GpuProcessor {
             .last_access
             .store(ts(), Ordering::Relaxed);
         lock
+    }
+}
+
+struct ScopeCleanup<F:FnOnce()>(Option<F>);
+impl<F:FnOnce()> Drop for ScopeCleanup<F> {
+    fn drop(&mut self) {if let Some(cleanup)=self.0.take() {cleanup();}}
+}
+
+fn checked_layout(w:usize,h:usize,source_len:usize,limits:&Limits)->Option<(u32,u32,usize,usize)> {
+    if w==0 || h==0 {return None;}
+    let ww=u32::try_from(w).ok()?;
+    let hh=u32::try_from(h).ok()?;
+    let n=w.checked_mul(h)?;
+    let bytes=n.checked_mul(4)?;
+    // Shader pixel indexing is u32; every buffer binding must fit the device.
+    if n>u32::MAX as usize || bytes>isize::MAX as usize || source_len!=bytes
+        || bytes as u64>limits.max_buffer_size || bytes as u64>u64::from(limits.max_storage_buffer_binding_size)
+        || ww.div_ceil(16)>limits.max_compute_workgroups_per_dimension
+        || hh.div_ceil(16)>limits.max_compute_workgroups_per_dimension {return None;}
+    Some((ww,hh,n,bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cache_admission_bounds_total_bytes_and_entries() {
+        let frame=state_bytes(1920,1080);
+        assert_eq!(frame,24_883_200+std::mem::size_of::<GpuParams>() as u64);
+        assert!(cache_has_room(0,0,frame,1,CACHE_BYTE_BUDGET));
+        assert!(!cache_has_room(frame,1,frame,1,CACHE_BYTE_BUDGET));
+        assert!(cache_has_room(CACHE_BYTE_BUDGET-frame,0,frame,2,CACHE_BYTE_BUDGET));
+        assert!(!cache_has_room(CACHE_BYTE_BUDGET-frame+1,0,frame,2,CACHE_BYTE_BUDGET));
+        assert!(!cache_has_room(0,0,CACHE_BYTE_BUDGET+1,2,CACHE_BYTE_BUDGET));
+        // Model LRU removals until an incoming frame fits.
+        let mut retained=frame*10;
+        let mut count=10;
+        while !cache_has_room(retained,count,frame*2,32,CACHE_BYTE_BUDGET) {retained-=frame;count-=1;}
+        assert!(retained+frame*2<=CACHE_BYTE_BUDGET);
+        assert_eq!(count,8);
+    }
+    #[test]
+    fn cleanup_runs_once_on_success_early_return_and_panic() {
+        for stage in 0..3 {
+            let calls=std::cell::Cell::new(0);
+            let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard=ScopeCleanup(Some(||calls.set(calls.get()+1)));
+                if stage==1 {return None;}
+                if stage==2 {panic!("injected readback panic");}
+                Some(7)
+            }));
+            assert_eq!(calls.get(),1);
+            match stage {0=>assert_eq!(result.unwrap(),Some(7)),1=>assert_eq!(result.unwrap(),None),_=>assert!(result.is_err())}
+        }
+    }
+    #[test]
+    fn layout_rejects_overflow_and_device_limits_before_allocation() {
+        let mut limits=Limits::default();
+        assert_eq!(checked_layout(17,31,17*31*4,&limits),Some((17,31,527,2108)));
+        assert!(checked_layout(0,1,0,&limits).is_none());
+        assert!(checked_layout(usize::MAX,2,0,&limits).is_none());
+        assert!(checked_layout(17,31,100,&limits).is_none());
+        limits.max_buffer_size=2107;
+        assert!(checked_layout(17,31,2108,&limits).is_none());
+        limits.max_buffer_size=4096;
+        limits.max_storage_buffer_binding_size=2107;
+        assert!(checked_layout(17,31,2108,&limits).is_none());
+        limits.max_storage_buffer_binding_size=4096;
+        limits.max_compute_workgroups_per_dimension=1;
+        assert!(checked_layout(17,31,2108,&limits).is_none());
+        assert_eq!(checked_layout(16,16,1024,&limits),Some((16,16,256,1024)));
     }
 }
 

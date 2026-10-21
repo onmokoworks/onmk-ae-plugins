@@ -330,6 +330,15 @@ struct LayerGeometry {
     bottom_up: bool,
 }
 
+fn depth_from_format(format: ae::PixelFormat) -> Result<i16, ae::Error> {
+    match format {
+        ae::PixelFormat::Argb32 => Ok(8),
+        ae::PixelFormat::Argb64 => Ok(16),
+        ae::PixelFormat::Argb128 => Ok(32),
+        _ => Err(ae::Error::BadCallbackParameter),
+    }
+}
+
 /// Validate a layer before touching its pixels.
 ///
 /// `Layer::buffer()` asserts on `rowbytes == 0` and on a null data pointer. Those
@@ -339,7 +348,9 @@ fn layer_geometry(layer: &ae::Layer) -> Result<LayerGeometry, ae::Error> {
     let w = layer.width();
     let h = layer.height();
     let stride = layer.buffer_stride();
-    let bit_depth = layer.bit_depth();
+    // The pinned SDK wrapper tests the DEEP flag before consulting the world
+    // format, which can misidentify a float allocation as 16-bit.
+    let bit_depth = depth_from_format(layer.pixel_format()?)?;
     let bpp = bytes_per_pixel(bit_depth).ok_or(ae::Error::BadCallbackParameter)?;
 
     if w == 0 || h == 0 || stride == 0 {
@@ -533,6 +544,10 @@ struct PreRenderState {
     matte_checked_out: bool,
 }
 
+fn has_pixels(rect: ae::Rect) -> bool {
+    rect.right > rect.left && rect.bottom > rect.top
+}
+
 fn smart_pre_render(
     in_data: &ae::InData,
     extra: &mut ae::pf::PreRenderExtra,
@@ -575,7 +590,8 @@ fn smart_pre_render(
                 in_data.time_step(),
                 in_data.time_scale(),
             )
-            .is_ok(),
+            .map(|r| has_pixels(r.result_rect.into()))
+            .unwrap_or(false),
         matte_checked_out: cb
             .checkout_layer(
                 Params::MatteLayer.index(),
@@ -585,7 +601,8 @@ fn smart_pre_render(
                 in_data.time_step(),
                 in_data.time_scale(),
             )
-            .is_ok(),
+            .map(|r| has_pixels(r.result_rect.into()))
+            .unwrap_or(false),
     };
 
     extra.set_pre_render_data(state);
@@ -607,29 +624,24 @@ fn smart_render_cpu(
 
     // Track what actually got checked out so every early return still checks back in.
     // Dropping out without checking in leaks the host's buffers.
-    let mut input_checked_out = false;
-    let mut lens_checked_out = false;
-    let mut matte_checked_out = false;
-
-    let result = (|| -> Result<(), ae::Error> {
+    with_checked_layers(|checked| {
         let dp = get_params(params)?;
 
-        let input_world = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
-        input_checked_out = true;
+        let input_world = cb.checkout_layer_pixels(0)?;
+        checked[0] = true;
+        let input_world = input_world.ok_or(ae::Error::Generic)?;
 
         let src = layer_to_image(&input_world)?;
         let (w, h) = (src.w, src.h);
 
         let lens = if state.lens_checked_out {
-            let img = checkout_layer_image(&cb, LENS_CHECKOUT_ID, w, h);
-            lens_checked_out = img.is_some();
+            let img = checkout_layer_image(&cb, LENS_CHECKOUT_ID, w, h, &mut checked[1]);
             img.flatten()
         } else {
             None
         };
         let matte = if state.matte_checked_out {
-            let img = checkout_layer_image(&cb, MATTE_CHECKOUT_ID, w, h);
-            matte_checked_out = img.is_some();
+            let img = checkout_layer_image(&cb, MATTE_CHECKOUT_ID, w, h, &mut checked[2]);
             img.flatten()
         } else {
             None
@@ -642,19 +654,23 @@ fn smart_render_cpu(
         distort::prism_warp(&dp, &src, lens.as_ref(), matte.as_ref(), |y, row| {
             write_row_to_layer(out_buf, &out_geom, y, row);
         })
-    })();
+    }, |id| cb.checkin_layer_pixels(id))
+}
 
-    if input_checked_out {
-        let _ = cb.checkin_layer_pixels(0);
+fn with_checked_layers(
+    render: impl FnOnce(&mut [bool;3])->Result<(),ae::Error>,
+    mut checkin: impl FnMut(u32)->Result<(),ae::Error>,
+) -> Result<(),ae::Error> {
+    let mut checked=[false;3];
+    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||render(&mut checked)));
+    let mut cleanup=Ok(());
+    for (index,id) in [(2,MATTE_CHECKOUT_ID),(1,LENS_CHECKOUT_ID),(0,0)] {
+        if checked[index] { cleanup=cleanup.and(checkin(id)); }
     }
-    if lens_checked_out {
-        let _ = cb.checkin_layer_pixels(LENS_CHECKOUT_ID);
+    match result {
+        Ok(result)=>result.and(cleanup),
+        Err(payload)=>std::panic::resume_unwind(payload),
     }
-    if matte_checked_out {
-        let _ = cb.checkin_layer_pixels(MATTE_CHECKOUT_ID);
-    }
-
-    result
 }
 
 /// Returns `Some(_)` when the ID was checked out (so the caller must check it back in),
@@ -664,8 +680,10 @@ fn checkout_layer_image(
     checkout_id: u32,
     w: usize,
     h: usize,
+    checked: &mut bool,
 ) -> Option<Option<ImageF32>> {
     let world = cb.checkout_layer_pixels(checkout_id).ok()?;
+    *checked = true; // Record acquisition before conversion or allocation can unwind.
     let world = match world {
         Some(w) => w,
         // Checked out fine but there are no pixels (e.g. an empty adjustment layer).
@@ -685,6 +703,36 @@ fn checkout_layer_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acquired_layers_are_released_on_error_and_unwind() {
+        for mask in 0..8 {
+            for mode in 0..3 {
+                let mut calls=Vec::new();
+                let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_checked_layers(|checked| {
+                        for i in 0..3 {checked[i]=mask&(1<<i)!=0;}
+                        match mode {0=>Ok(()),1=>Err(ae::Error::BadCallbackParameter),_=>panic!("render")}
+                    },|id| {calls.push(id);Err(ae::Error::Generic)})
+                }));
+                let expected:Vec<_>=[(2,MATTE_CHECKOUT_ID),(1,LENS_CHECKOUT_ID),(0,0)].into_iter()
+                    .filter(|(i,_)|mask&(1<<i)!=0).map(|(_,id)|id).collect();
+                assert_eq!(calls,expected);
+                match mode {
+                    0=>assert_eq!(result.unwrap(),if mask==0 {Ok(())}else{Err(ae::Error::Generic)}),
+                    1=>assert_eq!(result.unwrap(),Err(ae::Error::BadCallbackParameter)),
+                    _=>assert!(result.is_err()),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_auxiliary_checkout_is_not_a_real_black_layer() {
+        assert!(!has_pixels(ae::Rect { left: 0, top: 0, right: 0, bottom: 0 }));
+        assert!(!has_pixels(ae::Rect { left: 5, top: 2, right: 5, bottom: 20 }));
+        assert!(has_pixels(ae::Rect { left: -5, top: 2, right: 5, bottom: 20 }));
+    }
 
     /// The parameter enum's discriminants are used directly as AE parameter indices,
     /// so they must start at 1 (index 0 is the input layer) and stay contiguous in the
@@ -732,8 +780,8 @@ mod tests {
         encode_row(&mut back, 8, &mid);
         assert_eq!(src8, back);
 
-        // 16bpc: endpoints, midpoint, and a few arbitrary values, all <= 32768.
-        let vals16: Vec<u16> = vec![0, 1, 1234, 16384, 32767, 32768, 300, 9999];
+        // Native 16bpc: every AE code, including values absent from PNG8 expansion.
+        let vals16: Vec<u16> = (0..=32768).collect();
         let src16: Vec<u8> = vals16.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let mut mid = vec![0.0f32; vals16.len()];
         decode_row(&src16, 16, &mut mid).unwrap();
@@ -772,6 +820,14 @@ mod tests {
         encode_row(&mut out32, 32, &over);
         assert_eq!(f32::from_ne_bytes(out32[0..4].try_into().unwrap()), 2.0);
         assert_eq!(f32::from_ne_bytes(out32[4..8].try_into().unwrap()), -1.0);
+    }
+
+    #[test]
+    fn explicit_world_formats_determine_channel_width() {
+        assert_eq!(depth_from_format(ae::PixelFormat::Argb32).unwrap(), 8);
+        assert_eq!(depth_from_format(ae::PixelFormat::Argb64).unwrap(), 16);
+        assert_eq!(depth_from_format(ae::PixelFormat::Argb128).unwrap(), 32);
+        assert!(depth_from_format(ae::PixelFormat::GpuBgra128).is_err());
     }
 
     fn geom(w: usize, h: usize, bit_depth: i16, bottom_up: bool) -> LayerGeometry {

@@ -1,6 +1,7 @@
 use after_effects as ae;
 
 mod glow;
+mod pixels;
 
 // ---- Parameter IDs ----
 
@@ -314,6 +315,7 @@ impl AdobePluginGlobal for Plugin {
 
 // ---- Extract parameters ----
 
+#[cfg_attr(test, derive(Default))]
 pub struct GlowParams {
     pub brightness: f32,
     pub color_r: f32,
@@ -386,33 +388,18 @@ fn get_params(params: &ae::Parameters<Params>) -> Result<GlowParams, ae::Error> 
 
 // ---- Layer helpers ----
 
-fn layer_to_flat(layer: &ae::Layer) -> (Vec<u8>, usize, usize) {
-    let w = layer.width() as usize;
-    let h = layer.height() as usize;
-    let stride = layer.buffer_stride();
-    let buf = layer.buffer();
-    let mut flat = vec![0u8; w * h * 4];
-    for y in 0..h {
-        let src_off = y * stride;
-        let dst_off = y * w * 4;
-        let row_len = w * 4;
-        if src_off + row_len <= buf.len() && dst_off + row_len <= flat.len() {
-            flat[dst_off..dst_off + row_len].copy_from_slice(&buf[src_off..src_off + row_len]);
-        }
-    }
-    (flat, w, h)
+fn render_typed<T: pixels::Channel + glow::Channel>(gp: &GlowParams, input: &ae::Layer, output: &mut ae::Layer) -> Result<(), ae::Error> {
+    let (src, w, h) = pixels::read::<T>(input)?;
+    let result = glow::ultra_glow(gp, &src, w, h)?;
+    pixels::write(&result, output, w, h)
 }
 
-fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
-    let stride = layer.buffer_stride();
-    let buf = layer.buffer_mut();
-    for y in 0..h {
-        let src_off = y * w * 4;
-        let dst_off = y * stride;
-        let row_len = w * 4;
-        if src_off + row_len <= flat.len() && dst_off + row_len <= buf.len() {
-            buf[dst_off..dst_off + row_len].copy_from_slice(&flat[src_off..src_off + row_len]);
-        }
+fn render_layers(gp: &GlowParams, input: &ae::Layer, output: &mut ae::Layer) -> Result<(), ae::Error> {
+    match pixels::channel_bytes(input)? {
+        1 => render_typed::<u8>(gp, input, output),
+        2 => render_typed::<u16>(gp, input, output),
+        4 => render_typed::<f32>(gp, input, output),
+        _ => Err(ae::Error::BadCallbackParameter),
     }
 }
 
@@ -424,10 +411,7 @@ fn render_cpu(
     out_layer: &mut ae::Layer,
 ) -> Result<(), ae::Error> {
     let gp = get_params(params)?;
-    let (src, w, h) = layer_to_flat(in_layer);
-    let result = glow::ultra_glow(&gp, &src, w, h);
-    flat_to_layer(&result, out_layer, w, h);
-    Ok(())
+    render_layers(&gp, in_layer, out_layer)
 }
 
 fn smart_pre_render(
@@ -464,10 +448,42 @@ fn smart_render_cpu(
     let gp = get_params(params)?;
     let cb = extra.callbacks();
     let input_world = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
-    let mut output_world = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
-    let (src, w, h) = layer_to_flat(&input_world);
-    let result = glow::ultra_glow(&gp, &src, w, h);
-    flat_to_layer(&result, &mut output_world, w, h);
-    cb.checkin_layer_pixels(0)?;
-    Ok(())
+    with_input_checkin(|| {
+        let mut output_world=cb.checkout_output()?.ok_or(ae::Error::Generic)?;
+        render_layers(&gp,&input_world,&mut output_world)
+    }, || cb.checkin_layer_pixels(0))
+}
+
+fn with_input_checkin<T>(work: impl FnOnce() -> Result<T,ae::Error>,
+    checkin: impl FnOnce() -> Result<(),ae::Error>) -> Result<T,ae::Error> {
+    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+    let cleanup=checkin();
+    match result {
+        Ok(result) => {let value=result?; cleanup?; Ok(value)},
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[test]
+fn input_checkin_runs_once_and_preserves_primary_failure() {
+    use std::cell::Cell;
+    for fail_work in [false,true] {
+        for fail_checkin in [false,true] {
+            let calls=Cell::new(0);
+            let result=with_input_checkin(
+                || if fail_work {Err(ae::Error::OutOfMemory)} else {Ok(9)},
+                || {calls.set(calls.get()+1); if fail_checkin {Err(ae::Error::BadCallbackParameter)} else {Ok(())}});
+            assert_eq!(calls.get(),1);
+            assert_eq!(result,if fail_work {Err(ae::Error::OutOfMemory)} else if fail_checkin {Err(ae::Error::BadCallbackParameter)} else {Ok(9)});
+        }
+    }
+    for fail_checkin in [false,true] {
+        let calls=Cell::new(0);
+        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_input_checkin::<()>(|| panic!("injected render failure"),
+                || {calls.set(calls.get()+1); if fail_checkin {Err(ae::Error::BadCallbackParameter)} else {Ok(())}})
+        }));
+        assert_eq!(calls.get(),1);
+        assert_eq!(result.unwrap_err().downcast_ref::<&str>(),Some(&"injected render failure"));
+    }
 }

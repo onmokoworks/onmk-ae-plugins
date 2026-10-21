@@ -50,12 +50,37 @@ classic "STMap" remap used to re-project 3D UV passes back onto 2D artwork.
 
 ## Validation Status
 
+- Before typed SDK pixel access, the adapter validates dimensions, signed stride,
+  row length, addressable extent, nonnull data and channel alignment. Output image
+  dimensions must match the host world exactly instead of silently copying only
+  their intersection. Layout tests cover positive/negative padded strides and
+  rejected boundary values, not validity of host-owned memory behind a pointer.
+- Core image creation checks dimensions, addressable size and allocation failure.
+  Projection rejects inconsistent source lengths before sampling. Acquired input
+  images are returned on Smart Render errors/unwind; conversion errors from an
+  available auxiliary layer are propagated rather than treated as missing input.
+  Unit tests cover arithmetic/shape failures and cleanup precedence, not physical
+  allocator exhaustion or native AE callback fault injection.
+- Pixel indices stay 64-bit until wrapping. Large finite UVs previously saturated
+  32-bit indices and could corrupt bilinear output. A direct core regression uses
+  a 40000x1 texture, UV coordinates +/-65536, all three wrap modes and both filters,
+  checking signed/HDR channels at half opacity. This does not certify native AE
+  maximum dimensions, nonfinite UV inputs or arbitrary float precision.
 - Tested on Adobe After Effects 2025 / Windows
 - Supports 8-bit ARGB, 16-bit ARGB and 32-bit float ARGB
 - 32 bpc is recommended for Blender UV passes; 8 bpc limits each coordinate to
   256 levels
 - CPU implementation; the native `SmartRenderGpu` path falls back to CPU
 - Automated tests cover UV precision and premultiplied edge recovery
+- Core tests also cover negative/past-end wrap indices and hand-computed
+  bilinear seam colors for Clamp, Repeat and Mirror. Headless auxiliary-layer
+  fixtures check sampling, role selection, opacity and partial UV alpha at
+  8/16/32 bpc. PNG fixtures do not establish native HDR/sub-8-bit input precision
+  or arbitrary ROI/same-instance behavior.
+- World pixel format is queried explicitly before reading/writing channels.
+  This avoids interpreting ARGB128 float worlds as 16-bit when a host also sets
+  the deep-color flag. Headless AEXCompat regression fixtures check planar UV
+  coordinates across the full odd-sized frame in Classic and Smart Render.
 
 ## Build
 

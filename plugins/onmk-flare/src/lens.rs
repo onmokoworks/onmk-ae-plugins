@@ -10,6 +10,26 @@ pub struct Surface {
     pub coating: i32,
     pub is_stop: bool,
     pub z: f64,
+    pub blades: usize,
+    pub roundness: f64,
+    pub rotation: f64,
+    pub edge_bias: f64,
+}
+
+impl Surface {
+    pub fn pupil_radius(&self, x:f64, y:f64) -> f64 {
+        if !self.is_stop || self.blades < 3 { return self.semi_aperture; }
+        let sector=std::f64::consts::PI/self.blades as f64;
+        let a=(y.atan2(x)-self.rotation+sector).rem_euclid(2.0*sector)-sector;
+        let polygon=sector.cos()/a.cos();
+        self.semi_aperture*(polygon+(1.0-polygon)*self.roundness.clamp(0.0,1.0))
+    }
+    pub fn transmission(&self, x:f64, y:f64) -> f64 {
+        if !self.is_stop || self.edge_bias == 0.0 { return 1.0; }
+        let q=((x*x+y*y).sqrt()/self.pupil_radius(x,y)).clamp(0.0,1.0);
+        // Bounded artistic pupil apodization, not an extra light source.
+        1.0-self.edge_bias.clamp(0.0,1.0)*0.65*(1.0-q.powi(4))
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +106,10 @@ impl LensSystem {
                     .map_err(|_| format!("line {}: invalid coating", line_no + 1))?,
                 is_stop,
                 z: 0.0,
+                blades: 0,
+                roundness: 1.0,
+                rotation: 0.0,
+                edge_bias: 0.0,
             });
         }
         if focal_length <= 0.0 || surfaces.is_empty() {

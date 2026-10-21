@@ -185,13 +185,79 @@ fn input_mode(params: &ae::Parameters<Params>) -> Result<InputMode, ae::Error> {
 
 // ---- Layer <-> normalized float image helpers ----
 
+fn pixel_depth(layer: &ae::Layer) -> Result<i16, ae::Error> {
+    // Query the documented world format first. Layer::bit_depth() in the
+    // pinned SDK wrapper short-circuits to 16 for DEEP worlds, even when the
+    // World Suite identifies an ARGB128 float allocation.
+    depth_from_format(layer.pixel_format()?)
+}
+
+fn depth_from_format(format: ae::PixelFormat) -> Result<i16, ae::Error> {
+    match format {
+        ae::PixelFormat::Argb32 => Ok(8),
+        ae::PixelFormat::Argb64 => Ok(16),
+        ae::PixelFormat::Argb128 => Ok(32),
+        _ => Err(ae::Error::BadCallbackParameter),
+    }
+}
+
+#[test]
+fn explicit_world_formats_determine_channel_width() {
+    assert_eq!(depth_from_format(ae::PixelFormat::Argb32).unwrap(), 8);
+    assert_eq!(depth_from_format(ae::PixelFormat::Argb64).unwrap(), 16);
+    assert_eq!(depth_from_format(ae::PixelFormat::Argb128).unwrap(), 32);
+    // A CPU accessor must never dereference a GPU world as host pixels.
+    assert!(depth_from_format(ae::PixelFormat::GpuBgra128).is_err());
+}
+
+fn checked_world_access(w: usize, h: usize, row_bytes: isize, depth: i16, address: usize) -> Result<(), ae::Error> {
+    let component = match depth { 8 => 1, 16 => 2, 32 => 4, _ => return Err(ae::Error::BadCallbackParameter) };
+    if w > i32::MAX as usize || h > i32::MAX as usize || row_bytes == i32::MIN as isize {
+        return Err(ae::Error::BadCallbackParameter);
+    }
+    let stride = row_bytes.checked_abs().ok_or(ae::Error::BadCallbackParameter)? as usize;
+    let row = w.checked_mul(4 * component).ok_or(ae::Error::OutOfMemory)?;
+    let extent = stride.checked_mul(h).ok_or(ae::Error::OutOfMemory)?;
+    if extent > isize::MAX as usize { return Err(ae::Error::OutOfMemory); }
+    if w != 0 && h != 0 && (stride < row || address == 0 || address % component != 0 || stride % component != 0) {
+        return Err(ae::Error::BadCallbackParameter);
+    }
+    Ok(())
+}
+
+fn validate_layer_access(layer: &ae::Layer, depth: i16) -> Result<(), ae::Error> {
+    checked_world_access(layer.width(),layer.height(),layer.row_bytes(),depth,unsafe {layer.data_ptr()} as usize)
+}
+
+#[test]
+fn world_access_rejects_short_unaligned_null_and_overflow_layouts() {
+    for (depth, component) in [(8,1),(16,2),(32,4)] {
+        for sign in [-1,1] {
+            let stride = (17 * 4 * component + 8) as isize * sign;
+            assert!(checked_world_access(17,31,stride,depth,16).is_ok());
+            assert!(checked_world_access(17,31,(17*4*component-1) as isize * sign,depth,16).is_err());
+        }
+        assert!(checked_world_access(1,1,16,depth,0).is_err());
+        if component > 1 {
+            assert!(checked_world_access(1,1,16,depth,17).is_err());
+            assert!(checked_world_access(1,1,17,depth,16).is_err());
+        }
+        assert!(checked_world_access(0,0,0,depth,0).is_ok());
+        assert!(checked_world_access(1,2,isize::MAX,depth,16).is_err());
+        assert!(checked_world_access(1,1,i32::MIN as isize,depth,16).is_err());
+        assert!(checked_world_access(usize::MAX,1,16,depth,16).is_err());
+    }
+}
+
 fn layer_to_image(layer: &ae::Layer) -> Result<Image, ae::Error> {
+    let depth = pixel_depth(layer)?;
+    validate_layer_access(layer,depth)?;
     let w = layer.width() as usize;
     let h = layer.height() as usize;
-    let mut image = Image::transparent(w, h);
+    let mut image = Image::transparent(w, h)?;
     for y in 0..h {
         for x in 0..w {
-            image.pixels[y * w + x] = match layer.bit_depth() {
+            image.pixels[y * w + x] = match depth {
                 8 => {
                     let px = layer.as_pixel8(x, y);
                     [
@@ -223,12 +289,18 @@ fn layer_to_image(layer: &ae::Layer) -> Result<Image, ae::Error> {
 }
 
 fn image_to_layer(image: &Image, layer: &mut ae::Layer) -> Result<(), ae::Error> {
-    let w = image.width.min(layer.width());
-    let h = image.height.min(layer.height());
+    image.validate()?;
+    let depth = pixel_depth(layer)?;
+    validate_layer_access(layer,depth)?;
+    if image.width != layer.width() || image.height != layer.height() {
+        return Err(ae::Error::BadCallbackParameter);
+    }
+    let w = image.width;
+    let h = image.height;
     for y in 0..h {
         for x in 0..w {
             let px = image.pixels[y * image.width + x];
-            match layer.bit_depth() {
+            match depth {
                 8 => {
                     let dst = layer.as_pixel8_mut(x, y);
                     dst.alpha = (px[0] * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
@@ -268,28 +340,26 @@ fn render_cpu(
 ) -> Result<(), ae::Error> {
     let p = get_params(params)?;
     if input_mode(params)? == InputMode::GeneratePlanar {
-        let result = uv::generate_planar(out_layer.width(), out_layer.height(), p.v_origin_bottom);
+        let result = uv::generate_planar(out_layer.width(), out_layer.height(), p.v_origin_bottom)?;
         return image_to_layer(&result, out_layer);
     }
     let input = layer_to_image(in_layer)?;
-    let other = get_other_layer(params, in_data);
+    let other = get_other_layer(params, in_data)?;
     let result = match other {
         Some(other) if input_mode(params)? == InputMode::Texture => {
             uv::project(&p, &other, &input, out_layer.width(), out_layer.height())
         }
         Some(other) => uv::project(&p, &input, &other, out_layer.width(), out_layer.height()),
         None => Image::transparent(out_layer.width(), out_layer.height()),
-    };
+    }?;
     image_to_layer(&result, out_layer)
 }
 
-fn get_other_layer(params: &ae::Parameters<Params>, in_data: &ae::InData) -> Option<Image> {
-    let checkout = params
-        .checkout_at(Params::Texture, Some(in_data.current_time()), None, None)
-        .ok()?;
-    let layer_def = checkout.as_layer().ok()?;
-    let layer = layer_def.value()?;
-    layer_to_image(&layer).ok()
+fn get_other_layer(params: &ae::Parameters<Params>, in_data: &ae::InData) -> Result<Option<Image>, ae::Error> {
+    let Ok(checkout) = params.checkout_at(Params::Texture, Some(in_data.current_time()), None, None) else { return Ok(None); };
+    let layer_def = checkout.as_layer()?;
+    let Some(layer) = layer_def.value() else { return Ok(None); };
+    layer_to_image(&layer).map(Some)
 }
 
 // ---- SmartFX ----
@@ -346,6 +416,8 @@ fn smart_render_cpu(
     let cb = extra.callbacks();
 
     let input_world = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
+    let other_acquired = std::cell::Cell::new(false);
+    with_render_cleanup(|| {
     let mut output_world = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
     let input = layer_to_image(&input_world)?;
     let out_w = output_world.width();
@@ -354,6 +426,7 @@ fn smart_render_cpu(
     let result = if input_mode(params)? == InputMode::GeneratePlanar {
         uv::generate_planar(out_w, out_h, p.v_origin_bottom)
     } else if let Ok(Some(other_world)) = cb.checkout_layer_pixels(TEXTURE_CHECKOUT_ID as u32) {
+        other_acquired.set(true);
         let other = layer_to_image(&other_world)?;
         if input_mode(params)? == InputMode::Texture {
             uv::project(&p, &other, &input, out_w, out_h)
@@ -362,10 +435,42 @@ fn smart_render_cpu(
         }
     } else {
         Image::transparent(out_w, out_h)
-    };
-    image_to_layer(&result, &mut output_world)?;
+    }?;
+    image_to_layer(&result, &mut output_world)
+    }, || {
+        let other = if other_acquired.get() {
+            cb.checkin_layer_pixels(TEXTURE_CHECKOUT_ID as u32)
+        } else { Ok(()) };
+        let input = cb.checkin_layer_pixels(0);
+        other.and(input)
+    })
+}
 
-    cb.checkin_layer_pixels(0)?;
-    let _ = cb.checkin_layer_pixels(TEXTURE_CHECKOUT_ID as u32);
-    Ok(())
+fn with_render_cleanup<T>(work: impl FnOnce() -> Result<T, ae::Error>, cleanup: impl FnOnce() -> Result<(), ae::Error>) -> Result<T, ae::Error> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+    let released = cleanup();
+    match result {
+        Ok(Ok(value)) => released.map(|()| value),
+        Ok(Err(error)) => Err(error),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[test]
+fn render_cleanup_preserves_errors_and_runs_before_unwind() {
+    for work_fails in [false,true] {
+        for cleanup_fails in [false,true] {
+            let calls = std::cell::Cell::new(0);
+            let work = if work_fails { Err(ae::Error::OutOfMemory) } else { Ok(()) };
+            let cleanup = if cleanup_fails { Err(ae::Error::BadCallbackParameter) } else { Ok(()) };
+            assert_eq!(with_render_cleanup(||work,||{calls.set(calls.get()+1);cleanup}),work.and(cleanup));
+            assert_eq!(calls.get(),1);
+        }
+    }
+    let called = std::cell::Cell::new(false);
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Result<(),ae::Error> = with_render_cleanup(||panic!("render"),||{called.set(true);Ok(())});
+    }));
+    assert!(panic.is_err());
+    assert!(called.get());
 }

@@ -1,9 +1,40 @@
 use after_effects as ae;
 use onmk_film_core::{FilmParams, FilmStock, Gauge, InputColorspace, LookPreset};
 
+use std::sync::atomic::{AtomicUsize,Ordering};
+const IDLE_FRAME_BUDGET:usize=256*1024*1024;
+static IDLE_FRAME_BYTES:AtomicUsize=AtomicUsize::new(0);
+
+struct FrameCache<'a> {
+    frames:(Vec<f32>,Vec<f32>),
+    bytes:usize,
+    used:&'a AtomicUsize,
+    limit:usize,
+}
+impl<'a> FrameCache<'a> {
+    const fn new(used:&'a AtomicUsize,limit:usize)->Self {
+        Self{frames:(Vec::new(),Vec::new()),bytes:0,used,limit}
+    }
+    fn take(&mut self)->(Vec<f32>,Vec<f32>) {
+        self.used.fetch_sub(self.bytes,Ordering::Relaxed);
+        self.bytes=0;
+        std::mem::take(&mut self.frames)
+    }
+    fn store(&mut self,frames:(Vec<f32>,Vec<f32>)) {
+        drop(self.take());
+        let Some(bytes)=frames.0.capacity().checked_add(frames.1.capacity()).and_then(|n|n.checked_mul(std::mem::size_of::<f32>())) else{return;};
+        if bytes>self.limit {return;}
+        if self.used.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|used| {
+            used.checked_add(bytes).filter(|&total|total<=self.limit)
+        }).is_ok() {self.frames=frames;self.bytes=bytes;}
+    }
+}
+impl Drop for FrameCache<'_> {
+    fn drop(&mut self) {self.used.fetch_sub(self.bytes,Ordering::Relaxed);}
+}
 thread_local! {
-    static FRAME_BUFFERS: std::cell::RefCell<(Vec<f32>, Vec<f32>)> =
-        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    static FRAME_BUFFERS: std::cell::RefCell<FrameCache<'static>> =
+        std::cell::RefCell::new(FrameCache::new(&IDLE_FRAME_BYTES,IDLE_FRAME_BUDGET));
 }
 
 #[derive(Eq, PartialEq, Hash, Clone, Copy, Debug)]
@@ -491,26 +522,65 @@ fn read(p: &ae::Parameters<Params>, time: i32) -> Result<FilmParams, ae::Error> 
     Ok(x)
 }
 
+fn depth_from_format(format: ae::PixelFormat) -> Result<i16, ae::Error> {
+    match format {
+        ae::PixelFormat::Argb32 => Ok(8),
+        ae::PixelFormat::Argb64 => Ok(16),
+        ae::PixelFormat::Argb128 => Ok(32),
+        _ => Err(ae::Error::BadCallbackParameter),
+    }
+}
+
+#[test]
+fn cpu_world_formats_are_explicit() {
+    assert_eq!(depth_from_format(ae::PixelFormat::Argb32).unwrap(), 8);
+    assert_eq!(depth_from_format(ae::PixelFormat::Argb64).unwrap(), 16);
+    assert_eq!(depth_from_format(ae::PixelFormat::Argb128).unwrap(), 32);
+    assert!(depth_from_format(ae::PixelFormat::GpuBgra128).is_err());
+}
+
+fn checked_world_geometry(w:usize,h:usize,row_bytes:isize,channel:usize,address:usize)->Result<(),ae::Error> {
+    if w>i32::MAX as usize || h>i32::MAX as usize || row_bytes==i32::MIN as isize {return Err(ae::Error::BadCallbackParameter);}
+    if w==0 || h==0 {return Ok(());}
+    let stride=row_bytes.unsigned_abs();
+    let row=w.checked_mul(4).and_then(|v|v.checked_mul(channel)).ok_or(ae::Error::OutOfMemory)?;
+    let end=(h-1).checked_mul(stride).and_then(|v|v.checked_add(row)).ok_or(ae::Error::OutOfMemory)?;
+    if stride<row || end>isize::MAX as usize || address==0 || address%channel!=0 || stride%channel!=0 {
+        return Err(ae::Error::BadCallbackParameter);
+    }
+    Ok(())
+}
+
+fn resize_frame(frame:&mut Vec<f32>,w:usize,h:usize)->Result<(),ae::Error> {
+    let n=w.checked_mul(h).and_then(|v|v.checked_mul(4)).ok_or(ae::Error::OutOfMemory)?;
+    frame.try_reserve_exact(n.saturating_sub(frame.len())).map_err(|_|ae::Error::OutOfMemory)?;
+    frame.resize(n,0.0);
+    Ok(())
+}
+
 fn render_world(
     input: &ae::Layer,
     output: &mut ae::Layer,
     p: &FilmParams,
 ) -> Result<(), ae::Error> {
+    let input_depth = depth_from_format(input.pixel_format()?)?;
+    let output_depth = depth_from_format(output.pixel_format()?)?;
+    for (layer,depth) in [(input,input_depth),(&*output,output_depth)] {
+        checked_world_geometry(layer.width(),layer.height(),layer.row_bytes(),(depth/8) as usize,unsafe {layer.data_ptr()} as usize)?;
+    }
     let w = input.width().min(output.width());
     let h = input.height().min(output.height());
+    if w==0 || h==0 {return Ok(());}
     let (mut src, mut dst) = FRAME_BUFFERS.with(|buffers| {
         let mut buffers = buffers.borrow_mut();
-        (
-            std::mem::take(&mut buffers.0),
-            std::mem::take(&mut buffers.1),
-        )
+        buffers.take()
     });
-    src.resize(w * h * 4, 0.0);
-    dst.resize(w * h * 4, 0.0);
+    resize_frame(&mut src,w,h)?;
+    resize_frame(&mut dst,w,h)?;
     for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) * 4;
-            match input.bit_depth() {
+            match input_depth {
                 8 => {
                     let q = input.as_pixel8(x, y);
                     src[i] = q.red as f32 / 255.;
@@ -599,7 +669,7 @@ fn render_world(
     for y in 0..h {
         for x in 0..w {
             let i = (y * w + x) * 4;
-            match output.bit_depth() {
+            match output_depth {
                 8 => {
                     let q = output.as_pixel8_mut(x, y);
                     q.red = (dst[i] * 255.).clamp(0., 255.) as u8;
@@ -628,8 +698,7 @@ fn render_world(
     }
     FRAME_BUFFERS.with(|buffers| {
         let mut buffers = buffers.borrow_mut();
-        buffers.0 = src;
-        buffers.1 = dst;
+        buffers.store((src,dst));
     });
     Ok(())
 }
@@ -666,20 +735,118 @@ fn pre_render(
     Ok(())
 }
 
+fn with_pixel_checkin<T>(work:impl FnOnce()->Result<T,ae::Error>,checkin:impl FnOnce()->Result<(),ae::Error>)->Result<T,ae::Error> {
+    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .unwrap_or(Err(ae::Error::InternalStructDamaged));
+    let released=checkin();
+    match result {Err(error)=>Err(error),Ok(value)=>released.map(|()|value)}
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    #[test]
+    fn idle_cache_budget_tracks_capacity_take_replacement_and_drop() {
+        let used=AtomicUsize::new(0);
+        let frames=|| (vec![0.0f32;8],vec![0.0f32;8]);
+        let sample=frames();
+        let bytes=(sample.0.capacity()+sample.1.capacity())*4;
+        let mut a=FrameCache::new(&used,bytes*2);
+        let mut b=FrameCache::new(&used,bytes*2);
+        let mut c=FrameCache::new(&used,bytes*2);
+        a.store(sample); b.store(frames()); c.store(frames());
+        assert_eq!(used.load(Ordering::Relaxed),bytes*2);
+        assert_eq!(c.bytes,0);
+        let active=a.take(); assert_eq!(used.load(Ordering::Relaxed),bytes);
+        c.store(frames()); assert_eq!(used.load(Ordering::Relaxed),bytes*2);
+        drop(b); assert_eq!(used.load(Ordering::Relaxed),bytes);
+        a.store(active); assert_eq!(used.load(Ordering::Relaxed),bytes*2);
+        a.store((Vec::new(),Vec::new())); assert_eq!(used.load(Ordering::Relaxed),bytes);
+        drop(c); assert_eq!(used.load(Ordering::Relaxed),0);
+    }
+    #[test]
+    fn concurrent_idle_cache_admission_and_teardown_stay_bounded() {
+        let used=AtomicUsize::new(0);
+        let frame=|| (vec![0.0f32;8],vec![0.0f32;8]);
+        let sample=frame();
+        let bytes=(sample.0.capacity()+sample.1.capacity())*std::mem::size_of::<f32>();
+        let barrier=std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            let mut handles=Vec::new();
+            for _ in 0..4 {
+                handles.push(scope.spawn(|| {
+                    let mut cache=FrameCache::new(&used,bytes*2);
+                    let mut valid=true;
+                    for _ in 0..64 {
+                        barrier.wait();
+                        cache.store(frame());
+                        barrier.wait();
+                        // No thread releases its entry until all observers have checked.
+                        let retained=used.load(Ordering::Relaxed);
+                        barrier.wait();
+                        let active=cache.take();
+                        barrier.wait();
+                        let released=used.load(Ordering::Relaxed);
+                        barrier.wait();
+                        // Delay assertions until every round has finished: never strand peers.
+                        valid &= retained==bytes*2 && released==0;
+                        drop(active);
+                    }
+                    cache.store(frame());
+                    barrier.wait();
+                    // Drop on worker exit must release the shared admission charge.
+                    assert!(valid,"concurrent cache accounting violated");
+                }));
+            }
+            for handle in handles {handle.join().unwrap();}
+        });
+        assert_eq!(used.load(Ordering::Relaxed),0);
+    }
+    #[test]
+    fn world_geometry_and_frame_capacity_are_checked() {
+        for channel in [1,2,4] {
+            let stride=(17*4*channel+4) as isize;
+            for sign in [-1,1] {assert!(checked_world_geometry(17,31,stride*sign,channel,16).is_ok());}
+            assert!(checked_world_geometry(17,31,1,channel,16).is_err());
+            assert!(checked_world_geometry(17,31,stride,channel,0).is_err());
+        }
+        assert!(checked_world_geometry(1,1,16,4,1).is_err());
+        assert!(checked_world_geometry(1,1,i32::MIN as isize,1,16).is_err());
+        assert!(checked_world_geometry(1,3,isize::MAX,1,16).is_err());
+        assert!(checked_world_geometry(usize::MAX,1,4,1,16).is_err());
+        let mut frame=vec![1.0;8];
+        resize_frame(&mut frame,1,1).unwrap(); assert_eq!(frame,[1.0;4]);
+        assert!(resize_frame(&mut frame,usize::MAX,2).is_err()); assert_eq!(frame,[1.0;4]);
+        resize_frame(&mut frame,0,3).unwrap(); assert!(frame.is_empty());
+    }
+    #[test]
+    fn input_checkin_preserves_primary_failure() {
+        for outcome in 0..3 {for release_fails in [false,true] {
+            let calls=std::cell::Cell::new(0);
+            let result=with_pixel_checkin(||match outcome {
+                0=>Ok(42),1=>Err(ae::Error::BadCallbackParameter),_=>panic!("injected render panic"),
+            },||{calls.set(calls.get()+1);if release_fails {Err(ae::Error::Generic)}else{Ok(())}});
+            assert_eq!(calls.get(),1);
+            assert_eq!(result,match outcome {
+                0=>if release_fails {Err(ae::Error::Generic)}else{Ok(42)},
+                1=>Err(ae::Error::BadCallbackParameter),_=>Err(ae::Error::InternalStructDamaged),
+            });
+        }}
+    }
+}
+
 fn smart_render(
     extra: &ae::pf::SmartRenderExtra,
     params: &ae::Parameters<Params>,
 ) -> Result<(), ae::Error> {
     let cb = extra.callbacks();
     let input = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    with_pixel_checkin(|| {
         let mut output = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
         let time = extra
             .pre_render_data::<PreRenderState>()
             .map(|x| x.time)
             .unwrap_or(0);
         render_world(&input, &mut output, &read(params, time)?)
-    }));
-    cb.checkin_layer_pixels(0)?;
-    result.unwrap_or(Err(ae::Error::InternalStructDamaged))
+    },||cb.checkin_layer_pixels(0))
 }

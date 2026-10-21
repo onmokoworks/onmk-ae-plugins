@@ -34,6 +34,12 @@ pub enum DebugView {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RenderError {
+    #[error("field dimensions overflow")]
+    FieldDimensions,
+    #[error("invalid field blur radius")]
+    FieldRadius,
+    #[error("render working allocation failed")]
+    FieldAllocation,
     #[error("input buffer length is {actual}; expected {expected} (w*h*4)")]
     InputLength { actual: usize, expected: usize },
     #[error("output buffer length is {actual}; expected {expected} (output_w*output_h*4)")]
@@ -119,14 +125,14 @@ pub fn render(
         }
         return Ok(());
     }
-    let field = field::Field::build(input, params);
+    let field = field::Field::build(input, params)?;
     if matches!(
         view,
         DebugView::Result | DebugView::GlowOnly | DebugView::TextureMask
     ) {
         // Roughen Edges must see the complete checkout glow, rather than only
         // the requested output rect, otherwise its alpha boundary changes with ROI.
-        let mut glow = vec![0.0; input_expected];
+        let mut glow = field::zero_plane(input_expected)?;
         for y in 0..input.h {
             for x in 0..input.w {
                 let pixel = render::render_pixel(
@@ -144,7 +150,7 @@ pub fn render(
                 glow[destination..destination + 4].copy_from_slice(&pixel);
             }
         }
-        roughen::apply(&mut glow, input.w, input.h, input_origin, params);
+        roughen::apply(&mut glow, input.w, input.h, input_origin, params)?;
         if matches!(view, DebugView::Result | DebugView::GlowOnly) {
             render::colorize_glow(&mut glow, params);
         }

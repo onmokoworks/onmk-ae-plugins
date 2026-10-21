@@ -49,7 +49,8 @@ fn slit_scan_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var result: vec4<f32>;
 
     if params.interpolation == 1u {
-        let fi = min(u32(round(frame_f)), params.num_frames - 1u);
+        // CPU preselects in f64 so f32 conversion cannot cross a frame boundary.
+        let fi = min(u32(time_map[idx]), params.num_frames - 1u);
         result = unpack_argb(frames[fi * npx + idx]);
     } else {
         let lo = min(u32(floor(frame_f)), params.num_frames - 1u);
@@ -61,6 +62,9 @@ fn slit_scan_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     if params.mix < 1.0 {
+        // CPU stores the interpolated frame in ARGB8 before mixing original.
+        // Preserve that established rounding boundary on the GPU as well.
+        result = unpack_argb(pack_argb(result));
         let orig = unpack_argb(original[idx]);
         result = mix(orig, result, params.mix);
     }

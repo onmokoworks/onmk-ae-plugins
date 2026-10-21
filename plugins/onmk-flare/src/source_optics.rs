@@ -6,6 +6,7 @@ use crate::{physical::BrightSource, EffectParams};
 use std::f32::consts::PI;
 
 pub fn render(ep: &EffectParams, sources: &[BrightSource], w: usize, h: usize) -> Vec<[f32; 3]> {
+    if crate::rich::enabled(ep) { return crate::rich::source(ep,sources,w,h); }
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
     render_with_workers(ep, sources, w, h, workers)
 }

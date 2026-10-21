@@ -1,5 +1,6 @@
 use after_effects as ae;
 use std::panic::{self, AssertUnwindSafe};
+mod path_offset;
 
 /// Data passed from SmartPreRender to SmartRender via AE's pre_render_data mechanism.
 struct PreRenderPathData {
@@ -340,7 +341,9 @@ impl AdobePluginGlobal for Plugin {
                     },
                     Err(_) => 0,
                 };
-                let _ = smart_pre_render(&in_data, &mut extra, time_offset_frames);
+                let layer2_enabled = params.get(Params::Layer2Enabled)?.as_checkbox()?.value();
+                smart_pre_render(&in_data, &mut extra,
+                    if layer2_enabled { Some(time_offset_frames) } else { None })?;
                 extra.set_pre_render_data(PreRenderPathData {
                     positions: cached.0,
                     angles: cached.1,
@@ -358,10 +361,7 @@ impl AdobePluginGlobal for Plugin {
                     }
                 };
                 log_step(&format!("[SmartRender] path positions={}", path.0.len()));
-                let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                    let _ = smart_render_impl(&extra, params, &path);
-                }));
-                Ok(())
+                smart_render_impl(&extra, params, &path)
             }
 
             ae::Command::SmartRenderGpu { extra } => {
@@ -369,10 +369,7 @@ impl AdobePluginGlobal for Plugin {
                     Some(d) => (d.positions.clone(), d.angles.clone()),
                     None => (Vec::new(), Vec::new()),
                 };
-                let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                    let _ = smart_render_impl(&extra, params, &path);
-                }));
-                Ok(())
+                smart_render_impl(&extra, params, &path)
             }
 
             _ => Ok(()),
@@ -410,7 +407,7 @@ fn passthrough_copy(src: &ae::Layer, dst: &mut ae::Layer) {
 fn smart_pre_render(
     in_data: &ae::InData,
     extra: &mut ae::pf::PreRenderExtra,
-    time_offset_frames: i32,
+    time_offset_frames: Option<i32>,
 ) -> Result<(), ae::Error> {
     let req = extra.output_request();
     let cb = extra.callbacks();
@@ -418,6 +415,8 @@ fn smart_pre_render(
     let current_time = in_data.current_time();
     let time_step = in_data.time_step();
     let time_scale = in_data.time_scale();
+    let layer2_time = time_offset_frames.map(|frames|
+        checked_offset_time(current_time, time_step, frames)).transpose()?;
 
     // Checkout input layer (checkout_id = 0, param index 0)
     let in_result = cb.checkout_layer(
@@ -446,11 +445,12 @@ fn smart_pre_render(
         1, 1, &req, current_time, time_step, time_scale,
     );
 
-    // Checkout Source Layer 2 at offset time (param index 15, checkout_id 2) — optional
-    let layer2_time = current_time + time_offset_frames * time_step;
-    let _ = cb.checkout_layer(
-        SOURCE_LAYER2_PARAM_INDEX, 2, &req, layer2_time, time_step, time_scale,
-    );
+    // Checkout Source Layer 2 at offset time (param index 17, checkout_id 2) — optional
+    if let Some(layer2_time) = layer2_time {
+        let _ = cb.checkout_layer(
+            SOURCE_LAYER2_PARAM_INDEX, 2, &req, layer2_time, time_step, time_scale,
+        );
+    }
 
     Ok(())
 }
@@ -462,6 +462,24 @@ fn smart_pre_render(
 /// [Layer2GroupStart=15][Layer2Enabled=16][SourceLayer2=17]
 /// [Layer2CopyFromLayer1=18][Layer2Scale=19][Layer2Rotation=20][Layer2Opacity=21][Layer2GroupEnd=22]
 const SOURCE_LAYER2_PARAM_INDEX: i32 = 17;
+
+fn checked_offset_time(current: i32, step: i32, frames: i32) -> Result<i32, ae::Error> {
+    let time = i64::from(current) + i64::from(step) * i64::from(frames);
+    i32::try_from(time).map_err(|_| ae::Error::BadCallbackParameter)
+}
+
+#[test]
+fn offset_time_preserves_signed_frames_and_rejects_wraparound() {
+    assert_eq!(checked_offset_time(100, 10, 3), Ok(130));
+    assert_eq!(checked_offset_time(100, 10, -3), Ok(70));
+    assert_eq!(checked_offset_time(0, 10, -3), Ok(-30));
+    assert_eq!(checked_offset_time(i32::MAX, 1, 0), Ok(i32::MAX));
+    for (current, step, frames) in [(i32::MAX, 1, 1), (i32::MIN, 1, -1), (0, i32::MAX, 1000)] {
+        assert_eq!(checked_offset_time(current, step, frames), Err(ae::Error::BadCallbackParameter));
+    }
+    // Intermediate product may exceed i32 while the final time remains valid.
+    assert_eq!(checked_offset_time(-i32::MAX, i32::MAX, 2), Ok(i32::MAX));
+}
 
 // ---- SmartFX Render ----
 
@@ -556,23 +574,24 @@ fn smart_render_impl(
 
     let cb = extra.callbacks();
     let input_world = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
+    with_pixel_checkin(|| {
     let mut output_world = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
+    validate_world(&output_world)?;
 
     let out_w = output_world.width() as usize;
     let out_h = output_world.height() as usize;
     if out_w == 0 || out_h == 0 {
-        let _ = cb.checkin_layer_pixels(0);
         return Ok(());
     }
 
     // Read source layers via smart checkout
     let (s1_px, s1_w, s1_h) = match cb.checkout_layer_pixels(1) {
-        Ok(Some(w)) => layer_to_flat(&w),
+        Ok(Some(w)) => with_pixel_checkin(|| layer_to_flat(&w), || cb.checkin_layer_pixels(1))?,
         _ => (Vec::new(), 0, 0),
     };
     let (s2_px, s2_w, s2_h) = if layer2_enabled {
         match cb.checkout_layer_pixels(2) {
-            Ok(Some(w)) => layer_to_flat(&w),
+            Ok(Some(w)) => with_pixel_checkin(|| layer_to_flat(&w), || cb.checkin_layer_pixels(2))?,
             _ => (Vec::new(), 0, 0),
         }
     } else {
@@ -584,11 +603,8 @@ fn smart_render_impl(
 
     // If no source layer → passthrough input to output
     if !has_s1 && !has_s2 {
-        let input_flat = layer_to_flat_padded(&input_world, out_w, out_h);
-        flat_to_layer(&input_flat, &mut output_world, out_w, out_h);
-        let _ = cb.checkin_layer_pixels(0);
-        let _ = cb.checkin_layer_pixels(1);
-        let _ = cb.checkin_layer_pixels(2);
+        let input_flat = layer_to_flat_padded(&input_world, out_w, out_h)?;
+        flat_to_layer(&input_flat, &mut output_world, out_w, out_h)?;
         return Ok(());
     }
 
@@ -598,19 +614,16 @@ fn smart_render_impl(
 
     // If no mask path → passthrough
     if positions.is_empty() {
-        let input_flat = layer_to_flat_padded(&input_world, out_w, out_h);
-        flat_to_layer(&input_flat, &mut output_world, out_w, out_h);
-        let _ = cb.checkin_layer_pixels(0);
-        let _ = cb.checkin_layer_pixels(1);
-        let _ = cb.checkin_layer_pixels(2);
+        let input_flat = layer_to_flat_padded(&input_world, out_w, out_h)?;
+        flat_to_layer(&input_flat, &mut output_world, out_w, out_h)?;
         return Ok(());
     }
 
     // Build output buffer: start with original or transparent
     let mut output = if composite_on_orig {
-        layer_to_flat_padded(&input_world, out_w, out_h)
+        layer_to_flat_padded(&input_world, out_w, out_h)?
     } else {
-        vec![0u8; out_w * out_h * 4]
+        allocate_argb8(out_w,out_h)?
     };
 
     // Composite each copy
@@ -641,12 +654,16 @@ fn smart_render_impl(
     }
 
     // Write to output world
-    flat_to_layer(&output, &mut output_world, out_w, out_h);
+    flat_to_layer(&output, &mut output_world, out_w, out_h)?;
 
-    let _ = cb.checkin_layer_pixels(0);
-    let _ = cb.checkin_layer_pixels(1);
-    let _ = cb.checkin_layer_pixels(2);
     Ok(())
+    }, || cb.checkin_layer_pixels(0))
+}
+
+fn with_pixel_checkin<T>(work:impl FnOnce()->Result<T,ae::Error>, checkin:impl FnOnce()->Result<(),ae::Error>)->Result<T,ae::Error> {
+    let result=panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or(Err(ae::Error::Generic));
+    let released=checkin();
+    match result {Err(error)=>Err(error), Ok(value)=>released.map(|()|value)}
 }
 
 // ---- Mask path reading via AEGP suites (never panics) ----
@@ -743,26 +760,8 @@ fn read_mask_path_inner(
     // Apply corner rounding: add bezier handles to sharp corners
     apply_corner_rounding(&mut vertices, is_closed, corner_round);
 
-    // Apply expansion: offset each vertex outward from centroid (XY independent)
-    if expansion_x.abs() > 0.001 || expansion_y.abs() > 0.001 {
-        let cx: f64 = vertices.iter().map(|v| v.x).sum::<f64>() / vertices.len() as f64;
-        let cy: f64 = vertices.iter().map(|v| v.y).sum::<f64>() / vertices.len() as f64;
-
-        for vtx in &mut vertices {
-            let dx = vtx.x - cx;
-            let dy = vtx.y - cy;
-            let dist = (dx * dx + dy * dy).sqrt();
-            if dist > 0.001 {
-                let nx = dx / dist;
-                let ny = dy / dist;
-                vtx.x += nx * expansion_x;
-                vtx.y += ny * expansion_y;
-            }
-        }
-    }
-
     log_step("[read_mask] calling sample_bezier_path");
-    let result = sample_bezier_path(&vertices, is_closed, copies, offset);
+    let result = sample_bezier_path(&vertices, is_closed, copies, offset, expansion_x, expansion_y);
     log_step(&format!("[read_mask] DONE positions={} angles={}", result.0.len(), result.1.len()));
     result
 }
@@ -871,41 +870,23 @@ unsafe fn read_outline_raw_ffi(
     }
     log_step(&format!("[raw_ffi] outline_h ptr={:p}", outline_h));
 
-    // Read num_segments
+    // Open paths have one more unique vertex than segments. Reject the whole
+    // outline on a failed read; skipped vertices would create a different path.
+    let mut is_open: A_Boolean = 0;
     let mut num_segments: A_long = 0;
-    if let Some(f) = outline_suite.AEGP_GetMaskOutlineNumSegments {
-        let e = f(outline_h, &mut num_segments);
-        log_step(&format!("[raw_ffi] num_segments={} err={}", num_segments, e));
-    } else {
-        log_step("[raw_ffi] AEGP_GetMaskOutlineNumSegments None");
-    }
-
-    // Read vertices
-    let mut vertices: Vec<MaskVertex> = Vec::new();
-    if num_segments > 0 {
-        if let Some(vf) = outline_suite.AEGP_GetMaskOutlineVertexInfo {
-            for i in 0..num_segments {
-                let mut vtx: AEGP_MaskVertex = std::mem::zeroed();
-                if vf(outline_h, i, &mut vtx) == 0 {
-                    vertices.push(MaskVertex {
-                        x: vtx.x,
-                        y: vtx.y,
-                        tan_in_x: vtx.tan_in_x,
-                        tan_in_y: vtx.tan_in_y,
-                        tan_out_x: vtx.tan_out_x,
-                        tan_out_y: vtx.tan_out_y,
-                    });
-                }
-            }
-        }
-    }
+    let vertices = (|| {
+        if outline_suite.AEGP_IsMaskOutlineOpen?(outline_h, &mut is_open) != 0 {return None;}
+        if outline_suite.AEGP_GetMaskOutlineNumSegments?(outline_h, &mut num_segments) != 0 {return None;}
+        let read = outline_suite.AEGP_GetMaskOutlineVertexInfo?;
+        collect_outline_vertices(num_segments, is_open != 0, |index| {
+            let mut vtx: AEGP_MaskVertex = std::mem::zeroed();
+            if read(outline_h, index, &mut vtx) != 0 {return None;}
+            Some(MaskVertex {x:vtx.x, y:vtx.y, tan_in_x:vtx.tan_in_x,
+                tan_in_y:vtx.tan_in_y, tan_out_x:vtx.tan_out_x, tan_out_y:vtx.tan_out_y})
+        })
+    })().unwrap_or_default();
     log_step(&format!("[raw_ffi] vertices collected: {}", vertices.len()));
 
-    // Read is_open
-    let mut is_open: A_Boolean = 0;
-    if let Some(f) = outline_suite.AEGP_IsMaskOutlineOpen {
-        let _ = f(outline_h, &mut is_open);
-    }
     let is_closed = is_open == 0;
 
     // Now safe to dispose — we're done reading the outline
@@ -925,6 +906,124 @@ unsafe fn read_outline_raw_ffi(
 }
 
 // ---- Vertex helper ----
+
+fn collect_outline_vertices(segments:i32, open:bool, mut read:impl FnMut(i32)->Option<MaskVertex>) -> Option<Vec<MaskVertex>> {
+    if segments < 0 {return None;}
+    let count=segments.checked_add(i32::from(open))?;
+    let mut result=Vec::new();
+    result.try_reserve_exact(count as usize).ok()?;
+    for index in 0..count {result.push(read(index)?);}
+    Some(result)
+}
+
+#[cfg(test)]
+mod outline_tests {
+    use super::*;
+    #[test]
+    fn world_layout_rejects_invalid_geometry_and_maps_reversed_rows() {
+        for bpp in [4,8,16] {
+            let stride=3*bpp+8;
+            assert_eq!(checked_world_layout(3,5,stride as isize,bpp),Ok(stride));
+            assert_eq!(checked_world_layout(3,5,-(stride as isize),bpp),Ok(stride));
+            assert!(checked_world_layout(3,5,(3*bpp-1) as isize,bpp).is_err());
+            for y in 0..5 {
+                assert_eq!(row_offset(y,5,stride,false),y*stride);
+                assert_eq!(row_offset(y,5,stride,true),(4-y)*stride);
+            }
+        }
+        assert!(checked_world_layout(usize::MAX,1,4,4).is_err());
+        assert!(checked_world_layout(1,1,i32::MIN as isize,4).is_err());
+        assert!(checked_world_layout(1,1,isize::MIN,4).is_err());
+        assert!(checked_world_layout(1,2,isize::MAX,4).is_err());
+        assert_eq!(checked_world_layout(0,5,0,4),Ok(0));
+    }
+    #[test]
+    fn frame_allocation_checks_overflow_and_capacity() {
+        assert_eq!(allocate_argb8(3,5).unwrap(),vec![0;60]);
+        assert_eq!(allocate_argb8(0,usize::MAX).unwrap(),Vec::<u8>::new());
+        assert_eq!(allocate_argb8(usize::MAX,2),Err(ae::Error::OutOfMemory));
+        assert_eq!(allocate_argb8(usize::MAX/4,1),Err(ae::Error::OutOfMemory));
+    }
+    #[test]
+    fn zero_scale_draws_nothing() {
+        let src=[255,100,50,20].repeat(4);
+        let mut dst=vec![0;16];
+        composite_one(&mut dst,2,2,&src,2,2,1.0,1.0,0.0,0.0,1.0);
+        assert!(dst.iter().all(|v|*v==0));
+    }
+    #[test]
+    fn malformed_and_extreme_composites_do_not_write() {
+        let src=[255,100,50,20].repeat(4);
+        for (px,scale) in [(f64::NAN,1.0),(f64::INFINITY,1.0),(1e30,1.0),(-1e30,1.0),(1.0,f64::INFINITY),(1.0,-1.0)] {
+            let mut dst=vec![99;16];
+            composite_one(&mut dst,2,2,&src,2,2,px,1.0,0.0,scale,1.0);
+            assert_eq!(dst,[99;16]);
+        }
+        for (w,h,len) in [(2,2,3),(usize::MAX,2,16)] {
+            let mut dst=vec![99;16];
+            composite_one(&mut dst,2,2,&src[..len],w,h,1.0,1.0,0.0,1.0,1.0);
+            assert_eq!(dst,[99;16]);
+        }
+    }
+    #[test]
+    fn identity_copy_keeps_all_borders_and_single_pixel_axes() {
+        for (w,h) in [(1,1),(1,7),(9,1),(3,5)] {
+            let src:Vec<u8>=(0..w*h).flat_map(|i|[255,(i*7) as u8,(i*3) as u8,42]).collect();
+            let mut dst=vec![0;src.len()];
+            composite_one(&mut dst,w,h,&src,w,h,w as f64/2.0,h as f64/2.0,0.0,1.0,1.0);
+            assert_eq!(dst,src,"identity {w}x{h}");
+        }
+        let src=[255,0,0,0, 255,100,0,0, 255,0,100,0, 255,100,100,0];
+        assert_eq!(bilinear_sample(&src,2,2,0,0,0.5,0.5),[255,50,50,0]);
+        assert_eq!(bilinear_sample(&src,2,2,1,0,0.75,0.5),[255,100,50,0]);
+        assert_eq!(bilinear_sample(&src,2,2,1,1,0.75,0.75),[255,100,100,0]);
+    }
+    #[test]
+    fn composite_preserves_premultiplied_source_without_double_alpha() {
+        let src=[128,100,64,2].repeat(4);
+        for opacity in [1.0,0.5,0.0] {
+            let mut output=vec![0;16];
+            composite_one(&mut output,2,2,&src,2,2,1.0,1.0,0.0,1.0,opacity);
+            let op=(opacity*255.0) as u32;
+            let expected:Vec<u8>=[128,100,64,2].map(|v|((v*op+127)/255) as u8).to_vec();
+            assert_eq!(&output[..4],expected.as_slice());
+        }
+        let mut output=[128,32,16,8].repeat(4);
+        composite_one(&mut output,2,2,&src,2,2,1.0,1.0,0.0,1.0,1.0);
+        assert_eq!(&output[..4], &[192,116,72,6]);
+    }
+    #[test]
+    fn acquired_pixels_released_on_success_error_and_panic() {
+        for stage in 0..3 {for release_fails in [false,true] {
+            let calls=std::cell::Cell::new(0);
+            let result=with_pixel_checkin(|| match stage {
+                0=>Ok(7), 1=>Err(ae::Error::BadCallbackParameter), _=>panic!("injected work panic"),
+            },|| {calls.set(calls.get()+1); if release_fails {Err(ae::Error::OutOfMemory)} else {Ok(())}});
+            assert_eq!(calls.get(),1);
+            assert_eq!(result,match stage {0=>if release_fails {Err(ae::Error::OutOfMemory)} else {Ok(7)},1=>Err(ae::Error::BadCallbackParameter),_=>Err(ae::Error::Generic)});
+        }}
+        let order=std::cell::RefCell::new(Vec::new());
+        let result:Result<(),ae::Error>=with_pixel_checkin(|| {
+            with_pixel_checkin(|| Err(ae::Error::BadCallbackParameter),|| {order.borrow_mut().push(1); Err(ae::Error::OutOfMemory)})
+        },|| {order.borrow_mut().push(0); Ok(())});
+        assert_eq!(result,Err(ae::Error::BadCallbackParameter));
+        assert_eq!(*order.borrow(),[1,0]);
+    }
+    fn vertex(x:i32)->MaskVertex {MaskVertex {x:x as f64,y:0.0,tan_in_x:0.0,tan_in_y:0.0,tan_out_x:0.0,tan_out_y:0.0}}
+    #[test]
+    fn open_terminal_included_closed_duplicate_excluded() {
+        let open=collect_outline_vertices(2,true,|i|Some(vertex(i))).unwrap();
+        assert_eq!(open.iter().map(|v|v.x).collect::<Vec<_>>(),[0.0,1.0,2.0]);
+        assert_eq!(collect_outline_vertices(2,false,|i|Some(vertex(i))).unwrap().len(),2);
+        assert_eq!(collect_outline_vertices(0,true,|i|Some(vertex(i))).unwrap().len(),1);
+    }
+    #[test]
+    fn failed_read_discards_partial_path() {
+        assert!(collect_outline_vertices(3,false,|i|if i==1 {None} else {Some(vertex(i))}).is_none());
+        assert!(collect_outline_vertices(-1,true,|_|panic!("unexpected read")).is_none());
+        assert!(collect_outline_vertices(i32::MAX,true,|_|panic!("unexpected read")).is_none());
+    }
+}
 
 #[derive(Clone)]
 struct MaskVertex {
@@ -1019,6 +1118,8 @@ fn sample_bezier_path(
     is_closed: bool,
     copies: usize,
     offset: f64,
+    expansion_x: f64,
+    expansion_y: f64,
 ) -> (Vec<(f64, f64)>, Vec<f64>) {
     if vertices.is_empty() || copies == 0 {
         return (Vec::new(), Vec::new());
@@ -1077,6 +1178,23 @@ fn sample_bezier_path(
             }
             polyline.push(pt);
             tangents.push(tangents.last().copied().unwrap_or((1.0, 0.0)));
+        }
+    }
+
+    if expansion_x.abs() > 0.001 || expansion_y.abs() > 0.001 {
+        polyline = path_offset::offset(&polyline, is_closed, expansion_x, expansion_y);
+        // Include the closing edge when redistributing along the expanded path.
+        // Leave the zero-expansion sampling and tangent interpolation untouched.
+        if is_closed && !polyline.is_empty() { polyline.push(polyline[0]); }
+        arc_lengths.clear();
+        tangents.clear();
+        let mut length = 0.0;
+        for i in 0..polyline.len() {
+            if i > 0 { length += (polyline[i].0-polyline[i-1].0).hypot(polyline[i].1-polyline[i-1].1); }
+            arc_lengths.push(length);
+            let (a,b) = if i+1 < polyline.len() {(polyline[i],polyline[i+1])}
+                else if i > 0 {(polyline[i-1],polyline[i])} else {(polyline[i],polyline[i])};
+            tangents.push((b.0-a.0,b.1-a.1));
         }
     }
 
@@ -1145,6 +1263,22 @@ fn sample_bezier_path(
 
 // ---- Cubic bezier ----
 
+#[test]
+fn expanded_path_spacing_uses_offset_contour() {
+    let vertex=|x,y| MaskVertex {x,y,tan_in_x:0.0,tan_in_y:0.0,tan_out_x:0.0,tan_out_y:0.0};
+    let line=[vertex(0.0,0.0),vertex(10.0,0.0)];
+    let (points,angles)=sample_bezier_path(&line,false,3,0.0,2.0,2.0);
+    for (point,expected) in points.iter().zip([(0.0,-2.0),(5.0,-2.0),(10.0,-2.0)]) {
+        assert!((point.0-expected.0).abs()<1e-8 && (point.1-expected.1).abs()<1e-8);
+    }
+    assert!(angles.iter().all(|angle|angle.abs()<1e-8));
+    let square=[vertex(0.0,0.0),vertex(10.0,0.0),vertex(10.0,10.0),vertex(0.0,10.0)];
+    let (points,_)=sample_bezier_path(&square,true,4,0.0,2.0,2.0);
+    for (point,expected) in points.iter().zip([(-2.0,-2.0),(12.0,-2.0),(12.0,12.0),(-2.0,12.0)]) {
+        assert!((point.0-expected.0).abs()<1e-8 && (point.1-expected.1).abs()<1e-8);
+    }
+}
+
 fn cubic_bezier_f64(
     p0: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64), t: f64,
 ) -> (f64, f64) {
@@ -1191,9 +1325,13 @@ fn composite_one(
     scale: f64,
     opacity: f64,
 ) {
-    if src.is_empty() || src_w == 0 || src_h == 0 {
+    if src_w == 0 || src_h == 0 || out_w == 0 || out_h == 0
+        || ![px,py,angle,scale,opacity].iter().all(|v|v.is_finite()) || scale<=0.0 || opacity<=0.0 {
         return;
     }
+    let Some(src_len)=src_w.checked_mul(src_h).and_then(|n|n.checked_mul(4)) else {return;};
+    let Some(out_len)=out_w.checked_mul(out_h).and_then(|n|n.checked_mul(4)) else {return;};
+    if src.len()<src_len || output.len()<out_len {return;}
 
     let half_w = src_w as f64 * 0.5 * scale;
     let half_h = src_h as f64 * 0.5 * scale;
@@ -1214,18 +1352,20 @@ fn composite_one(
     for &(cx, cy) in &corners {
         let rx = cx * cos_a - cy * sin_a + px;
         let ry = cx * sin_a + cy * cos_a + py;
+        if !rx.is_finite() || !ry.is_finite() {return;}
         min_x = min_x.min(rx);
         min_y = min_y.min(ry);
         max_x = max_x.max(rx);
         max_y = max_y.max(ry);
     }
 
-    let ox_start = (min_x.floor() as i32).max(0) as usize;
-    let oy_start = (min_y.floor() as i32).max(0) as usize;
-    let ox_end = ((max_x.ceil() as i32) + 1).clamp(0, out_w as i32) as usize;
-    let oy_end = ((max_y.ceil() as i32) + 1).clamp(0, out_h as i32) as usize;
+    let ox_start = min_x.floor().clamp(0.0,out_w as f64) as usize;
+    let oy_start = min_y.floor().clamp(0.0,out_h as f64) as usize;
+    let ox_end = (max_x.ceil()+1.0).clamp(0.0,out_w as f64) as usize;
+    let oy_end = (max_y.ceil()+1.0).clamp(0.0,out_h as f64) as usize;
 
-    let inv_scale = if scale > 0.001 { 1.0 / scale } else { 1.0 };
+    let inv_scale = 1.0 / scale;
+    if !inv_scale.is_finite() {return;}
 
     for oy in oy_start..oy_end {
         let row_off = oy * out_w * 4;
@@ -1241,15 +1381,15 @@ fn composite_one(
             let sx = rx * inv_scale + src_w as f64 * 0.5;
             let sy = ry * inv_scale + src_h as f64 * 0.5;
 
-            let ix = sx.floor() as i32;
-            let iy = sy.floor() as i32;
-            if ix < 0 || iy < 0 || ix + 1 >= src_w as i32 || iy + 1 >= src_h as i32 {
+            if !sx.is_finite() || !sy.is_finite() || sx<0.0 || sy<0.0 || sx>=src_w as f64 || sy>=src_h as f64 {
                 continue;
             }
+            let ix = sx.floor() as usize;
+            let iy = sy.floor() as usize;
             let fx = sx - ix as f64;
             let fy = sy - iy as f64;
 
-            let sample = bilinear_sample(src, src_w, ix as usize, iy as usize, fx, fy);
+            let sample = bilinear_sample(src, src_w, src_h, ix as usize, iy as usize, fx, fy);
 
             let sa = ((sample[0] as u32 * opacity_u8 + 127) / 255) as u8;
             if sa == 0 {
@@ -1267,20 +1407,25 @@ fn composite_one(
             let da = output[dst_idx] as u32;
 
             output[dst_idx]     = (sa32 + (da * inv_sa + 127) / 255).min(255) as u8;
-            output[dst_idx + 1] = ((sample[1] as u32 * sa32 + output[dst_idx + 1] as u32 * inv_sa + 127) / 255) as u8;
-            output[dst_idx + 2] = ((sample[2] as u32 * sa32 + output[dst_idx + 2] as u32 * inv_sa + 127) / 255) as u8;
-            output[dst_idx + 3] = ((sample[3] as u32 * sa32 + output[dst_idx + 3] as u32 * inv_sa + 127) / 255) as u8;
+            // Samples are already premultiplied. Apply only user opacity to
+            // source RGB, not its alpha again.
+            for ch in 1..4 {
+                output[dst_idx + ch] = ((sample[ch] as u32 * opacity_u8
+                    + output[dst_idx + ch] as u32 * inv_sa + 127) / 255).min(255) as u8;
+            }
         }
     }
 }
 
-/// Bilinear sample from ARGB flat buffer → [A, R, G, B]. Caller must guarantee ix+1 < w and iy+1 < h.
+/// Bilinear sample with edge-clamped neighbors. Caller guarantees ix < w, iy < h.
 #[inline]
-fn bilinear_sample(src: &[u8], w: usize, ix: usize, iy: usize, fx: f64, fy: f64) -> [u8; 4] {
+fn bilinear_sample(src: &[u8], w: usize, h: usize, ix: usize, iy: usize, fx: f64, fy: f64) -> [u8; 4] {
+    let nx=(ix+1).min(w-1);
+    let ny=(iy+1).min(h-1);
     let i00 = (iy * w + ix) * 4;
-    let i10 = i00 + 4;
-    let i01 = i00 + w * 4;
-    let i11 = i01 + 4;
+    let i10 = (iy * w + nx) * 4;
+    let i01 = (ny * w + ix) * 4;
+    let i11 = (ny * w + nx) * 4;
 
     let fx32 = fx as f32;
     let fy32 = fy as f32;
@@ -1304,20 +1449,53 @@ fn bilinear_sample(src: &[u8], w: usize, ix: usize, iy: usize, fx: f64, fy: f64)
 
 // ---- Layer I/O helpers ----
 
-fn layer_to_flat(layer: &ae::Layer) -> (Vec<u8>, usize, usize) {
+fn checked_world_layout(w:usize,h:usize,row_bytes:isize,bpp:usize)->Result<usize,ae::Error> {
+    if w>i32::MAX as usize || h>i32::MAX as usize || row_bytes==i32::MIN as isize {return Err(ae::Error::BadCallbackParameter);}
+    if w==0 || h==0 {return Ok(0);}
+    let stride=row_bytes.checked_abs().ok_or(ae::Error::BadCallbackParameter)? as usize;
+    let row=w.checked_mul(bpp).ok_or(ae::Error::OutOfMemory)?;
+    let len=stride.checked_mul(h).ok_or(ae::Error::OutOfMemory)?;
+    if stride<row || len>isize::MAX as usize {return Err(ae::Error::BadCallbackParameter);}
+    Ok(stride)
+}
+
+fn validate_world(layer:&ae::Layer)->Result<i16,ae::Error> {
+    let depth=if layer.width()==0 || layer.height()==0 {8} else {match layer.pixel_format()? {
+        ae::PixelFormat::Argb32=>8, ae::PixelFormat::Argb64=>16, ae::PixelFormat::Argb128=>32,
+        _=>return Err(ae::Error::BadCallbackParameter),
+    }};
+    checked_world_layout(layer.width(),layer.height(),layer.row_bytes(),depth as usize/2)?;
+    if layer.width()!=0 && layer.height()!=0 && unsafe {layer.data_ptr()}.is_null() {return Err(ae::Error::BadCallbackParameter);}
+    Ok(depth)
+}
+
+fn row_offset(y:usize,h:usize,stride:usize,reverse:bool)->usize {
+    (if reverse {h-1-y} else {y})*stride
+}
+
+fn allocate_argb8(w:usize,h:usize)->Result<Vec<u8>,ae::Error> {
+    let len=w.checked_mul(h).and_then(|n|n.checked_mul(4)).ok_or(ae::Error::OutOfMemory)?;
+    let mut pixels=Vec::new();
+    pixels.try_reserve_exact(len).map_err(|_|ae::Error::OutOfMemory)?;
+    pixels.resize(len,0);
+    Ok(pixels)
+}
+
+fn layer_to_flat(layer: &ae::Layer) -> Result<(Vec<u8>, usize, usize),ae::Error> {
+    let depth = validate_world(layer)?;
     let w = layer.width() as usize;
     let h = layer.height() as usize;
     if w == 0 || h == 0 {
-        return (Vec::new(), 0, 0);
+        return Ok((Vec::new(), 0, 0));
     }
-    let depth = layer.bit_depth();
     let stride = layer.buffer_stride();
+    let reverse = layer.row_bytes()<0;
     let buf = layer.buffer();
-    let mut flat = vec![0u8; w * h * 4];
+    let mut flat = allocate_argb8(w,h)?;
     match depth {
         16 => {
             for y in 0..h {
-                let src_row = y * stride;
+                let src_row = row_offset(y,h,stride,reverse);
                 let dst_row = y * w * 4;
                 for x in 0..w {
                     let si = src_row + x * 8;
@@ -1333,7 +1511,7 @@ fn layer_to_flat(layer: &ae::Layer) -> (Vec<u8>, usize, usize) {
         }
         32 => {
             for y in 0..h {
-                let src_row = y * stride;
+                let src_row = row_offset(y,h,stride,reverse);
                 let dst_row = y * w * 4;
                 for x in 0..w {
                     let si = src_row + x * 16;
@@ -1352,7 +1530,7 @@ fn layer_to_flat(layer: &ae::Layer) -> (Vec<u8>, usize, usize) {
         }
         _ => {
             for y in 0..h {
-                let src_off = y * stride;
+                let src_off = row_offset(y,h,stride,reverse);
                 let dst_off = y * w * 4;
                 let row_len = w * 4;
                 if src_off + row_len <= buf.len() && dst_off + row_len <= flat.len() {
@@ -1361,18 +1539,18 @@ fn layer_to_flat(layer: &ae::Layer) -> (Vec<u8>, usize, usize) {
             }
         }
     }
-    (flat, w, h)
+    Ok((flat, w, h))
 }
 
 /// Read in_layer into a flat buffer matching out_layer dimensions.
 /// In non-smart Render, in/out share the same w/h, so this is a direct conversion.
-fn layer_to_flat_padded(layer: &ae::Layer, out_w: usize, out_h: usize) -> Vec<u8> {
-    let (flat, w, h) = layer_to_flat(layer);
+fn layer_to_flat_padded(layer: &ae::Layer, out_w: usize, out_h: usize) -> Result<Vec<u8>,ae::Error> {
+    let (flat, w, h) = layer_to_flat(layer)?;
     if w == out_w && h == out_h {
-        return flat;
+        return Ok(flat);
     }
     // Different size: blit what fits
-    let mut canvas = vec![0u8; out_w * out_h * 4];
+    let mut canvas = allocate_argb8(out_w,out_h)?;
     let copy_w = w.min(out_w);
     let copy_h = h.min(out_h);
     for y in 0..copy_h {
@@ -1383,18 +1561,22 @@ fn layer_to_flat_padded(layer: &ae::Layer, out_w: usize, out_h: usize) -> Vec<u8
             canvas[dst_off..dst_off + row].copy_from_slice(&flat[src_off..src_off + row]);
         }
     }
-    canvas
+    Ok(canvas)
 }
 
-fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
-    let depth = layer.bit_depth();
+fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) -> Result<(),ae::Error> {
+    let depth = validate_world(layer)?;
+    let len=w.checked_mul(h).and_then(|n|n.checked_mul(4)).ok_or(ae::Error::OutOfMemory)?;
+    if (w,h)!=(layer.width(),layer.height()) || flat.len()!=len {return Err(ae::Error::BadCallbackParameter);}
+    if w==0 || h==0 {return Ok(());}
     let stride = layer.buffer_stride();
+    let reverse = layer.row_bytes()<0;
     let buf = layer.buffer_mut();
     match depth {
         16 => {
             for y in 0..h {
                 let src_row = y * w * 4;
-                let dst_row = y * stride;
+                let dst_row = row_offset(y,h,stride,reverse);
                 for x in 0..w {
                     let si = src_row + x * 4;
                     let di = dst_row + x * 8;
@@ -1413,7 +1595,7 @@ fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
         32 => {
             for y in 0..h {
                 let src_row = y * w * 4;
-                let dst_row = y * stride;
+                let dst_row = row_offset(y,h,stride,reverse);
                 for x in 0..w {
                     let si = src_row + x * 4;
                     let di = dst_row + x * 16;
@@ -1433,7 +1615,7 @@ fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
         _ => {
             for y in 0..h {
                 let src_off = y * w * 4;
-                let dst_off = y * stride;
+                let dst_off = row_offset(y,h,stride,reverse);
                 let row_len = w * 4;
                 if src_off + row_len <= flat.len() && dst_off + row_len <= buf.len() {
                     buf[dst_off..dst_off + row_len].copy_from_slice(&flat[src_off..src_off + row_len]);
@@ -1441,5 +1623,5 @@ fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
             }
         }
     }
+    Ok(())
 }
-

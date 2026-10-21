@@ -1,4 +1,5 @@
 use after_effects as ae;
+use ae::{AsPtr, AsMutPtr};
 
 #[derive(Eq, PartialEq, Hash, Clone, Copy, Debug)]
 enum Params {
@@ -290,6 +291,27 @@ fn render(
     let sx = f64::from(in_data.downsample_x()) as f32;
     let sy = f64::from(in_data.downsample_y()) as f32;
     let origin = output.origin();
+    let format = input.pixel_format()?;
+    if format != output.pixel_format()? {
+        return Err(ae::Error::BadCallbackParameter);
+    }
+    // The wrapper's generic iterate selects depth from DEEP before querying
+    // the World Suite. Float worlds may carry that flag too.
+    if format == ae::PixelFormat::Argb128 {
+        let height = output.height() as i32;
+        return ae::pf::suites::IterateFloat::new()?.iterate(
+            in_data.as_ptr(), Some(input.as_ptr()), output.as_mut_ptr(),
+            0, height, None, |x, y, src, dst| {
+                let px = (x + origin.h) as f32 / sx.max(0.0001) + 0.5;
+                let py = (y + origin.v) as f32 / sy.max(0.0001) + 0.5;
+                composite_f32(src, dst, p, coverage(p, px, py) * p.opacity);
+                Ok(())
+            },
+        );
+    }
+    if !matches!(format, ae::PixelFormat::Argb32 | ae::PixelFormat::Argb64) {
+        return Err(ae::Error::BadCallbackParameter);
+    }
     input.iterate_with(
         output,
         0,
@@ -458,6 +480,59 @@ mod tests {
         let p = params(1);
         assert!(signed_distance(&p, 50.0, 50.0) < 0.0);
         assert!(signed_distance(&p, 100.0, 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn float_composite_preserves_hdr_and_negative_values() {
+        let p = params(1);
+        let src = ae::PixelF32 { alpha: 1.0, red: 4.25, green: -0.125, blue: 0.1234567 };
+        let mut dst = ae::PixelF32 { alpha: 0.0, red: 0.0, green: 0.0, blue: 0.0 };
+        composite_f32(&src, &mut dst, &p, 0.0);
+        assert_eq!([dst.alpha, dst.red, dst.green, dst.blue], [src.alpha, src.red, src.green, src.blue]);
+        composite_f32(&src, &mut dst, &p, 0.5);
+        assert_eq!(dst.red, 2.625);
+        assert_eq!(dst.green, 0.4375);
+    }
+
+    #[test]
+    fn native_u16_low_bits_survive_identity_and_half_overlay() {
+        let p=params(1);
+        for alpha in 0..=32768u16 {
+            let src=ae::Pixel16 {alpha,red:alpha,green:alpha/2,blue:alpha/3};
+            let mut dst=ae::Pixel16 {alpha:0,red:0,green:0,blue:0};
+            composite_u16(&src,&mut dst,&p,0.0);
+            assert_eq!([dst.alpha,dst.red,dst.green,dst.blue],
+                [src.alpha,src.red,src.green,src.blue],"identity alpha={alpha}");
+            composite_u16(&src,&mut dst,&p,0.5);
+            // White at half coverage over premultiplied input: independent
+            // integer reference, with positive halves rounded upward.
+            let expected=[src.alpha,src.red,src.green,src.blue]
+                .map(|v|((32768u32+v as u32+1)/2) as u16);
+            assert_eq!([dst.alpha,dst.red,dst.green,dst.blue],expected,"overlay alpha={alpha}");
+        }
+    }
+
+    #[test]
+    fn native_u16_mask_alpha_matches_integer_reference() {
+        let mut p=params(1);
+        p.composite=3;
+        for operation in 1..=5 {
+            p.mask_operation=operation;
+            for alpha in 0..=32768u16 {
+                let src=ae::Pixel16 {alpha,red:0,green:0,blue:0};
+                let mut dst=ae::Pixel16 {alpha:0,red:0,green:0,blue:0};
+                composite_u16(&src,&mut dst,&p,0.5);
+                let a=alpha as u32;
+                let expected=match operation {
+                    1=>16384,
+                    2|4=>(a+1)/2,
+                    3=>16384+(a+1)/2,
+                    _=>a.abs_diff(16384),
+                } as u16;
+                assert_eq!(dst.alpha,expected,"operation={operation} alpha={alpha}");
+                assert_eq!([dst.red,dst.green,dst.blue],[0,0,0]);
+            }
+        }
     }
 
     #[test]

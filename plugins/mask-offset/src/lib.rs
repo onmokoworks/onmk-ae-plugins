@@ -206,18 +206,14 @@ impl AdobePluginGlobal for Plugin {
                 let polygon = extra.pre_render_data::<PreRenderMaskData>()
                     .map(|d| d.polygon.clone())
                     .unwrap_or_default();
-                let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                    let _ = smart_render(&extra, params, &polygon);
-                }));
+                smart_render(&extra, params, &polygon)?;
             }
 
             ae::Command::SmartRenderGpu { extra } => {
                 let polygon = extra.pre_render_data::<PreRenderMaskData>()
                     .map(|d| d.polygon.clone())
                     .unwrap_or_default();
-                let _ = panic::catch_unwind(AssertUnwindSafe(|| {
-                    let _ = smart_render(&extra, params, &polygon);
-                }));
+                smart_render(&extra, params, &polygon)?;
             }
 
             _ => {}
@@ -294,24 +290,103 @@ fn compute_offset_polygon(
     let mut vertices = vertices;
     apply_corner_rounding(&mut vertices, is_closed, corner_round);
 
-    // Apply expansion
-    if expansion_x.abs() > 0.001 || expansion_y.abs() > 0.001 {
-        let n = vertices.len() as f64;
-        let cx: f64 = vertices.iter().map(|v| v.x).sum::<f64>() / n;
-        let cy: f64 = vertices.iter().map(|v| v.y).sum::<f64>() / n;
-        for vtx in &mut vertices {
-            let dx = vtx.x - cx;
-            let dy = vtx.y - cy;
-            let dist = (dx * dx + dy * dy).sqrt();
-            if dist > 0.001 {
-                vtx.x += (dx / dist) * expansion_x;
-                vtx.y += (dy / dist) * expansion_y;
-            }
+    // Offset the sampled contour, not anchors along centroid rays. Tangent
+    // direction and winding, rather than aspect ratio, determine the offset.
+    let polygon = sample_polygon(&vertices, is_closed);
+    offset_polygon(&polygon, expansion_x, expansion_y)
+}
+
+fn offset_polygon(polygon: &[(f64,f64)], ex: f64, ey: f64) -> Vec<(f64,f64)> {
+    if ex.abs() <= 0.001 && ey.abs() <= 0.001 { return polygon.to_vec(); }
+    // A nonempty degenerate contour means an empty mask, not missing-mask passthrough.
+    let empty = || vec![(0.0,0.0);3];
+    if !ex.is_finite() || !ey.is_finite() { return empty(); }
+    let mut points = Vec::new();
+    for &p in polygon {
+        if !p.0.is_finite() || !p.1.is_finite() { return empty(); }
+        if points.last().map_or(true, |q:&(f64,f64)| (p.0-q.0).hypot(p.1-q.1)>1e-9) {
+            points.push(p);
         }
     }
+    if points.len()>1 && (points[0].0-points[points.len()-1].0).hypot(points[0].1-points[points.len()-1].1)<=1e-9 {
+        points.pop();
+    }
+    if points.len()<3 { return empty(); }
+    let n=points.len();
+    let cross=|a:(f64,f64),b:(f64,f64)| a.0*b.1-a.1*b.0;
+    let area: f64=(0..n).map(|i|cross(points[i],points[(i+1)%n])).sum();
+    if area.abs()<1e-9 || !area.is_finite() { return empty(); }
+    let winding=area.signum();
+    let normals: Vec<_>=(0..n).map(|i| {
+        let a=points[i]; let b=points[(i+1)%n];
+        let (dx,dy)=(b.0-a.0,b.1-a.1); let length=dx.hypot(dy);
+        (winding*dy/length,-winding*dx/length)
+    }).collect();
+    let distance=|normal:(f64,f64)| ex*normal.0*normal.0+ey*normal.1*normal.1;
+    let convex=(0..n).all(|i| cross(normals[i],normals[(i+1)%n])*winding>=-1e-9);
+    if convex && ex<=0.0 && ey<=0.0 {
+        // Half-plane clipping makes erosion disappear instead of turning an
+        // over-shrunk convex contour inside out and making it grow again.
+        let mut out=points.clone();
+        for i in 0..n {
+            let normal=normals[i]; let origin=points[i];
+            let side=|p:(f64,f64)| normal.0*(p.0-origin.0)+normal.1*(p.1-origin.1)-distance(normal);
+            let mut clipped=Vec::new();
+            if out.is_empty() { return empty(); }
+            let mut a=*out.last().unwrap(); let mut sa=side(a);
+            for &b in &out {
+                let sb=side(b);
+                if (sa<=0.0)!=(sb<=0.0) {
+                    let t=sa/(sa-sb);
+                    clipped.push((a.0+(b.0-a.0)*t,a.1+(b.1-a.1)*t));
+                }
+                if sb<=0.0 { clipped.push(b); }
+                a=b; sa=sb;
+            }
+            out=clipped;
+        }
+        return if out.len()<3 {empty()} else {out};
+    }
+    let mut out=Vec::new();
+    for i in 0..n {
+        let a=normals[(i+n-1)%n]; let b=normals[i]; let p=points[i];
+        let (da,db)=(distance(a),distance(b)); let det=cross(a,b);
+        let delta=if det.abs()>1e-9 {
+            ((da*b.1-a.1*db)/det,(a.0*db-da*b.0)/det)
+        } else { (b.0*db,b.1*db) };
+        if delta.0.hypot(delta.1)>16.0*ex.abs().max(ey.abs()) {
+            // Bevel near reversals instead of producing unbounded miter spikes.
+            out.push((p.0+a.0*da,p.1+a.1*da));
+            out.push((p.0+b.0*db,p.1+b.1*db));
+        } else { out.push((p.0+delta.0,p.1+delta.1)); }
+    }
+    out
+}
 
-    // Sample bezier path densely into a polygon
-    sample_polygon(&vertices, is_closed)
+#[test]
+fn contour_offset_uses_edge_distance_and_preserves_winding_and_zero() {
+    let rectangle=vec![(4.0,6.0),(12.0,6.0),(12.0,24.0),(4.0,24.0)];
+    assert_eq!(offset_polygon(&rectangle,0.0,0.0),rectangle);
+    for reverse in [false,true] {
+        let mut input=rectangle.clone(); if reverse {input.reverse();}
+        for (ex,ey,bounds) in [(2.0,2.0,(2.0,4.0,14.0,26.0)),
+            (-2.0,-2.0,(6.0,8.0,10.0,22.0)),(2.0,-2.0,(2.0,8.0,14.0,22.0))] {
+            let out=offset_polygon(&input,ex,ey);
+            for y in 0..31 {for x in 0..17 {
+                let (px,py)=(x as f64+0.5,y as f64+0.5);
+                assert_eq!(point_in_polygon(px,py,&out),px>bounds.0&&px<bounds.2&&py>bounds.1&&py<bounds.3);
+            }}
+        }
+        let collapsed=offset_polygon(&input,-20.0,-20.0);
+        assert!(!collapsed.is_empty());
+        assert!(!point_in_polygon(8.0,15.0,&collapsed));
+    }
+    // Non-axis-aligned contour: each edge of this diamond moves exactly 2px.
+    let diamond=vec![(0.0,-10.0),(10.0,0.0),(0.0,10.0),(-10.0,0.0)];
+    let out=offset_polygon(&diamond,2.0,2.0);
+    assert!((out[1].0-(10.0+2.0*2.0f64.sqrt())).abs()<1e-10);
+    let duplicate=vec![(4.0,6.0),(4.0,6.0),(12.0,6.0),(12.0,24.0),(4.0,24.0),(4.0,6.0)];
+    assert_eq!(offset_polygon(&duplicate,2.0,2.0),offset_polygon(&rectangle,2.0,2.0));
 }
 
 // ---- Mode constants (1-indexed from popup) ----
@@ -341,29 +416,25 @@ fn smart_render(
 
     let cb = extra.callbacks();
     let input_world = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
+    render_with_checkin(|| {
     let mut output_world = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
 
     let w = output_world.width() as usize;
     let h = output_world.height() as usize;
-    if w == 0 || h == 0 {
-        let _ = cb.checkin_layer_pixels(0);
-        return Ok(());
-    }
-
     // Copy input to output first
-    copy_layer(&input_world, &mut output_world);
+    let depth = copy_layer(&input_world, &mut output_world)?;
+    if w == 0 || h == 0 { return Ok(()); }
 
     if polygon.is_empty() {
-        let _ = cb.checkin_layer_pixels(0);
         return Ok(());
     }
 
     let stride = output_world.buffer_stride();
+    let reverse = output_world.row_bytes() < 0;
     let buf = output_world.buffer_mut();
-    let depth = input_world.bit_depth();
 
     for y in 0..h {
-        let row_off = y * stride;
+        let row_off = (if reverse {h - 1 - y} else {y}) * stride;
         for x in 0..w {
             let inside_raw = point_in_polygon(x as f64 + 0.5, y as f64 + 0.5, polygon);
             let mut mask_val = if inside_raw { 1.0 } else { 0.0 };
@@ -377,7 +448,7 @@ fn smart_render(
 
             match mode {
                 MODE_MASK_ALPHA => {
-                    // Multiply alpha only
+                    // AE pixels are premultiplied: coverage scales all channels.
                     multiply_alpha(buf, row_off, x, depth, mask_val);
                 }
                 MODE_SHOW_INSIDE => {
@@ -408,33 +479,42 @@ fn smart_render(
         }
     }
 
-    let _ = cb.checkin_layer_pixels(0);
     Ok(())
+    }, || cb.checkin_layer_pixels(0))
+}
+
+// Once input pixels have been acquired, release them on every work-result path,
+// including a Rust panic. Preserve the original render error over cleanup errors.
+fn render_with_checkin(
+    work: impl FnOnce() -> Result<(), ae::Error>,
+    checkin: impl FnOnce() -> Result<(), ae::Error>,
+) -> Result<(), ae::Error> {
+    let result = panic::catch_unwind(AssertUnwindSafe(work))
+        .unwrap_or(Err(ae::Error::Generic));
+    let released = checkin();
+    result.and(released)
 }
 
 fn multiply_alpha(buf: &mut [u8], row_off: usize, x: usize, depth: i16, factor: f64) {
-    match depth {
-        16 => {
-            let off = row_off + x * 8;
-            if off + 1 < buf.len() {
-                let v = u16::from_ne_bytes([buf[off], buf[off + 1]]);
-                let bytes = ((v as f64 * factor) as u16).to_ne_bytes();
-                buf[off] = bytes[0]; buf[off + 1] = bytes[1];
+    let channel_bytes = match depth {16 => 2usize, 32 => 4, _ => 1};
+    let pixel_bytes = 4 * channel_bytes;
+    let Some(start) = x.checked_mul(pixel_bytes).and_then(|v|row_off.checked_add(v)) else {return;};
+    let Some(end) = start.checked_add(pixel_bytes) else {return;};
+    let Some(pixel) = buf.get_mut(start..end) else {return;};
+    // Preserve exact identity, including native low bits and float HDR values.
+    if factor == 1.0 {return;}
+    if factor == 0.0 {pixel.fill(0); return;}
+    for channel in pixel.chunks_exact_mut(channel_bytes) {
+        match depth {
+            16 => {
+                let value = u16::from_ne_bytes(channel.try_into().unwrap());
+                channel.copy_from_slice(&((value as f64 * factor) as u16).to_ne_bytes());
             }
-        }
-        32 => {
-            let off = row_off + x * 16;
-            if off + 3 < buf.len() {
-                let v = f32::from_ne_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]);
-                let bytes = (v * factor as f32).to_ne_bytes();
-                buf[off] = bytes[0]; buf[off+1] = bytes[1]; buf[off+2] = bytes[2]; buf[off+3] = bytes[3];
+            32 => {
+                let value = f32::from_ne_bytes(channel.try_into().unwrap());
+                channel.copy_from_slice(&(value * factor as f32).to_ne_bytes());
             }
-        }
-        _ => {
-            let off = row_off + x * 4;
-            if off < buf.len() {
-                buf[off] = (buf[off] as f64 * factor) as u8;
-            }
+            _ => channel[0] = (channel[0] as f64 * factor) as u8,
         }
     }
 }
@@ -493,22 +573,50 @@ fn write_pixel(buf: &mut [u8], row_off: usize, x: usize, depth: i16, color: ae::
 
 // ---- Copy layer pixels ----
 
-fn copy_layer(src: &ae::Layer, dst: &mut ae::Layer) {
-    let w = src.width().min(dst.width()) as usize;
-    let h = src.height().min(dst.height()) as usize;
-    let src_stride = src.buffer_stride();
-    let dst_stride = dst.buffer_stride();
-    let src_buf = src.buffer();
-    let dst_buf = dst.buffer_mut();
-    let bpp = match src.bit_depth() { 16 => 8, 32 => 16, _ => 4 };
-    let row_bytes = w * bpp;
+fn world_depth(layer: &ae::Layer) -> Result<i16, ae::Error> {
+    if layer.width()>i32::MAX as usize || layer.height()>i32::MAX as usize
+        || layer.row_bytes()==i32::MIN as isize {return Err(ae::Error::BadCallbackParameter);}
+    if layer.width()==0 || layer.height()==0 {return Ok(8);}
+    let depth = match layer.pixel_format()? {
+        ae::PixelFormat::Argb32 => 8,
+        ae::PixelFormat::Argb64 => 16,
+        ae::PixelFormat::Argb128 => 32,
+        _ => return Err(ae::Error::BadCallbackParameter),
+    };
+    checked_extent(layer.width(),layer.height(),layer.buffer_stride(),depth as usize / 2)?;
+    let len=layer.buffer_stride().checked_mul(layer.height()).ok_or(ae::Error::OutOfMemory)?;
+    if len>isize::MAX as usize || unsafe {layer.data_ptr()}.is_null() {return Err(ae::Error::BadCallbackParameter);}
+    Ok(depth)
+}
+
+fn checked_extent(w:usize,h:usize,stride:usize,bpp:usize)->Result<usize,ae::Error> {
+    if w==0 || h==0 {return Ok(0);}
+    let row=w.checked_mul(bpp).ok_or(ae::Error::OutOfMemory)?;
+    if stride<row {return Err(ae::Error::BadCallbackParameter);}
+    (h-1).checked_mul(stride).and_then(|v|v.checked_add(row)).ok_or(ae::Error::OutOfMemory)
+}
+
+fn copy_rows(src:&[u8],dst:&mut[u8],w:usize,h:usize,bpp:usize,ss:usize,ds:usize,sr:bool,dr:bool)->Result<(),ae::Error> {
+    if src.len()<checked_extent(w,h,ss,bpp)? || dst.len()<checked_extent(w,h,ds,bpp)? {return Err(ae::Error::BadCallbackParameter);}
+    if w==0 || h==0 {return Ok(());}
+    let row_bytes=w*bpp;
     for y in 0..h {
-        let so = y * src_stride;
-        let do_ = y * dst_stride;
-        if so + row_bytes <= src_buf.len() && do_ + row_bytes <= dst_buf.len() {
-            dst_buf[do_..do_ + row_bytes].copy_from_slice(&src_buf[so..so + row_bytes]);
-        }
+        let so=(if sr {h-1-y} else {y})*ss;
+        let do_=(if dr {h-1-y} else {y})*ds;
+        dst[do_..do_+row_bytes].copy_from_slice(&src[so..so+row_bytes]);
     }
+    Ok(())
+}
+
+fn copy_layer(src: &ae::Layer, dst: &mut ae::Layer) -> Result<i16,ae::Error> {
+    if (src.width(),src.height())!=(dst.width(),dst.height()) {return Err(ae::Error::BadCallbackParameter);}
+    let depth=world_depth(src)?;
+    if depth!=world_depth(dst)? {return Err(ae::Error::BadCallbackParameter);}
+    let (w,h)=(src.width(),src.height());
+    if w==0 || h==0 {return Ok(depth);}
+    let (ss,ds,sr,dr)=(src.buffer_stride(),dst.buffer_stride(),src.row_bytes()<0,dst.row_bytes()<0);
+    copy_rows(src.buffer(),dst.buffer_mut(),w,h,depth as usize/2,ss,ds,sr,dr)?;
+    Ok(depth)
 }
 
 // ---- Point-in-polygon (ray casting) ----
@@ -719,31 +827,19 @@ unsafe fn read_outline_raw_ffi(
         return (Vec::new(), true);
     }
 
-    let mut num_segments: A_long = 0;
-    if let Some(f) = outline_suite.AEGP_GetMaskOutlineNumSegments {
-        f(outline_h, &mut num_segments);
-    }
-
-    let mut vertices: Vec<MaskVertex> = Vec::new();
-    if num_segments > 0 {
-        if let Some(vf) = outline_suite.AEGP_GetMaskOutlineVertexInfo {
-            for i in 0..num_segments {
-                let mut vtx: AEGP_MaskVertex = std::mem::zeroed();
-                if vf(outline_h, i, &mut vtx) == 0 {
-                    vertices.push(MaskVertex {
-                        x: vtx.x, y: vtx.y,
-                        tan_in_x: vtx.tan_in_x, tan_in_y: vtx.tan_in_y,
-                        tan_out_x: vtx.tan_out_x, tan_out_y: vtx.tan_out_y,
-                    });
-                }
-            }
-        }
-    }
-
     let mut is_open: A_Boolean = 0;
-    if let Some(f) = outline_suite.AEGP_IsMaskOutlineOpen {
-        let _ = f(outline_h, &mut is_open);
-    }
+    let mut num_segments: A_long = 0;
+    let vertices=(|| {
+        if outline_suite.AEGP_IsMaskOutlineOpen?(outline_h,&mut is_open)!=0 {return None;}
+        if outline_suite.AEGP_GetMaskOutlineNumSegments?(outline_h,&mut num_segments)!=0 {return None;}
+        let vf=outline_suite.AEGP_GetMaskOutlineVertexInfo?;
+        collect_outline_vertices(num_segments,is_open!=0,|i| {
+            let mut vtx: AEGP_MaskVertex=std::mem::zeroed();
+            if vf(outline_h,i,&mut vtx)!=0 {return None;}
+            Some(MaskVertex {x:vtx.x,y:vtx.y,tan_in_x:vtx.tan_in_x,tan_in_y:vtx.tan_in_y,
+                tan_out_x:vtx.tan_out_x,tan_out_y:vtx.tan_out_y})
+        })
+    })().unwrap_or_default();
 
     if let Some(dispose) = stream_suite.AEGP_DisposeStreamValue { dispose(&mut stream_val2); }
     if let Some(r) = release { r(outline_suite_name, outline_suite_version); r(stream_suite_name, stream_suite_version); }
@@ -751,3 +847,90 @@ unsafe fn read_outline_raw_ffi(
     (vertices, is_open == 0)
 }
 
+fn collect_outline_vertices(segments:i32,open:bool,mut read:impl FnMut(i32)->Option<MaskVertex>) -> Option<Vec<MaskVertex>> {
+    if segments<0 {return None;}
+    let count=segments.checked_add(i32::from(open))?;
+    let mut vertices=Vec::new();
+    vertices.try_reserve_exact(count as usize).ok()?;
+    for index in 0..count {vertices.push(read(index)?);}
+    Some(vertices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn checked_rows_preserve_padding_reverse_and_reject_partial_copy() {
+        for bpp in [4,8,16] {
+            let stride=2*bpp+3;
+            let src:Vec<u8>=(0..stride*3).map(|v|v as u8).collect();
+            for sr in [false,true] {for dr in [false,true] {
+                let mut dst=vec![255;stride*3];
+                copy_rows(&src,&mut dst,2,3,bpp,stride,stride,sr,dr).unwrap();
+                for y in 0..3 {
+                    let s=(if sr {2-y} else {y})*stride;
+                    let d=(if dr {2-y} else {y})*stride;
+                    assert_eq!(&dst[d..d+2*bpp],&src[s..s+2*bpp]);
+                    assert_eq!(&dst[d+2*bpp..d+stride],&[255;3]);
+                }
+            }}
+            let mut dst=vec![99;stride*3];
+            assert!(copy_rows(&src[..stride],&mut dst,2,3,bpp,stride,stride,false,false).is_err());
+            assert!(dst.iter().all(|v|*v==99));
+            assert!(checked_extent(2,3,bpp,bpp).is_err());
+        }
+        assert!(checked_extent(usize::MAX,2,usize::MAX,16).is_err());
+        assert_eq!(checked_extent(0,usize::MAX,0,16),Ok(0));
+    }
+    #[test]
+    fn mask_coverage_scales_premultiplied_rgb_at_native_precision() {
+        let mut p8 = [128, 100, 64, 2];
+        multiply_alpha(&mut p8, 0, 0, 8, 0.5);
+        assert_eq!(p8, [64, 50, 32, 1]);
+        let mut p16: Vec<u8> = [32768u16, 16386, 2, 0].into_iter().flat_map(u16::to_ne_bytes).collect();
+        multiply_alpha(&mut p16, 0, 0, 16, 0.5);
+        assert_eq!(p16.chunks_exact(2).map(|c|u16::from_ne_bytes(c.try_into().unwrap())).collect::<Vec<_>>(), [16384,8193,1,0]);
+        let mut pf: Vec<u8> = [0.5f32, 8.0, -2.0, 0.25].into_iter().flat_map(f32::to_ne_bytes).collect();
+        multiply_alpha(&mut pf, 0, 0, 32, 0.5);
+        assert_eq!(pf.chunks_exact(4).map(|c|f32::from_ne_bytes(c.try_into().unwrap())).collect::<Vec<_>>(), [0.25,4.0,-1.0,0.125]);
+        multiply_alpha(&mut pf, 0, 0, 32, 0.0);
+        assert!(pf.chunks_exact(4).all(|c|f32::from_ne_bytes(c.try_into().unwrap())==0.0));
+    }
+    #[test]
+    fn render_checkin_runs_once_on_success_error_and_panic() {
+        for stage in 0..3 {
+            for release_fails in [false, true] {
+                let calls = std::cell::Cell::new(0);
+                let result = render_with_checkin(|| match stage {
+                    0 => Ok(()),
+                    1 => Err(ae::Error::BadCallbackParameter),
+                    _ => panic!("injected render panic"),
+                }, || {
+                    calls.set(calls.get() + 1);
+                    if release_fails { Err(ae::Error::OutOfMemory) } else { Ok(()) }
+                });
+                assert_eq!(calls.get(), 1);
+                match stage {
+                    0 => assert_eq!(result, if release_fails {Err(ae::Error::OutOfMemory)} else {Ok(())}),
+                    1 => assert_eq!(result, Err(ae::Error::BadCallbackParameter)),
+                    _ => assert_eq!(result, Err(ae::Error::Generic)),
+                }
+            }
+        }
+    }
+    fn vertex(x:f64)->MaskVertex {MaskVertex{x,y:0.0,tan_in_x:0.0,tan_in_y:0.0,tan_out_x:0.0,tan_out_y:0.0}}
+    #[test]
+    fn open_outline_reads_terminal_vertex_closed_avoids_duplicate() {
+        let open=collect_outline_vertices(2,true,|i|Some(vertex(i as f64))).unwrap();
+        assert_eq!(open.iter().map(|v|v.x).collect::<Vec<_>>(),[0.0,1.0,2.0]);
+        let closed=collect_outline_vertices(2,false,|i|Some(vertex(i as f64))).unwrap();
+        assert_eq!(closed.len(),2);
+        assert_eq!(collect_outline_vertices(0,true,|_|Some(vertex(0.0))).unwrap().len(),1);
+    }
+    #[test]
+    fn bad_vertex_discards_whole_outline_not_partial_shape() {
+        assert!(collect_outline_vertices(3,false,|i|if i==1 {None} else {Some(vertex(i as f64))}).is_none());
+        assert!(collect_outline_vertices(-1,false,|_|panic!("invalid read")).is_none());
+        assert!(collect_outline_vertices(i32::MAX,true,|_|panic!("overflow read")).is_none());
+    }
+}

@@ -730,6 +730,25 @@ fn timestamped_json_name(prefix: &str) -> String {
     format!("{}_{}.json", prefix, now)
 }
 
+fn checked_output_layout(width:usize,height:usize,stride:usize,bpp:usize)->Result<(usize,usize),ae::Error> {
+    if width==0 || height==0 {return Ok((0,0));}
+    let row=width.checked_mul(bpp).ok_or(ae::Error::OutOfMemory)?;
+    let length=stride.checked_mul(height).ok_or(ae::Error::OutOfMemory)?;
+    if stride<row || length>isize::MAX as usize {return Err(ae::Error::BadCallbackParameter);}
+    Ok((row,length))
+}
+
+fn reverse_output_rows(output:&mut [u8],row:usize,height:usize,stride:usize)->Result<(),ae::Error> {
+    if row==0 || height==0 {return Ok(());}
+    let (_,length)=checked_output_layout(row,height,stride,1)?;
+    if output.len()<length {return Err(ae::Error::BadCallbackParameter);}
+    for y in 0..height/2 {
+        let (front,back)=output.split_at_mut((height-1-y)*stride);
+        front[y*stride..y*stride+row].swap_with_slice(&mut back[..row]);
+    }
+    Ok(())
+}
+
 fn render_lattice(
     params: &mut ae::Parameters<Params>,
     state: &LatticeLabProjectState,
@@ -742,7 +761,26 @@ fn render_lattice(
     let height = out_layer.height() as usize;
     let time = current_time_sec(in_data);
 
-    if out_layer.bit_depth() == 8 {
+    let format=out_layer.pixel_format()?;
+    let bpp=match format {
+        ae::PixelFormat::Argb32=>4, ae::PixelFormat::Argb64=>8, ae::PixelFormat::Argb128=>16,
+        _=>return Err(ae::Error::BadCallbackParameter),
+    };
+    if width>i32::MAX as usize || height>i32::MAX as usize || out_layer.row_bytes()==i32::MIN as isize {
+        return Err(ae::Error::BadCallbackParameter);
+    }
+    if width==0 || height==0 {return Ok(());}
+    let stride=out_layer.buffer_stride();
+    let (row,_)=checked_output_layout(width,height,stride,bpp)?;
+    if unsafe {out_layer.data_ptr()}.is_null() {return Err(ae::Error::BadCallbackParameter);}
+    let reverse=out_layer.row_bytes()<0;
+    if format == ae::PixelFormat::Argb64 {
+        let runtime=lattice::LatticeRuntimeInputs::new(width,height,time).map_err(|_|ae::Error::OutOfMemory)?;
+        let plan=lattice::build_lattice_render_plan(&config,runtime);
+        let output=out_layer.buffer_mut();
+        output.fill(0);
+        lattice::render_lattice_plan_16bit(&plan,output,stride).map_err(|_|ae::Error::BadCallbackParameter)?;
+    } else if format == ae::PixelFormat::Argb32 {
         let request = LatticeLabRenderRequest {
             width,
             height,
@@ -756,12 +794,10 @@ fn render_lattice(
         let row_bytes = width
             .checked_mul(render_core::RenderSurface::ARGB8_BYTES_PER_PIXEL)
             .ok_or(ae::Error::OutOfMemory)?;
-        let mut flat = vec![
-            0u8;
-            row_bytes
-                .checked_mul(height)
-                .ok_or(ae::Error::OutOfMemory)?
-        ];
+        let length=row_bytes.checked_mul(height).ok_or(ae::Error::OutOfMemory)?;
+        let mut flat=Vec::new();
+        flat.try_reserve_exact(length).map_err(|_|ae::Error::OutOfMemory)?;
+        flat.resize(length,0);
         let request = LatticeLabRenderRequest {
             width,
             height,
@@ -770,9 +806,9 @@ fn render_lattice(
             clear_output: true,
         };
         render_lattice_lab_8bit(&config, request, &mut flat).map_err(map_lattice_error)?;
-        copy_argb8_to_layer(&flat, out_layer, width, height);
+        copy_argb8_to_32bpc(&flat,out_layer.buffer_mut(),width,height,stride);
     }
-
+    if reverse {reverse_output_rows(out_layer.buffer_mut(),row,height,stride)?;}
     Ok(())
 }
 
@@ -1001,47 +1037,6 @@ fn map_lattice_error(error: LatticeLabAdapterError) -> ae::Error {
     }
 }
 
-fn copy_argb8_to_layer(flat: &[u8], layer: &mut ae::Layer, width: usize, height: usize) {
-    let depth = layer.bit_depth();
-    let stride = layer.buffer_stride();
-    let buf = layer.buffer_mut();
-    match depth {
-        16 => copy_argb8_to_16bpc(flat, buf, width, height, stride),
-        32 => copy_argb8_to_32bpc(flat, buf, width, height, stride),
-        _ => copy_argb8_to_8bpc(flat, buf, width, height, stride),
-    }
-}
-
-fn copy_argb8_to_8bpc(flat: &[u8], buf: &mut [u8], width: usize, height: usize, stride: usize) {
-    let row_len = width.saturating_mul(4);
-    for y in 0..height {
-        let src = y.saturating_mul(row_len);
-        let dst = y.saturating_mul(stride);
-        if src + row_len <= flat.len() && dst + row_len <= buf.len() {
-            buf[dst..dst + row_len].copy_from_slice(&flat[src..src + row_len]);
-        }
-    }
-}
-
-fn copy_argb8_to_16bpc(flat: &[u8], buf: &mut [u8], width: usize, height: usize, stride: usize) {
-    for y in 0..height {
-        let src_row = y.saturating_mul(width).saturating_mul(4);
-        let dst_row = y.saturating_mul(stride);
-        for x in 0..width {
-            let src = src_row + x * 4;
-            let dst = dst_row + x * 8;
-            if src + 3 < flat.len() && dst + 7 < buf.len() {
-                for ch in 0..4 {
-                    let value = ((flat[src + ch] as u32 * 32768 + 127) / 255) as u16;
-                    let bytes = value.to_ne_bytes();
-                    buf[dst + ch * 2] = bytes[0];
-                    buf[dst + ch * 2 + 1] = bytes[1];
-                }
-            }
-        }
-    }
-}
-
 fn copy_argb8_to_32bpc(flat: &[u8], buf: &mut [u8], width: usize, height: usize, stride: usize) {
     for y in 0..height {
         let src_row = y.saturating_mul(width).saturating_mul(4);
@@ -1066,6 +1061,54 @@ fn copy_argb8_to_32bpc(flat: &[u8], buf: &mut [u8], width: usize, height: usize,
 mod tests {
     use super::*;
     use lattice_ae_adapter::LATTICE_LAB_EFFECT_IDENTITY;
+    #[test]
+    fn output_layout_and_row_reversal_are_checked() {
+        for bpp in [4,8,16] {
+            let row=2*bpp; let stride=row+3;
+            let mut bytes:Vec<u8>=(0..stride*3).map(|v|v as u8).collect();
+            let original=bytes.clone();
+            assert_eq!(checked_output_layout(2,3,stride,bpp),Ok((row,stride*3)));
+            reverse_output_rows(&mut bytes,row,3,stride).unwrap();
+            for y in 0..3 {
+                assert_eq!(&bytes[y*stride..y*stride+row],&original[(2-y)*stride..(2-y)*stride+row]);
+                assert_eq!(&bytes[y*stride+row..(y+1)*stride],&original[y*stride+row..(y+1)*stride]);
+            }
+            reverse_output_rows(&mut bytes,row,3,stride).unwrap();
+            assert_eq!(bytes,original);
+        }
+        let mut short=[99;7];
+        assert!(reverse_output_rows(&mut short,4,2,4).is_err());
+        assert_eq!(short,[99;7]);
+        assert!(checked_output_layout(2,3,7,4).is_err());
+        assert!(checked_output_layout(usize::MAX,2,8,16).is_err());
+        assert_eq!(checked_output_layout(0,usize::MAX,0,16),Ok((0,0)));
+    }
+
+    #[test]
+    fn sixteen_bit_render_retains_sub_eight_bit_point() {
+        let mut plan=lattice::LatticeRenderPlan {
+            runtime:lattice::LatticeRuntimeInputs::new(1,1,0.0).unwrap(),
+            blend_mode:lattice::LatticeBlendMode::Normal,
+            points:vec![lattice::LatticeRenderPoint {position:[0.5,0.5,0.0],size:2.0,color:[1.0,1.0,1.0,1.0/1024.0]}],
+            links:vec![],mesh_edges:vec![],
+        };
+        let mut output=[0u8;8];
+        lattice::render_lattice_plan_16bit(&plan,&mut output,8).unwrap();
+        let values:Vec<u16>=output.chunks_exact(2).map(|b|u16::from_ne_bytes([b[0],b[1]])).collect();
+        assert_eq!(values,[32;4],"full coverage alpha1/1024 must survive native16 rendering");
+        plan.points.push(plan.points[0]);
+        for (mode,rgb) in [(lattice::LatticeBlendMode::Normal,64),(lattice::LatticeBlendMode::Add,76),(lattice::LatticeBlendMode::Screen,58)] {
+            plan.blend_mode=mode;
+            let mut padded=[0u8;12]; padded[8..].fill(99);
+            lattice::render_lattice_plan_16bit(&plan,&mut padded,12).unwrap();
+            let values:Vec<u16>=padded[..8].chunks_exact(2).map(|b|u16::from_ne_bytes([b[0],b[1]])).collect();
+            assert_eq!(values,[64,rgb,rgb,rgb]);
+            assert_eq!(&padded[8..],&[99;4]);
+        }
+        let mut short=[99u8;7];
+        assert!(lattice::render_lattice_plan_16bit(&plan,&mut short,8).is_err());
+        assert_eq!(short,[99;7]);
+    }
 
     #[test]
     fn plugin_identity_matches_lattice_lab_adapter() {

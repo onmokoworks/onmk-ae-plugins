@@ -1,4 +1,5 @@
 use crate::RefractParams;
+use crate::refract::Channel;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,12 +17,13 @@ struct GpuParams {
     color: [f32; 4],
     light: [f32; 4],
     half_vec: [f32; 4],
-    // x = height_source, y = height_invert (0/1), z = coverage_source, w = unused
+    // x = height_source, y = height_invert (0/1), z = coverage_source, w = native float transport
     mode2: [u32; 4],
 }
 
 #[allow(dead_code)]
 struct BufferState {
+    packed_byte: bool,
     width: u32,
     height: u32,
     source_buf: Buffer,
@@ -42,6 +44,8 @@ struct BufferState {
 }
 
 struct GpuProcessor {
+    cache_budget: u64,
+    cache_entries: usize,
     device: Device,
     queue: Queue,
     init_pipeline: ComputePipeline,
@@ -66,14 +70,14 @@ pub fn available() -> bool {
     processor().is_some()
 }
 
-pub fn render(
+pub fn render<T: Channel>(
     params: &RefractParams,
-    src: &[u8],
-    mask: Option<&[u8]>,
-    bg: Option<&[u8]>,
+    src: &[T],
+    mask: Option<&[T]>,
+    bg: Option<&[T]>,
     w: usize,
     h: usize,
-) -> Option<Vec<u8>> {
+) -> Option<Vec<T>> {
     processor()?.process(params, src, mask.unwrap_or(src), bg.unwrap_or(src), w, h)
 }
 
@@ -147,6 +151,8 @@ impl GpuProcessor {
         };
 
         Ok(Self {
+            cache_budget: 1024 * 1024 * 1024,
+            cache_entries: 8,
             init_pipeline: mk("init_planes"),
             copy_mask_pipeline: mk("copy_mask"),
             blur_height_h_pipeline: mk("blur_height_h"),
@@ -166,38 +172,47 @@ impl GpuProcessor {
         })
     }
 
-    fn process(
+    fn process<T: Channel>(
         &self,
         rp: &RefractParams,
-        src: &[u8],
-        mask: &[u8],
-        bg: &[u8],
+        src: &[T],
+        mask: &[T],
+        bg: &[T],
         w: usize,
         h: usize,
-    ) -> Option<Vec<u8>> {
-        if w == 0 || h == 0 || src.len() < w * h * 4 {
+    ) -> Option<Vec<T>> {
+        let count = w.checked_mul(h)?.checked_mul(4)?;
+        if w == 0 || h == 0 || w > u32::MAX as usize || h > u32::MAX as usize
+            || src.len() != count || mask.len() != count || bg.len() != count {
             return None;
         }
         if rp.output_mode == 2 {
-            return Some(src.to_vec());
+            let mut result = Vec::new();
+            result.try_reserve_exact(src.len()).ok()?;
+            result.extend_from_slice(src);
+            return Some(result);
         }
 
         let n = w * h;
         let (ww, hh) = (w as u32, h as u32);
-        let lock = self.get_state(ww, hh);
+        let limits = self.device.limits();
+        let bytes = n.checked_mul(16)? as u64;
+        if bytes > limits.max_buffer_size || bytes > u64::from(limits.max_storage_buffer_binding_size)
+            || w.div_ceil(16) > limits.max_compute_workgroups_per_dimension as usize
+            || h.div_ceil(16) > limits.max_compute_workgroups_per_dimension as usize { return None; }
+        let lock = self.get_state(ww, hh, T::PACKED_BYTE)?;
         let state = lock.get(&std::thread::current().id())?;
 
-        let src_packed = pack_argb(src, n);
-        let mask_packed = pack_argb(mask, n);
-        let bg_packed = pack_argb(bg, n);
-        self.queue
-            .write_buffer(&state.source_buf, 0, as_bytes_slice(&src_packed));
-        self.queue
-            .write_buffer(&state.mask_buf, 0, as_bytes_slice(&mask_packed));
-        self.queue
-            .write_buffer(&state.bg_buf, 0, as_bytes_slice(&bg_packed));
+        let packed_bytes = n.checked_mul(if T::PACKED_BYTE { 4 } else { 16 })? as u64;
+        for (input, buffer) in [(src,&state.source_buf),(mask,&state.mask_buf),(bg,&state.bg_buf)] {
+            let packed = pack_argb(input,n)?;
+            self.queue.write_buffer(buffer,0,as_bytes_slice(&packed));
+            // write_buffer copies into queue-owned staging; release this CPU
+            // conversion before preparing the next auxiliary input.
+        }
 
         let mut params = make_params(rp, ww, hh);
+        params.mode2[3] = u32::from(!T::PACKED_BYTE);
         let wg_x = (ww + 15) / 16;
         let wg_y = (hh + 15) / 16;
 
@@ -240,30 +255,25 @@ impl GpuProcessor {
         let mut enc = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor { label: None });
-        enc.copy_buffer_to_buffer(&state.output_buf, 0, &state.staging_buf, 0, (n * 4) as u64);
+        enc.copy_buffer_to_buffer(&state.output_buf, 0, &state.staging_buf, 0, packed_bytes);
         self.queue.submit(Some(enc.finish()));
 
         let slice = state.staging_buf.slice(..);
         let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
-        slice.map_async(MapMode::Read, move |v| tx.send(v).unwrap());
-        let _ = self.device.poll(PollType::Wait);
+        slice.map_async(MapMode::Read, move |v| { let _ = tx.send(v); });
+        let _unmap = UnmapOnDrop(&state.staging_buf);
+        if self.device.poll(PollType::Wait).is_err() { return None; }
 
         if let Some(Ok(())) = pollster::block_on(rx.receive()) {
             let data = slice.get_mapped_range();
-            let packed: &[u32] =
-                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u32, n) };
-            let mut result = vec![0u8; n * 4];
-            unpack_argb(packed, &mut result);
-            drop(data);
-            state.staging_buf.unmap();
-            Some(result)
+            decode_readback(&data,n)
         } else {
             None
         }
     }
 
-    fn create_buffers(&self, w: u32, h: u32) -> BufferState {
-        let n = (w * h) as u64;
+    fn create_buffers(&self, w: u32, h: u32, packed_byte: bool) -> BufferState {
+        let n = u64::from(w) * u64::from(h);
         let mk = |size: u64, usage: BufferUsages| {
             self.device.create_buffer(&BufferDescriptor {
                 size,
@@ -273,7 +283,7 @@ impl GpuProcessor {
             })
         };
 
-        let packed = n * 4;
+        let packed = n * if packed_byte { 4 } else { 16 };
         let plane = n * 4;
         let rgb = n * 16;
         let ro = BufferUsages::STORAGE | BufferUsages::COPY_DST;
@@ -352,6 +362,7 @@ impl GpuProcessor {
         });
 
         BufferState {
+            packed_byte,
             width: w,
             height: h,
             source_buf,
@@ -376,35 +387,37 @@ impl GpuProcessor {
         &self,
         w: u32,
         h: u32,
-    ) -> parking_lot::RwLockUpgradableReadGuard<'_, HashMap<std::thread::ThreadId, BufferState>>
+        packed_byte: bool,
+    ) -> Option<parking_lot::RwLockUpgradableReadGuard<'_, HashMap<std::thread::ThreadId, BufferState>>>
     {
+        let requested = buffer_bytes(w,h,packed_byte)?;
+        if requested > self.cache_budget || self.cache_entries == 0 { return None; }
         let mut lock = self.state.upgradable_read();
         let tid = std::thread::current().id();
         if lock
             .get(&tid)
-            .map(|s| s.width != w || s.height != h)
+            .map(|s| s.width != w || s.height != h || s.packed_byte != packed_byte)
             .unwrap_or(true)
         {
             lock.with_upgraded(|map| {
-                let max = num_cpus::get().max(2) - 1;
-                if map.len() > max {
-                    let mut keys: Vec<_> = map
-                        .iter()
-                        .map(|(k, v)| (*k, v.last_access.load(Ordering::Relaxed)))
-                        .collect();
-                    keys.sort_by_key(|a| a.1);
-                    for (k, _) in keys.iter().take(map.len() - max) {
-                        map.remove(k);
-                    }
+                // Drop a replaced frame before allocating its replacement.
+                // The write guard excludes all active users of retained states.
+                map.remove(&tid);
+                let mut retained: u64 = map.values().map(|s| buffer_bytes(s.width,s.height,s.packed_byte).unwrap()).sum();
+                while map.len() >= self.cache_entries || retained > self.cache_budget - requested {
+                    let oldest = map.iter().min_by_key(|(_,s)|s.last_access.load(Ordering::Relaxed)).map(|(id,_)|*id);
+                    let Some(id) = oldest else { break; };
+                    let old = map.remove(&id).unwrap();
+                    retained -= buffer_bytes(old.width,old.height,old.packed_byte).unwrap();
                 }
-                map.insert(tid, self.create_buffers(w, h));
+                map.insert(tid, self.create_buffers(w, h, packed_byte));
             });
         }
         lock.get(&tid)
             .unwrap()
             .last_access
             .store(ts(), Ordering::Relaxed);
-        lock
+        Some(lock)
     }
 
     fn dispatch(
@@ -428,6 +441,14 @@ impl GpuProcessor {
         }
         self.queue.submit(Some(enc.finish()));
     }
+}
+
+fn buffer_bytes(w: u32, h: u32, packed_byte: bool) -> Option<u64> {
+    // Five transport buffers, five scalar planes, two RGBA float planes,
+    // and one uniform buffer. Driver/pipeline allocation is not included.
+    u64::from(w).checked_mul(u64::from(h))?
+        .checked_mul(if packed_byte { 72 } else { 132 })?
+        .checked_add(std::mem::size_of::<GpuParams>() as u64)
 }
 
 fn make_params(rp: &RefractParams, w: u32, h: u32) -> GpuParams {
@@ -508,27 +529,46 @@ fn boxes_for_gauss(sigma: f64) -> [usize; 3] {
     sizes
 }
 
-fn pack_argb(src: &[u8], n: usize) -> Vec<u32> {
-    (0..n)
-        .map(|i| {
-            let o = i * 4;
-            let a = src[o] as u32;
-            let r = src[o + 1] as u32;
-            let g = src[o + 2] as u32;
-            let b = src[o + 3] as u32;
-            (r << 24) | (g << 16) | (b << 8) | a
-        })
-        .collect()
+fn pack_argb<T: Channel>(src: &[T], n: usize) -> Option<Vec<u32>> {
+    let channels = n.checked_mul(4)?;
+    if src.len()!=channels { return None; }
+    let mut packed = Vec::new();
+    packed.try_reserve_exact(if T::PACKED_BYTE { n } else { channels }).ok()?;
+    for p in src.chunks_exact(4) {
+        if T::PACKED_BYTE {
+            packed.push(((p[1].units() as u32) << 24) | ((p[2].units() as u32) << 16) | ((p[3].units() as u32) << 8) | p[0].units() as u32);
+        } else {
+            packed.extend([p[1].units().to_bits(),p[2].units().to_bits(),p[3].units().to_bits(),p[0].units().to_bits()]);
+        }
+    }
+    Some(packed)
 }
 
-fn unpack_argb(packed: &[u32], dst: &mut [u8]) {
-    for (i, &p) in packed.iter().enumerate() {
-        let o = i * 4;
-        dst[o] = (p & 0xFF) as u8;
-        dst[o + 1] = ((p >> 24) & 0xFF) as u8;
-        dst[o + 2] = ((p >> 16) & 0xFF) as u8;
-        dst[o + 3] = ((p >> 8) & 0xFF) as u8;
+struct UnmapOnDrop<'a>(&'a Buffer);
+impl Drop for UnmapOnDrop<'_> {
+    fn drop(&mut self) { self.0.unmap(); }
+}
+
+fn decode_readback<T: Channel>(bytes: &[u8], pixels: usize) -> Option<Vec<T>> {
+    let pixel_bytes = if T::PACKED_BYTE { 4 } else { 16 };
+    if bytes.len() != pixels.checked_mul(pixel_bytes)? { return None; }
+    let channels = pixels.checked_mul(4)?;
+    let mut result = Vec::new();
+    result.try_reserve_exact(channels).ok()?;
+    result.resize(channels,T::default());
+    for (src,dst) in bytes.chunks_exact(pixel_bytes).zip(result.chunks_exact_mut(4)) {
+        if T::PACKED_BYTE {
+            let p = u32::from_ne_bytes(src.try_into().ok()?);
+            for (d,shift) in [0,24,16,8].into_iter().enumerate() {
+                dst[d] = T::from_units(((p >> shift) & 255) as f32);
+            }
+        } else {
+            for (d,s) in [3usize,0,1,2].into_iter().enumerate() {
+                dst[d] = T::from_units(f32::from_ne_bytes(src[s*4..s*4+4].try_into().ok()?));
+            }
+        }
     }
+    Some(result)
 }
 
 fn normalize(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
@@ -595,9 +635,92 @@ mod tests {
     use super::*;
 
     #[test]
+    fn readback_decodes_native_channels_and_rejects_wrong_lengths() {
+        let byte: Vec<u8> = (0..=255).collect();
+        assert_eq!(decode_readback::<u8>(as_bytes_slice(&pack_argb(&byte,64).unwrap()),64).unwrap(),byte);
+        let deep: Vec<u16> = (0..=32768).flat_map(|v|[32768,v,32768-v,1]).collect();
+        assert_eq!(decode_readback::<u16>(as_bytes_slice(&pack_argb(&deep,32769).unwrap()),32769).unwrap(),deep);
+        let hdr = [0.5f32,-0.25,4.125,0.50001];
+        let actual = decode_readback::<f32>(as_bytes_slice(&pack_argb(&hdr,1).unwrap()),1).unwrap();
+        for (a,b) in actual.iter().zip(hdr) { assert!((a-b).abs()<1e-6); }
+        for len in [0,1,3,5,15,17] {
+            assert!(decode_readback::<f32>(&vec![0;len],1).is_none());
+            if len!=4 { assert!(decode_readback::<u8>(&vec![0;len],1).is_none()); }
+        }
+        assert!(decode_readback::<f32>(&[],usize::MAX).is_none());
+        assert!(decode_readback::<u8>(&[],0).unwrap().is_empty());
+        assert!(pack_argb::<u8>(&[],usize::MAX).is_none());
+        assert!(pack_argb::<u16>(&[0;3],1).is_none());
+        assert!(pack_argb::<f32>(&[0.0;5],1).is_none());
+        assert!(pack_argb::<u8>(&[],0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn retained_gpu_buffers_obey_byte_and_worker_limits() {
+        let mut gpu = GpuProcessor::new().expect("actual GPU required");
+        // A 5x3 float state plus a 3x2 state exceeds this limit even when
+        // the two-entry limit alone would permit both.
+        gpu.cache_budget=2500;
+        gpu.cache_entries=2;
+        let rp = RefractParams { samples:1,coverage_source:3,saturation:1.0,
+            ior_r:1.5,ior_g:1.5,ior_b:1.5,base_ior:1.5,
+            fresnel_power:2.0,mix:0.0,output_mode:1,..Default::default() };
+        std::thread::scope(|scope| {
+            for index in 0..12 {
+                let gpu=&gpu;
+                let rp=&rp;
+                scope.spawn(move || {
+                    let (w,h) = [(3,2),(5,3),(1,1)][index%3];
+                    let source = [0.5f32,-0.25,2.0,0.125].repeat(w*h);
+                    assert_eq!(gpu.process(rp,&source,&source,&source,w,h).unwrap(),source);
+                    let state = gpu.state.read();
+                    assert!(state.len()<=2);
+                    let mut total=0;
+                    for s in state.values() {
+                        let actual = [&s.source_buf,&s.mask_buf,&s.bg_buf,&s.output_buf,&s.staging_buf,
+                            &s.height_a,&s.height_b,&s.mask_a,&s.comp_mask,&s.tmp_plane,
+                            &s.rgb_a,&s.rgb_b,&s.params_buf].iter().map(|b|b.size()).sum::<u64>();
+                        assert_eq!(Some(actual),buffer_bytes(s.width,s.height,s.packed_byte));
+                        total+=actual;
+                    }
+                    assert!(total<=gpu.cache_budget);
+                }).join().unwrap();
+            }
+        });
+        let retained=gpu.state.read().len();
+        assert!(gpu.get_state(4000,4000,false).is_none());
+        assert_eq!(gpu.state.read().len(),retained);
+        assert!(buffer_bytes(u32::MAX,u32::MAX,false).is_none());
+    }
+
+    #[test]
+    fn native_gpu_precision_and_format_switching() {
+        let gpu = GpuProcessor::new().expect("actual GPU required");
+        let mut rp = RefractParams { samples: 1, coverage_source: 3, saturation: 1.0,
+            ior_r: 1.5, ior_g: 1.5, ior_b: 1.5, base_ior: 1.5,
+            fresnel_power: 2.0, mix: 0.0, output_mode: 1, ..Default::default() };
+        let codes: Vec<u16> = (0..=32768).flat_map(|v| [32768,v,v,v]).collect();
+        assert_eq!(gpu.process(&rp,&codes,&codes,&codes,32769,1).unwrap(),codes);
+        for (w,h) in [(13,7),(1,1),(17,31),(13,7)] {
+            let src: Vec<f32> = (0..w*h).flat_map(|_| [0.375,-0.25,4.125,0.50001]).collect();
+            let actual = gpu.process(&rp,&src,&src,&src,w,h).unwrap();
+            for (a,b) in actual.iter().zip(&src) { assert!((a-b).abs() < 1e-6); }
+            let bytes: Vec<u8> = (0..w*h).flat_map(|i| [255,(i%256) as u8,127,3]).collect();
+            assert_eq!(gpu.process(&rp,&bytes,&bytes,&bytes,w,h).unwrap(),bytes);
+        }
+        // Exercise the effect, not just mix=0. Flat normals sample each native
+        // background value without displacement; affected blur keeps low bits.
+        rp.mix=1.0;
+        rp.affected_blur=2.0;
+        let deep: Vec<u16> = (0..15).flat_map(|_| [32768,16385,16387,1]).collect();
+        let actual = gpu.process(&rp,&deep,&deep,&deep,5,3).unwrap();
+        for (a,b) in actual.iter().zip(&deep) { assert!(a.abs_diff(*b) <= 1, "{a} != {b}"); }
+    }
+
+    #[test]
     fn wgpu_backend_renders_smoke_frame() {
         let gpu = GpuProcessor::new().expect("wgpu processor should initialize");
-        let rp = RefractParams {
+        let mut rp = RefractParams {
             ior_r: 1.15,
             ior_g: 1.18,
             ior_b: 1.22,
@@ -661,5 +784,50 @@ mod tests {
             .process(&rp, &src, &mask, &src, w, h)
             .expect("wgpu render should return a frame");
         assert_eq!(out.len(), src.len());
+        // Same-size A/B/A replay: a new processor provides a cold-state
+        // reference, so persistent buffers/uniforms cannot validate themselves.
+        for (index, mode) in [1,3,4,5].into_iter().enumerate() {
+            let mut changed_source = src.clone();
+            let mut changed_mask = mask.clone();
+            let mut changed_background = src.clone();
+            for pixel in 0..w*h {
+                let offset = pixel*4;
+                changed_source[offset+1] = ((pixel*13+index*7)%256) as u8;
+                changed_source[offset+2] = ((pixel*3+71)%256) as u8;
+                let coverage = if (pixel/w+pixel%w)%3==0 { 64 } else { 255 };
+                changed_mask[offset..offset+4].fill(coverage);
+                changed_background[offset+1] = ((pixel*5+37)%256) as u8;
+                changed_background[offset+3] = ((pixel*17+9)%256) as u8;
+            }
+            rp.output_mode=mode;
+            rp.map_blur=1.5;
+            rp.bg_blur=2.0;
+            rp.affected_blur=1.0;
+            rp.brightness=0.1;
+            rp.mix=0.625;
+            let changed = gpu.process(&rp,&changed_source,&changed_mask,&changed_background,w,h).unwrap();
+            let cold = GpuProcessor::new().expect("cold GPU reference required");
+            let expected = cold.process(&rp,&changed_source,&changed_mask,&changed_background,w,h).unwrap();
+            assert_eq!(changed,expected,"warm/cold mismatch in output mode {mode}");
+            assert_ne!(changed,out,"state-change fixture must discriminate mode {mode}");
+            rp.output_mode=1;
+            rp.map_blur=0.0;
+            rp.bg_blur=0.0;
+            rp.affected_blur=0.0;
+            rp.brightness=0.0;
+            rp.mix=1.0;
+            let restored = gpu.process(&rp,&src,&mask,&src,w,h).unwrap();
+            assert_eq!(restored,out,"baseline not restored after mode {mode}");
+        }
+        // Exercise readback contents and same-device buffer resizing, not just
+        // allocation length. Zero effect must preserve every input channel.
+        rp.mix = 0.0;
+        for (rw, rh) in [(16, 16), (13, 7), (1, 1), (16, 16)] {
+            let input = &src[..rw * rh * 4];
+            let coverage = &mask[..rw * rh * 4];
+            let identity = gpu.process(&rp, input, coverage, input, rw, rh)
+                .expect("wgpu resized identity render should return a frame");
+            assert_eq!(identity, input, "GPU zero-mix identity at {rw}x{rh}");
+        }
     }
 }

@@ -4,6 +4,7 @@ mod glow;
 mod blend;
 mod colormap;
 mod gpu;
+mod pixels;
 
 use std::sync::OnceLock;
 
@@ -244,10 +245,9 @@ impl AdobePluginGlobal for Plugin {
 
             ae::Command::Render { in_layer, mut out_layer } => {
                 let ep = get_params(params)?;
-                let (original, w, h) = layer_to_flat(&in_layer);
-                let luma_map = get_map_layer_luma(params, &in_data, w, h, ep.invert_map);
-                let result = render_with_params(&ep, &original, w, h, luma_map.as_deref());
-                flat_to_layer(&result, &mut out_layer, w, h);
+                let (w, h) = (in_layer.width(), in_layer.height());
+                let luma_map = get_map_layer_luma(params, &in_data, w, h, ep.invert_map)?;
+                render_layers(&ep, &in_layer, &mut out_layer, luma_map.as_deref())?;
             }
 
             ae::Command::SmartPreRender { mut extra } => {
@@ -270,6 +270,7 @@ impl AdobePluginGlobal for Plugin {
 
 // ---- Parameters ----
 
+#[cfg_attr(test, derive(Default))]
 pub struct EffectParams {
     pub input_channel: i32,
     pub glow_shape: i32,
@@ -343,62 +344,54 @@ fn get_params(params: &ae::Parameters<Params>) -> Result<EffectParams, ae::Error
 
 // ---- Pixel buffer helpers ----
 
-fn layer_to_flat(layer: &ae::Layer) -> (Vec<u8>, usize, usize) {
-    let w = layer.width() as usize;
-    let h = layer.height() as usize;
-    let stride = layer.buffer_stride();
-    let buf = layer.buffer();
-    let mut flat = vec![0u8; w * h * 4];
+fn map_luma<T: pixels::Channel>(layer: &ae::Layer, w: usize, h: usize, invert: bool) -> Result<Vec<f64>, ae::Error> {
+    let (flat, mw, mh) = pixels::read::<T>(layer)?;
+    let count = w.checked_mul(h).ok_or(ae::Error::BadCallbackParameter)?;
+    if w == 0 || h == 0 { return Err(ae::Error::BadCallbackParameter); }
+    let mut map = glow::filled::<f64>(count)?;
     for y in 0..h {
-        let src_off = y * stride;
-        let dst_off = y * w * 4;
-        let row_len = w * 4;
-        if src_off + row_len <= buf.len() && dst_off + row_len <= flat.len() {
-            flat[dst_off..dst_off + row_len].copy_from_slice(&buf[src_off..src_off + row_len]);
-        }
-    }
-    (flat, w, h)
-}
-
-fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
-    let stride = layer.buffer_stride();
-    let buf = layer.buffer_mut();
-    for y in 0..h {
-        let src_off = y * w * 4;
-        let dst_off = y * stride;
-        let row_len = w * 4;
-        if src_off + row_len <= flat.len() && dst_off + row_len <= buf.len() {
-            buf[dst_off..dst_off + row_len].copy_from_slice(&flat[src_off..src_off + row_len]);
-        }
-    }
-}
-
-fn build_luminance_map(buf: &[u8], w: usize, h: usize, invert: bool) -> Vec<f64> {
-    let mut map = vec![0.0f64; w * h];
-    for i in 0..(w * h) {
-        let off = i * 4;
-        let r = buf[off + 1] as f64;
-        let g = buf[off + 2] as f64;
-        let b = buf[off + 3] as f64;
-        let luma = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
-        map[i] = if invert { 1.0 - luma } else { luma };
-    }
-    map
-}
-
-fn build_luminance_map_resample(
-    buf: &[u8], mw: usize, mh: usize, w: usize, h: usize, invert: bool,
-) -> Vec<f64> {
-    let src_map = build_luminance_map(buf, mw, mh, invert);
-    let mut map = vec![0.0f64; w * h];
-    for y in 0..h {
-        let sy = (y * mh / h).min(mh - 1);
+        let sy = ((y as u128 * mh as u128 / h as u128) as usize).min(mh - 1);
         for x in 0..w {
-            let sx = (x * mw / w).min(mw - 1);
-            map[y * w + x] = src_map[sy * mw + sx];
+            let sx = ((x as u128 * mw as u128 / w as u128) as usize).min(mw - 1);
+            let p = &flat[(sy * mw + sx) * 4..];
+            let luma = 0.2126 * p[1].normalized() + 0.7152 * p[2].normalized() + 0.0722 * p[3].normalized();
+            map[y * w + x] = if invert { 1.0 - luma } else { luma };
         }
     }
-    map
+    Ok(map)
+}
+
+fn layer_luma(layer: &ae::Layer, w: usize, h: usize, invert: bool) -> Result<Vec<f64>, ae::Error> {
+    match pixels::channel_bytes(layer)? {
+        1 => map_luma::<u8>(layer, w, h, invert),
+        2 => map_luma::<u16>(layer, w, h, invert),
+        4 => map_luma::<f32>(layer, w, h, invert),
+        _ => Err(ae::Error::BadCallbackParameter),
+    }
+}
+
+fn decode_optional_map<T, U>(map: Result<Option<T>, ae::Error>,
+    decode: impl FnOnce(T) -> Result<U, ae::Error>) -> Result<Option<U>, ae::Error> {
+    map?.map(decode).transpose()
+}
+
+#[test]
+fn absent_map_and_failed_map_are_distinct() {
+    use std::cell::Cell;
+    let calls = Cell::new(0);
+    for (input, expected) in [
+        (Ok(None), Ok(None)),
+        (Err(ae::Error::Generic), Err(ae::Error::Generic)),
+        (Ok(Some(1)), Ok(Some(7))),
+        (Ok(Some(2)), Err(ae::Error::OutOfMemory)),
+    ] {
+        let result = decode_optional_map(input, |value| {
+            calls.set(calls.get()+1);
+            if value == 1 { Ok(7) } else { Err(ae::Error::OutOfMemory) }
+        });
+        assert_eq!(result, expected);
+    }
+    assert_eq!(calls.get(), 2);
 }
 
 /// Read the map layer via legacy checkout
@@ -407,27 +400,32 @@ fn get_map_layer_luma(
     in_data: &ae::InData,
     w: usize, h: usize,
     invert: bool,
-) -> Option<Vec<f64>> {
+) -> Result<Option<Vec<f64>>, ae::Error> {
     let checkout = params.checkout_at(
         Params::MapLayer,
         Some(in_data.current_time()),
         None, None,
-    ).ok()?;
-    let layer_def = checkout.as_layer().ok()?;
-    let layer = layer_def.value()?;
-    let (flat, mw, mh) = layer_to_flat(&layer);
-    if mw == w && mh == h {
-        Some(build_luminance_map(&flat, w, h, invert))
-    } else {
-        Some(build_luminance_map_resample(&flat, mw, mh, w, h, invert))
-    }
+    )?;
+    let layer_def = checkout.as_layer()?;
+    decode_optional_map(Ok(layer_def.value()), |layer| layer_luma(&layer, w, h, invert))
 }
 
 // ---- SmartFX PreRender ----
 
-// Parameter index for MapLayer (1-based: input=0, InputChannel=1, ..., MapLayer=28)
+// Parameter index for MapLayer (input=0; includes all preceding controls).
 const MAP_PARAM_INDEX: i32 = 31;
 const MAP_CHECKOUT_ID: i32 = 1;
+
+fn has_pixels(rect: ae::Rect) -> bool {
+    rect.right > rect.left && rect.bottom > rect.top
+}
+
+#[test]
+fn absent_map_is_not_a_black_control_image() {
+    assert!(!has_pixels(ae::Rect { left: 0, top: 0, right: 0, bottom: 0 }));
+    assert!(!has_pixels(ae::Rect { left: 5, top: 0, right: 5, bottom: 20 }));
+    assert!(has_pixels(ae::Rect { left: -5, top: 0, right: 5, bottom: 20 }));
+}
 
 fn smart_pre_render(
     in_data: &ae::InData,
@@ -451,27 +449,80 @@ fn smart_pre_render(
     extra.set_max_result_rect(req_rect);
 
     // Checkout map layer
-    let _ = cb.checkout_layer(
+    let map_has_pixels = cb.checkout_layer(
         MAP_PARAM_INDEX, MAP_CHECKOUT_ID,
         &req,
         in_data.current_time(),
         in_data.time_step(),
         in_data.time_scale(),
-    );
-
+    ).map(|r| has_pixels(r.result_rect.into()))?;
+    extra.set_pre_render_data(map_has_pixels);
     Ok(())
 }
 
 // ---- Render ----
 
-fn render_with_params(
-    ep: &EffectParams, original: &[u8], w: usize, h: usize,
+fn render_with_params<T: glow::Channel>(
+    ep: &EffectParams, original: &[T], w: usize, h: usize,
     luma_map: Option<&[f64]>,
-) -> Vec<u8> {
+) -> Result<Vec<T>, ae::Error> {
     if let Some(gpu) = get_gpu() {
-        gpu.process(ep, original, w, h, luma_map)
-    } else {
-        glow::process(ep, original, w, h, luma_map)
+        if let Ok(result) = gpu.process_channels(ep, original, w, h, luma_map) { return Ok(result); }
+    }
+    glow::process_channels(ep, original, w, h, luma_map)
+}
+
+fn render_typed<T: pixels::Channel + glow::Channel>(ep: &EffectParams, input: &ae::Layer, output: &mut ae::Layer, map: Option<&[f64]>) -> Result<(), ae::Error> {
+    let (original, w, h) = pixels::read::<T>(input)?;
+    let result = render_with_params(ep, &original, w, h, map)?;
+    pixels::write(&result, output, w, h)
+}
+
+fn render_layers(ep: &EffectParams, input: &ae::Layer, output: &mut ae::Layer, map: Option<&[f64]>) -> Result<(), ae::Error> {
+    match pixels::channel_bytes(input)? {
+        1 => render_typed::<u8>(ep, input, output, map),
+        2 => render_typed::<u16>(ep, input, output, map),
+        4 => render_typed::<f32>(ep, input, output, map),
+        _ => Err(ae::Error::BadCallbackParameter),
+    }
+}
+
+fn with_pixel_checkin<T>(work: impl FnOnce() -> Result<T, ae::Error>,
+    checkin: impl FnOnce() -> Result<(), ae::Error>) -> Result<T, ae::Error> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+    let cleanup = checkin();
+    match result {
+        Ok(Ok(value)) => cleanup.map(|()| value),
+        Ok(Err(error)) => Err(error),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[test]
+fn pixel_checkin_preserves_errors_and_unwinds_in_reverse_order() {
+    use std::cell::RefCell;
+    for fail_work in [false, true] {
+        for fail_cleanup in [false, true] {
+            let calls = RefCell::new(Vec::new());
+            let result = with_pixel_checkin(|| with_pixel_checkin(
+                || if fail_work { Err(ae::Error::OutOfMemory) } else { Ok(7) },
+                || { calls.borrow_mut().push(1); if fail_cleanup { Err(ae::Error::BadCallbackParameter) } else { Ok(()) } }),
+                || { calls.borrow_mut().push(0); Ok(()) });
+            assert_eq!(*calls.borrow(), vec![1, 0]);
+            assert_eq!(result, if fail_work { Err(ae::Error::OutOfMemory) }
+                else if fail_cleanup { Err(ae::Error::BadCallbackParameter) } else { Ok(7) });
+        }
+    }
+    for fail_cleanup in [false, true] {
+        let calls = RefCell::new(Vec::new());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _: Result<(), ae::Error> = with_pixel_checkin(|| with_pixel_checkin(
+                || panic!("render sentinel"),
+                || { calls.borrow_mut().push(1); if fail_cleanup { Err(ae::Error::Generic) } else { Ok(()) } }),
+                || { calls.borrow_mut().push(0); Ok(()) });
+        })).unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"render sentinel"));
+        assert_eq!(*calls.borrow(), vec![1, 0]);
     }
 }
 
@@ -485,26 +536,15 @@ fn smart_render(
 
     let input_world = cb.checkout_layer_pixels(0)?
         .ok_or(ae::Error::Generic)?;
-    let mut output_world = cb.checkout_output()?
-        .ok_or(ae::Error::Generic)?;
-
-    let (original, w, h) = layer_to_flat(&input_world);
-
-    let luma_map = if let Ok(Some(map_world)) = cb.checkout_layer_pixels(MAP_CHECKOUT_ID as u32) {
-        let (map_flat, mw, mh) = layer_to_flat(&map_world);
-        if mw == w && mh == h {
-            Some(build_luminance_map(&map_flat, w, h, ep.invert_map))
-        } else {
-            Some(build_luminance_map_resample(&map_flat, mw, mh, w, h, ep.invert_map))
-        }
-    } else {
-        None
-    };
-
-    let result = render_with_params(&ep, &original, w, h, luma_map.as_deref());
-    flat_to_layer(&result, &mut output_world, w, h);
-
-    cb.checkin_layer_pixels(0)?;
-    let _ = cb.checkin_layer_pixels(MAP_CHECKOUT_ID as u32);
-    Ok(())
+    with_pixel_checkin(|| {
+        let mut output_world = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
+        let (w, h) = (input_world.width(), input_world.height());
+        let map_world = if extra.pre_render_data::<bool>().copied().unwrap_or(false) {
+            cb.checkout_layer_pixels(MAP_CHECKOUT_ID as u32)?
+        } else { None };
+        with_pixel_checkin(|| {
+            let luma_map = map_world.as_ref().map(|map| layer_luma(map, w, h, ep.invert_map)).transpose()?;
+            render_layers(&ep, &input_world, &mut output_world, luma_map.as_deref())
+        }, || if map_world.is_some() { cb.checkin_layer_pixels(MAP_CHECKOUT_ID as u32) } else { Ok(()) })
+    }, || cb.checkin_layer_pixels(0))
 }

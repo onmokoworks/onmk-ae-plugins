@@ -1,0 +1,17 @@
+{
+  "plugin_sha256": "8bb7f71278238ed9a67b04c2024d54a42c71d9f5c1bfc2c320ac06dc64f9e625",
+  "harness_sha256": "21a3ae3a1ff9ee040f81170407ac5752d5ee0be1585212d2abea45b750a4cb73",
+  "cases": [
+    {
+      "name": "short-2",
+      "route": "smart32",
+      "alpha_sum": 10994.45211103432
+    },
+    {
+      "name": "short-3",
+      "route": "smart32",
+      "alpha_sum": 10994.452481621229
+    }
+  ],
+  "cpu_gpu_max_abs_difference": 2.5272369384765625e-05
+}

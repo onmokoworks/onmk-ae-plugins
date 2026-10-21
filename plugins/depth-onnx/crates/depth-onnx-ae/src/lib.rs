@@ -108,7 +108,7 @@ impl AdobePluginGlobal for Plugin {
     fn handle_command(
         &mut self,
         cmd: ae::Command,
-        _: ae::InData,
+        in_data: ae::InData,
         mut out_data: ae::OutData,
         _: &mut ae::Parameters<Params>,
     ) -> Result<(), ae::Error> {
@@ -130,6 +130,10 @@ impl AdobePluginGlobal for Plugin {
                     true,
                 );
             }
+            ae::Command::SequenceSetdown => {
+                SMOOTHING.remove(in_data.effect_ref().as_ptr() as u64);
+            }
+            ae::Command::GlobalSetdown => SMOOTHING.clear(),
             ae::Command::QueryDynamicFlags => {}
             _ => {}
         }
@@ -198,6 +202,7 @@ impl AdobePluginInstance for Instance {
                     return Ok(());
                 };
 
+                return with_checkin(|| {
                 let model_popup = plugin.params.get(Params::Model)?.as_popup()?.value();
                 let custom_path = plugin
                     .sequence
@@ -214,18 +219,11 @@ impl AdobePluginInstance for Instance {
                     .value() as f32;
 
                 let Some(mut output_world) = cb.checkout_output()? else {
-                    cb.checkin_layer_pixels(0)?;
                     return Ok(());
                 };
 
-                let rgba = match render::world_to_float_rgba(&input_world) {
-                    Some(buf) => buf,
-                    None => {
-                        output_world.copy_from(&input_world, None, None)?;
-                        cb.checkin_layer_pixels(0)?;
-                        return Ok(());
-                    }
-                };
+                // Malformed worlds and allocation failures are errors, not successful passthrough.
+                let rgba = render::world_to_float_rgba(&input_world)?;
 
                 let bundled = CATALOG.lock().bundled_models.clone();
                 let (model_dir, manifest, model_error) =
@@ -233,8 +231,7 @@ impl AdobePluginInstance for Instance {
 
                 if let Some(error) = model_error {
                     show_user_error(&mut plugin.out_data, &error);
-                    cb.checkin_layer_pixels(0)?;
-                    return Ok(());
+                    return output_world.copy_from(&input_world, None, None);
                 }
 
                 let (model_dir, manifest) = (model_dir.unwrap(), manifest.unwrap());
@@ -242,8 +239,7 @@ impl AdobePluginInstance for Instance {
                     Ok(guard) => guard,
                     Err(err) => {
                         show_user_error(&mut plugin.out_data, &err);
-                        cb.checkin_layer_pixels(0)?;
-                        return Ok(());
+                        return output_world.copy_from(&input_world, None, None);
                     }
                 };
                 engine.configure(model_dir, manifest);
@@ -256,9 +252,9 @@ impl AdobePluginInstance for Instance {
                 };
                 match engine.run(request) {
                     Ok(mut result) => {
-                        normalize_depth(&mut result.depth, result.d_min, result.d_max);
+                        normalize_depth(&mut result.depth, result.d_min, result.d_max)?;
                         let cache_key = in_data.effect_ref().as_ptr() as u64;
-                        SMOOTHING.blend(cache_key, resolution.size(), &mut result.depth, smoothing);
+                        SMOOTHING.blend(cache_key, resolution.size(), &mut result.depth, smoothing)?;
                         render::write_depth_to_world(
                             &mut output_world,
                             &result.depth,
@@ -268,10 +264,12 @@ impl AdobePluginInstance for Instance {
                     }
                     Err(err) => {
                         show_user_error(&mut plugin.out_data, &err.to_string());
+                        output_world.copy_from(&input_world, None, None)?;
                     }
                 }
 
-                cb.checkin_layer_pixels(0)?;
+                Ok(())
+                }, || cb.checkin_layer_pixels(0));
             }
             ae::Command::UserChangedParam { param_index } => {
                 if plugin.params.type_at(param_index) == Params::BrowseModel {
@@ -301,6 +299,104 @@ impl AdobePluginInstance for Instance {
     }
 }
 
+// Always release a successfully checked-out input, including early returns and
+// fallible parameter/output operations. Preserve the render error if both fail.
+fn with_checkin<E>(render: impl FnOnce() -> Result<(), E>, checkin: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(render));
+    let cleanup = checkin();
+    match result {
+        Ok(result) => result.and(cleanup),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[cfg(test)]
+mod checkout_tests {
+    use super::with_checkin;
+    use std::cell::Cell;
+
+    #[test]
+    fn missing_model_notification_and_fallback_cleanup_contract() {
+        // Direct adapter contract: no runtime/model installation or host inference claim.
+        let (directory, manifest, error) = super::resolve_model_selection(1, "", &[]);
+        assert!(directory.is_none() && manifest.is_none());
+        let error = error.expect("missing catalog must explain failure");
+        assert!(error.contains("no models found"));
+        for copy_fails in [false, true] {
+            for checkin_fails in [false, true] {
+                let mut raw: super::ae::sys::PF_OutData = unsafe { std::mem::zeroed() };
+                let mut out = super::ae::OutData::from_raw(&mut raw);
+                let order = std::cell::RefCell::new(Vec::new());
+                let source = [32768u16, 16385, 16387, 1];
+                let mut destination = [0u16; 4];
+                let result = with_checkin(|| {
+                    super::show_user_error(&mut out, &error);
+                    order.borrow_mut().push("copy");
+                    if copy_fails { Err("copy") } else { destination.copy_from_slice(&source); Ok(()) }
+                }, || {
+                    order.borrow_mut().push("checkin");
+                    if checkin_fails { Err("checkin") } else { Ok(()) }
+                });
+                assert_eq!(*order.borrow(), ["copy", "checkin"]);
+                assert_eq!(result, if copy_fails { Err("copy") } else if checkin_fails { Err("checkin") } else { Ok(()) });
+                if !copy_fails { assert_eq!(destination, source); }
+                let bytes: Vec<u8> = raw.return_msg.iter().map(|&v|v as u8).collect();
+                let end = bytes.iter().position(|&v|v==0).unwrap();
+                assert_eq!(std::str::from_utf8(&bytes[..end]).unwrap(), format!("{}{}",super::USER_ERROR_PREFIX,error));
+                assert_ne!(raw.out_flags & super::ae::sys::PF_OutFlag_DISPLAY_ERROR_MESSAGE as i32,0);
+            }
+        }
+    }
+
+    #[test]
+    fn user_error_is_bounded_terminated_and_preserves_utf8() {
+        for message in ["missing model".to_owned(), "x".repeat(600), "モデル😀".repeat(100), "bad\0path".to_owned()] {
+            let mut raw: super::ae::sys::PF_OutData = unsafe { std::mem::zeroed() };
+            raw.return_msg.fill(88);
+            let mut out = super::ae::OutData::from_raw(&mut raw);
+            super::show_user_error(&mut out, &message);
+            let bytes: Vec<u8> = raw.return_msg.iter().map(|&v| v as u8).collect();
+            let end = bytes.iter().position(|&v| v == 0).expect("terminated message");
+            assert!(end <= 255);
+            let text = std::str::from_utf8(&bytes[..end]).unwrap();
+            assert!(text.starts_with(super::USER_ERROR_PREFIX));
+            assert!(bytes[end..].iter().all(|&v| v == 0));
+            assert_ne!(raw.out_flags & super::ae::sys::PF_OutFlag_DISPLAY_ERROR_MESSAGE as i32, 0);
+            if message == "missing model" { assert_eq!(text, "Depth ONNX: missing model"); }
+        }
+    }
+
+    #[test]
+    fn checked_out_input_is_released_before_panic_propagates() {
+        let calls = Cell::new(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_checkin::<&str>(|| panic!("render panic"), || {
+                calls.set(calls.get() + 1);
+                Err("cleanup")
+            })
+        }));
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1);
+        let payload = result.unwrap_err();
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"render panic"));
+    }
+
+    #[test]
+    fn checked_out_input_is_released_once_on_all_result_paths() {
+        for render_result in [Ok(()), Err("render")] {
+            for cleanup_result in [Ok(()), Err("cleanup")] {
+                let calls = Cell::new(0);
+                let result = with_checkin(|| render_result, || {
+                    calls.set(calls.get() + 1);
+                    cleanup_result
+                });
+                assert_eq!(calls.get(), 1);
+                assert_eq!(result, render_result.and(cleanup_result));
+            }
+        }
+    }
+}
+
 fn engine() -> Result<parking_lot::MutexGuard<'static, DepthEngine>, String> {
     let slot = ENGINE.get_or_init(|| {
         DepthEngine::new()
@@ -313,14 +409,60 @@ fn engine() -> Result<parking_lot::MutexGuard<'static, DepthEngine>, String> {
     }
 }
 
-fn normalize_depth(depth: &mut [f32], lo: f32, hi: f32) {
-    let scale = if hi > lo { 1.0 / (hi - lo) } else { 0.0 };
-    for v in depth.iter_mut() {
-        *v = (*v - lo) * scale;
+#[test]
+fn finite_depth_extremes_normalize_without_nan_or_infinity() {
+    for (lo,mid,hi) in [(-f32::MAX,0.0,f32::MAX),(0.0,f32::from_bits(1),f32::from_bits(2))] {
+        let mut values=[lo,mid,hi];
+        normalize_depth(&mut values,lo,hi).unwrap();
+        assert_eq!(values,[0.0,0.5,1.0]);
     }
 }
 
+#[test]
+fn depth_normalization_preserves_normal_math_and_rejects_invalid_results() {
+    for (lo,hi) in [(0.0,1.0),(-2.0,7.0),(0.125,0.375),(3.0,3.0)] {
+        let mut values:Vec<f32>=(0..31).map(|i|lo+(hi-lo)*i as f32/30.0).collect();
+        let scale=if hi>lo {1.0/(hi-lo)}else{0.0};
+        let expected:Vec<f32>=values.iter().map(|v|(*v-lo)*scale).collect();
+        normalize_depth(&mut values,lo,hi).unwrap();
+        assert_eq!(values,expected);
+    }
+    for (lo,hi,values) in [(1.0,0.0,vec![0.5]),(f32::NAN,1.0,vec![0.5]),
+        (0.0,f32::INFINITY,vec![0.5]),(0.0,1.0,vec![0.5,f32::NAN]),(0.0,1.0,vec![2.0])] {
+        let before:Vec<u32>=values.iter().map(|v|v.to_bits()).collect();
+        let mut actual=values;
+        assert!(normalize_depth(&mut actual,lo,hi).is_err());
+        assert_eq!(actual.iter().map(|v|v.to_bits()).collect::<Vec<_>>(),before);
+    }
+}
+
+fn normalize_depth(depth: &mut [f32], lo: f32, hi: f32) -> Result<(),ae::Error> {
+    if !lo.is_finite() || !hi.is_finite() || hi<lo
+        || depth.iter().any(|v|!v.is_finite() || *v<lo || *v>hi) {
+        return Err(ae::Error::BadCallbackParameter);
+    }
+    if hi==lo {depth.fill(0.0); return Ok(());}
+    let range=hi-lo;
+    let scale=1.0/range;
+    if range.is_finite() && scale.is_finite() {
+        for v in depth.iter_mut() { *v=(*v-lo)*scale; }
+    } else {
+        let range=hi as f64-lo as f64;
+        for v in depth.iter_mut() { *v=((*v as f64-lo as f64)/range) as f32; }
+    }
+    Ok(())
+}
+
 fn show_user_error(out_data: &mut ae::OutData, message: &str) {
-    out_data.set_return_msg(&format!("{USER_ERROR_PREFIX}{message}"));
+    // The SDK wrapper asserts at 256 bytes and does not append a terminator.
+    // Bound the message while building it; paths/runtime errors can be very long.
+    let mut bounded = String::with_capacity(255);
+    for ch in USER_ERROR_PREFIX.chars().chain(message.chars()) {
+        let ch = if ch == '\0' { ' ' } else { ch };
+        if bounded.len() + ch.len_utf8() > 255 { break; }
+        bounded.push(ch);
+    }
+    out_data.as_mut().return_msg.fill(0);
+    out_data.set_return_msg(&bounded);
     out_data.set_out_flag(ae::OutFlags::DisplayErrorMessage, true);
 }

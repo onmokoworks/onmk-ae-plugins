@@ -11,6 +11,9 @@ pub(crate) struct Runtime {
 }
 impl Runtime {
     pub fn render(&mut self, ep: &EffectParams, src: &[u8], w: usize, h: usize) -> Vec<u8> {
+        self.render_pixels(ep,src,w,h)
+    }
+    pub(crate) fn render_pixels<T: crate::pixel::Channel>(&mut self, ep: &EffectParams, src: &[T], w: usize, h: usize) -> Vec<T> {
         if w == 0 || h == 0 || w.checked_mul(h).and_then(|n| n.checked_mul(4)) != Some(src.len()) {
             return src.to_vec();
         }
@@ -30,9 +33,9 @@ impl Runtime {
             }
         }
         let result = if let Some(gpu) = &self.gpu {
-            gpu.process(ep, src, w, h)
+            gpu.process_pixels(ep, src, w, h)
         } else {
-            crate::flare::process(ep, src, w, h)
+            crate::flare::process_pixels(ep, src, w, h)
         };
         if self.gpu.as_ref().is_some_and(|g| !g.is_healthy()) {
             self.gpu.take();
@@ -46,6 +49,14 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn float_cpu_cooldown_fallback_preserves_sub_byte_values() {
+        let mut runtime=Runtime { retry_at:Some(Instant::now()+Duration::from_secs(30)), ..Default::default() };
+        let ep=EffectParams { style_preset:6, source_opacity:1.0,transfer_mode:4,global_scale:1.0, ..Default::default() };
+        let src=[1.0_f32,0.5000305,0.50006104,0.000030517578];
+        assert_eq!(runtime.render_pixels(&ep,&src,1,1),src);
+        assert!(runtime.gpu.is_none());
+    }
     #[test]
     #[ignore = "real GPU destruction, CPU cooldown, reinitialization and idle cleanup"]
     fn runtime_device_recovery() {

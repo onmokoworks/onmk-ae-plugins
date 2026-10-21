@@ -2,6 +2,7 @@ use after_effects as ae;
 
 mod gpu;
 mod refract;
+mod pixels;
 
 // ---- Parameter IDs ----
 
@@ -691,6 +692,7 @@ impl AdobePluginGlobal for Plugin {
 
 // ---- Extract parameters ----
 
+#[cfg_attr(test, derive(Default))]
 pub struct RefractParams {
     pub ior_mode: i32,
     pub base_ior: f32,
@@ -846,35 +848,20 @@ fn get_params(params: &ae::Parameters<Params>) -> Result<RefractParams, ae::Erro
     })
 }
 
-// ---- Copy layer pixels to flat buffer (ARGB u8) ----
+// ---- Native-depth layer codecs ----
 
-fn layer_to_flat(layer: &ae::Layer) -> (Vec<u8>, usize, usize) {
-    let w = layer.width() as usize;
-    let h = layer.height() as usize;
-    let stride = layer.buffer_stride();
-    let buf = layer.buffer();
-    let mut flat = vec![0u8; w * h * 4];
-    for y in 0..h {
-        let src_off = y * stride;
-        let dst_off = y * w * 4;
-        let row_len = w * 4;
-        if src_off + row_len <= buf.len() && dst_off + row_len <= flat.len() {
-            flat[dst_off..dst_off + row_len].copy_from_slice(&buf[src_off..src_off + row_len]);
-        }
+fn read_aux<T: pixels::Channel + refract::Channel>(layer: &ae::Layer) -> Result<(Vec<T>,usize,usize),ae::Error> {
+    if pixels::channel_bytes(layer)? == T::BYTES { return pixels::read::<T>(layer); }
+    fn convert<S: pixels::Channel,T: refract::Channel>(layer: &ae::Layer) -> Result<(Vec<T>,usize,usize),ae::Error> {
+        let (src,w,h)=pixels::read::<S>(layer)?;
+        let mut converted = Vec::new();
+        converted.try_reserve_exact(src.len()).map_err(|_| ae::Error::OutOfMemory)?;
+        converted.extend(src.into_iter().map(|v| T::from_units((v.normalized()*255.0) as f32)));
+        Ok((converted,w,h))
     }
-    (flat, w, h)
-}
-
-fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
-    let stride = layer.buffer_stride();
-    let buf = layer.buffer_mut();
-    for y in 0..h {
-        let src_off = y * w * 4;
-        let dst_off = y * stride;
-        let row_len = w * 4;
-        if src_off + row_len <= flat.len() && dst_off + row_len <= buf.len() {
-            buf[dst_off..dst_off + row_len].copy_from_slice(&flat[src_off..src_off + row_len]);
-        }
+    match pixels::channel_bytes(layer)? {
+        1=>convert::<u8,T>(layer), 2=>convert::<u16,T>(layer), 4=>convert::<f32,T>(layer),
+        _=>Err(ae::Error::BadCallbackParameter),
     }
 }
 
@@ -882,72 +869,170 @@ fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
 /// WITHOUT stretching. The layer's pixels keep their 1:1 resolution and are
 /// blitted at (off_x, off_y) in the destination. This preserves the shape's
 /// comp-space position so that moving a shape layer moves its refraction.
-fn fit_layer_at_offset(
-    src: &[u8],
+fn fit_layer_at_offset<T: Copy + Default>(
+    src: &[T],
     sw: usize,
     sh: usize,
     dw: usize,
     dh: usize,
     off_x: isize,
     off_y: isize,
-) -> Vec<u8> {
-    let mut dst = vec![0u8; dw * dh * 4];
+) -> Result<Vec<T>, ae::Error> {
+    if sw.checked_mul(sh).and_then(|n|n.checked_mul(4)) != Some(src.len()) {
+        return Err(ae::Error::BadCallbackParameter);
+    }
+    let mut dst = empty_image::<T>(dw,dh)?;
     if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
-        return dst;
+        return Ok(dst);
     }
     if off_x == 0 && off_y == 0 && sw == dw && sh == dh {
         dst.copy_from_slice(src);
-        return dst;
+        return Ok(dst);
     }
     for sy in 0..sh {
-        let dy = sy as isize + off_y;
-        if dy < 0 || dy >= dh as isize {
+        let dy = sy as i128 + off_y as i128;
+        if dy < 0 || dy >= dh as i128 {
             continue;
         }
-        let sx_start = (-off_x).max(0) as usize;
-        let sx_end = ((dw as isize - off_x).min(sw as isize)).max(0) as usize;
+        let sx_start = (-(off_x as i128)).max(0) as usize;
+        let sx_end = ((dw as i128 - off_x as i128).min(sw as i128)).max(0) as usize;
         if sx_start >= sx_end {
             continue;
         }
-        let dx_start = (sx_start as isize + off_x) as usize;
+        let dx_start = (sx_start as i128 + off_x as i128) as usize;
         let row_len = (sx_end - sx_start) * 4;
         let si = (sy * sw + sx_start) * 4;
         let di = (dy as usize * dw + dx_start) * 4;
         dst[di..di + row_len].copy_from_slice(&src[si..si + row_len]);
     }
-    dst
+    Ok(dst)
+}
+
+fn empty_image<T: Copy + Default>(w: usize,h: usize) -> Result<Vec<T>,ae::Error> {
+    let count = w.checked_mul(h).and_then(|n|n.checked_mul(4)).ok_or(ae::Error::OutOfMemory)?;
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(count).map_err(|_|ae::Error::OutOfMemory)?;
+    pixels.resize(count,T::default());
+    Ok(pixels)
+}
+
+fn finish_auxiliary<T>(decoded: Result<T,ae::Error>, checkin: Result<(),ae::Error>) -> Result<T,ae::Error> {
+    let pixels = decoded?;
+    checkin?;
+    Ok(pixels)
+}
+
+// Preserve the original failure while always returning a successfully checked-out
+// world. Resume panics only after cleanup, for the plug-in's outer panic boundary.
+fn with_pixel_checkin<T>(work: impl FnOnce() -> Result<T,ae::Error>,
+    checkin: impl FnOnce() -> Result<(),ae::Error>) -> Result<T,ae::Error> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+    let cleanup = checkin();
+    match result {
+        Ok(decoded) => finish_auxiliary(decoded,cleanup),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+#[test]
+fn checked_out_pixels_are_returned_on_error_and_unwind() {
+    use std::cell::Cell;
+    for work_failure in [false,true] {
+        for cleanup_failure in [false,true] {
+            let calls=Cell::new(0);
+            let result=with_pixel_checkin(
+                || if work_failure {Err(ae::Error::OutOfMemory)} else {Ok(7)},
+                || {calls.set(calls.get()+1); if cleanup_failure {Err(ae::Error::BadCallbackParameter)} else {Ok(())}});
+            assert_eq!(calls.get(),1);
+            assert_eq!(result,if work_failure {Err(ae::Error::OutOfMemory)} else if cleanup_failure {Err(ae::Error::BadCallbackParameter)} else {Ok(7)});
+        }
+    }
+    for cleanup_failure in [false,true] {
+        let calls=Cell::new(0);
+        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_pixel_checkin::<()>(|| panic!("injected pixel failure"),
+                || {calls.set(calls.get()+1); if cleanup_failure {Err(ae::Error::BadCallbackParameter)} else {Ok(())}})
+        }));
+        assert_eq!(calls.get(),1);
+        assert_eq!(result.unwrap_err().downcast_ref::<&str>(),Some(&"injected pixel failure"));
+    }
+    let order=std::cell::RefCell::new(Vec::new());
+    let _=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_pixel_checkin::<()>(|| with_pixel_checkin(|| panic!("nested failure"),
+            || {order.borrow_mut().push("auxiliary"); Ok(())}),
+            || {order.borrow_mut().push("input"); Ok(())})
+    }));
+    assert_eq!(*order.borrow(),["auxiliary","input"]);
+}
+
+#[test]
+fn auxiliary_errors_and_invalid_geometry_are_not_missing_layers() {
+    assert_eq!(finish_auxiliary::<()>(Err(ae::Error::OutOfMemory),Err(ae::Error::BadCallbackParameter)),Err(ae::Error::OutOfMemory));
+    assert_eq!(finish_auxiliary(Ok(17),Err(ae::Error::BadCallbackParameter)),Err(ae::Error::BadCallbackParameter));
+    assert_eq!(finish_auxiliary(Ok(17),Ok(())),Ok(17));
+    assert_eq!(fit_layer_at_offset(&[0u16;3],1,1,1,1,0,0),Err(ae::Error::BadCallbackParameter));
+    assert_eq!(fit_layer_at_offset::<u8>(&[],usize::MAX,2,1,1,0,0),Err(ae::Error::BadCallbackParameter));
+    assert_eq!(empty_image::<f32>(usize::MAX,2),Err(ae::Error::OutOfMemory));
+    assert_eq!(empty_image::<f32>(usize::MAX/4,1),Err(ae::Error::OutOfMemory));
+    for offset in [isize::MIN,isize::MAX] {
+        assert_eq!(fit_layer_at_offset(&[255u8;8],1,2,1,1,offset,0).unwrap(),[0;4]);
+        assert_eq!(fit_layer_at_offset(&[255u8;8],1,2,1,1,0,offset).unwrap(),[0;4]);
+    }
 }
 
 // ---- Legacy Render path ----
 
-fn render_cpu(
+fn render_cpu(params: &ae::Parameters<Params>, in_data: &ae::InData, input: &ae::Layer, output: &mut ae::Layer) -> Result<(),ae::Error> {
+    match pixels::channel_bytes(input)? {
+        1=>render_typed::<u8>(params,in_data,input,output),
+        2=>render_typed::<u16>(params,in_data,input,output),
+        4=>render_typed::<f32>(params,in_data,input,output),
+        _=>Err(ae::Error::BadCallbackParameter),
+    }
+}
+
+fn smart_render_cpu(extra: &ae::pf::SmartRenderExtra, params: &ae::Parameters<Params>) -> Result<(),ae::Error> {
+    let cb=extra.callbacks();
+    let input=cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
+    with_pixel_checkin(|| {
+        let mut output=cb.checkout_output()?.ok_or(ae::Error::Generic)?;
+        match pixels::channel_bytes(&input)? {
+            1=>smart_render_typed::<u8>(extra,params,&input,&mut output),
+            2=>smart_render_typed::<u16>(extra,params,&input,&mut output),
+            4=>smart_render_typed::<f32>(extra,params,&input,&mut output),
+            _=>Err(ae::Error::BadCallbackParameter),
+        }
+    }, || cb.checkin_layer_pixels(0))
+}
+
+
+fn render_typed<T: pixels::Channel + refract::Channel>(
     params: &ae::Parameters<Params>,
     in_data: &ae::InData,
     in_layer: &ae::Layer,
     out_layer: &mut ae::Layer,
 ) -> Result<(), ae::Error> {
     let rp = get_params(params)?;
-    let (src, w, h) = layer_to_flat(in_layer);
+    let (src, w, h) = pixels::read::<T>(in_layer)?;
     let in_org = in_layer.origin();
     let (in_h, in_v) = (in_org.h as isize, in_org.v as isize);
-    let mask = get_layer_flat(params, Params::MaskLayer, in_data, w, h, in_h, in_v);
-    let bg = get_layer_flat(params, Params::BgLayer, in_data, w, h, in_h, in_v);
-    let result = dispatch_render(&rp, &src, mask.as_deref(), bg.as_deref(), w, h);
-    flat_to_layer(&result, out_layer, w, h);
-    Ok(())
+    let mask = get_layer_flat(params, Params::MaskLayer, in_data, w, h, in_h, in_v)?;
+    let bg = get_layer_flat(params, Params::BgLayer, in_data, w, h, in_h, in_v)?;
+    let result = dispatch_render(&rp, &src, mask.as_deref(), bg.as_deref(), w, h)?;
+    pixels::write(&result, out_layer, w, h)
 }
 
-/// Choose GPU or CPU backend based on the `use_gpu` param and CUDA availability.
-/// GPU failures silently fall back to CPU so a broken CUDA environment never
+/// Choose GPU or CPU backend based on the `use_gpu` param and wgpu availability.
+/// GPU failures fall back to CPU so an unavailable GPU environment never
 /// breaks rendering.
-fn dispatch_render(
+fn dispatch_render<T: refract::Channel>(
     rp: &RefractParams,
-    src: &[u8],
-    mask: Option<&[u8]>,
-    bg: Option<&[u8]>,
+    src: &[T],
+    mask: Option<&[T]>,
+    bg: Option<&[T]>,
     w: usize,
     h: usize,
-) -> Vec<u8> {
+) -> Result<Vec<T>,ae::Error> {
     // The Glass Edge distance transform, the Background Blur and the Map Blur are
     // CPU-only for now; fall back to the CPU renderer when any is active so GPU
     // and CPU stay visually consistent.
@@ -959,13 +1044,13 @@ fn dispatch_render(
         && gpu::available()
     {
         if let Some(result) = gpu::render(rp, src, mask, bg, w, h) {
-            return result;
+            return Ok(result);
         }
     }
     refract::render(rp, src, mask, bg, w, h)
 }
 
-fn get_layer_flat(
+fn get_layer_flat<T: pixels::Channel + refract::Channel>(
     params: &ae::Parameters<Params>,
     param_id: Params,
     in_data: &ae::InData,
@@ -973,15 +1058,15 @@ fn get_layer_flat(
     h: usize,
     in_h: isize,
     in_v: isize,
-) -> Option<Vec<u8>> {
+) -> Result<Option<Vec<T>>,ae::Error> {
     let checkout = params
         .checkout_at(param_id, Some(in_data.current_time()), None, None)
-        .ok()?;
-    let layer_def = checkout.as_layer().ok()?;
-    let layer = layer_def.value()?;
-    let (flat, lw, lh) = layer_to_flat(&layer);
+        ?;
+    let layer_def = checkout.as_layer()?;
+    let Some(layer) = layer_def.value() else {return Ok(None)};
+    let (flat, lw, lh) = read_aux::<T>(&layer)?;
     let origin = layer.origin();
-    Some(fit_layer_at_offset(
+    Ok(Some(fit_layer_at_offset(
         &flat,
         lw,
         lh,
@@ -989,7 +1074,7 @@ fn get_layer_flat(
         h,
         origin.h as isize - in_h,
         origin.v as isize - in_v,
-    ))
+    )?))
 }
 
 // ---- SmartFX PreRender ----
@@ -1002,6 +1087,62 @@ fn get_layer_flat(
 // retrieve the checked-out pixels again in SmartRender.
 const MASK_CHECKOUT_ID: i32 = 1;
 const BG_CHECKOUT_ID: i32 = 2;
+
+#[derive(Clone, Copy, Default)]
+struct AuxiliaryPixels {
+    mask: bool,
+    background: bool,
+}
+
+fn has_pixels(rect: ae::Rect) -> bool {
+    rect.right > rect.left && rect.bottom > rect.top
+}
+
+#[test]
+fn native_auxiliary_offsets_keep_low_bits_and_hdr() {
+    let src = [32768u16,16385,16387,1,32768,3,5,7];
+    let out = fit_layer_at_offset(&src,2,1,3,2,1,1).unwrap();
+    assert_eq!(&out[16..24],&src);
+    assert!(out[..16].iter().all(|&v|v==0));
+    let hdr = [1.0f32,-0.25,4.125,0.50001,1.0,2.0,3.0,4.0];
+    let clipped = fit_layer_at_offset(&hdr,2,1,1,1,-1,0).unwrap();
+    assert_eq!(clipped,&hdr[4..]);
+}
+
+#[test]
+fn auxiliary_offsets_match_destination_sampling_reference() {
+    fn compare<T: Copy + Default + PartialEq + std::fmt::Debug>(source: &[T]) {
+        let (sw,sh,dw,dh)=(7usize,5usize,9usize,7usize);
+        for ox in [-10isize,-7,-2,0,2,8,10] {
+            for oy in [-8isize,-5,-1,0,2,6,8] {
+                let actual=fit_layer_at_offset(source,sw,sh,dw,dh,ox,oy).unwrap();
+                // Independent destination-driven reference, not source-row clipping.
+                for y in 0..dh {
+                    for x in 0..dw {
+                        let (sx,sy)=(x as isize-ox,y as isize-oy);
+                        for c in 0..4 {
+                            let expected=if sx>=0 && sy>=0 && sx<sw as isize && sy<sh as isize {
+                                source[(sy as usize*sw+sx as usize)*4+c]
+                            } else {T::default()};
+                            assert_eq!(actual[(y*dw+x)*4+c],expected,"offset={ox},{oy} pixel={x},{y} channel={c}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let deep:Vec<u16>=(0..35).flat_map(|i|[32768,16385+i*2,16387+i*2,1+i*2]).collect();
+    compare(&deep);
+    let hdr:Vec<f32>=(0..35).flat_map(|i|[0.375,-0.25-i as f32/16.0,4.125+i as f32/16.0,0.50001]).collect();
+    compare(&hdr);
+}
+
+#[test]
+fn empty_auxiliary_rect_is_not_a_black_image() {
+    assert!(!has_pixels(ae::Rect { left: 0, top: 0, right: 0, bottom: 0 }));
+    assert!(!has_pixels(ae::Rect { left: 1, top: 2, right: 1, bottom: 5 }));
+    assert!(has_pixels(ae::Rect { left: -3, top: -2, right: 2, bottom: 5 }));
+}
 
 /// Positional index of a layer param (for `checkout_layer`). Falls back to a
 /// large unused index if the param is somehow missing, so a stray checkout
@@ -1034,44 +1175,47 @@ fn smart_pre_render(
     let mask_index = layer_param_index(params, Params::MaskLayer);
     let bg_index = layer_param_index(params, Params::BgLayer);
 
+    let mut available = AuxiliaryPixels::default();
     if mask_index >= 0 {
-        let _ = cb.checkout_layer(
+        available.mask = cb.checkout_layer(
             mask_index,
             MASK_CHECKOUT_ID,
             &req,
             in_data.current_time(),
             in_data.time_step(),
             in_data.time_scale(),
-        );
+        ).map(|r| has_pixels(r.result_rect.into())).unwrap_or(false);
     }
 
     if bg_index >= 0 {
-        let _ = cb.checkout_layer(
+        available.background = cb.checkout_layer(
             bg_index,
             BG_CHECKOUT_ID,
             &req,
             in_data.current_time(),
             in_data.time_step(),
             in_data.time_scale(),
-        );
+        ).map(|r| has_pixels(r.result_rect.into())).unwrap_or(false);
     }
 
+    extra.set_pre_render_data(available);
     Ok(())
 }
 
 // ---- SmartFX CPU Render ----
 
-fn smart_render_cpu(
+fn smart_render_typed<T: pixels::Channel + refract::Channel>(
     extra: &ae::pf::SmartRenderExtra,
     params: &ae::Parameters<Params>,
+    input_world: &ae::Layer,
+    output_world: &mut ae::Layer,
 ) -> Result<(), ae::Error> {
     let rp = get_params(params)?;
     let cb = extra.callbacks();
+    let available = extra.pre_render_data::<AuxiliaryPixels>().copied().unwrap_or_default();
 
-    let input_world = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
-    let mut output_world = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
 
-    let (src, w, h) = layer_to_flat(&input_world);
+    let (src, w, h) = pixels::read::<T>(&input_world)?;
     let in_org = input_world.origin();
     let (in_h, in_v) = (in_org.h as isize, in_org.v as isize);
 
@@ -1081,55 +1225,48 @@ fn smart_render_cpu(
     // effect everywhere). Substitute an empty mask so the effect simply has no
     // shape. An UNassigned mask still returns None so the renderer uses the
     // source as the shape (the documented "no mask" behavior).
-    let mask = checkout_layer_flat(&cb, MASK_CHECKOUT_ID as u32, w, h, in_h, in_v).or_else(|| {
-        if layer_assigned(params, Params::MaskLayer) {
-            Some(vec![0u8; w * h * 4])
-        } else {
-            None
-        }
-    });
-    let bg = checkout_layer_flat(&cb, BG_CHECKOUT_ID as u32, w, h, in_h, in_v);
+    let mut mask = if available.mask {
+        checkout_layer_flat(&cb, MASK_CHECKOUT_ID as u32, w, h, in_h, in_v)?
+    } else { None };
+    if mask.is_none() && layer_assigned(params, Params::MaskLayer)? {
+        mask = Some(empty_image::<T>(w,h)?);
+    }
+    let bg = if available.background {
+        checkout_layer_flat(&cb, BG_CHECKOUT_ID as u32, w, h, in_h, in_v)?
+    } else { None };
 
-    let result = dispatch_render(&rp, &src, mask.as_deref(), bg.as_deref(), w, h);
-    flat_to_layer(&result, &mut output_world, w, h);
+    let result = dispatch_render(&rp, &src, mask.as_deref(), bg.as_deref(), w, h)?;
+    pixels::write(&result, output_world, w, h)?;
 
-    cb.checkin_layer_pixels(0)?;
-    let _ = cb.checkin_layer_pixels(MASK_CHECKOUT_ID as u32);
-    let _ = cb.checkin_layer_pixels(BG_CHECKOUT_ID as u32);
     Ok(())
 }
 
 /// True if a layer is actually assigned to `id` (regardless of whether it
 /// currently overlaps the frame). Used to tell "no mask layer selected" apart
 /// from "mask layer selected but moved off-frame".
-fn layer_assigned(params: &ae::Parameters<Params>, id: Params) -> bool {
-    let checkout = match params.checkout(id) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    let layer_def = match checkout.as_layer() {
-        Ok(l) => l,
-        Err(_) => return false,
-    };
-    layer_def.value().is_some()
+fn layer_assigned(params: &ae::Parameters<Params>, id: Params) -> Result<bool,ae::Error> {
+    let checkout = params.checkout(id)?;
+    let layer_def = checkout.as_layer()?;
+    Ok(layer_def.value().is_some())
 }
 
-fn checkout_layer_flat(
+fn checkout_layer_flat<T: pixels::Channel + refract::Channel>(
     cb: &ae::pf::SmartRenderCallbacks,
     checkout_id: u32,
     w: usize,
     h: usize,
     in_h: isize,
     in_v: isize,
-) -> Option<Vec<u8>> {
-    let world = cb.checkout_layer_pixels(checkout_id).ok()??;
-    let (flat, lw, lh) = layer_to_flat(&world);
-    let origin = world.origin();
+) -> Result<Option<Vec<T>>,ae::Error> {
+    let Some(world) = cb.checkout_layer_pixels(checkout_id)? else {return Ok(None)};
+    let ((flat,lw,lh),origin) = with_pixel_checkin(
+        || Ok((read_aux::<T>(&world)?,world.origin())),
+        || cb.checkin_layer_pixels(checkout_id))?;
     // Place relative to the INPUT world's origin. When AE renders a partial
     // region (ROI) — typically near the frame edges — the input world has a
     // non-zero origin; ignoring it makes the mask/bg jump frame-to-frame as the
     // requested region shifts. Subtracting it keeps placement stable.
-    Some(fit_layer_at_offset(
+    Ok(Some(fit_layer_at_offset(
         &flat,
         lw,
         lh,
@@ -1137,5 +1274,5 @@ fn checkout_layer_flat(
         h,
         origin.h as isize - in_h,
         origin.v as isize - in_v,
-    ))
+    )?))
 }

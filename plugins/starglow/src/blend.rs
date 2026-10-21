@@ -15,7 +15,9 @@ pub fn composite(
     let og = sg * source_opacity + bg;
     let ob = sb * source_opacity + bb;
 
-    (or.max(0.0), og.max(0.0), ob.max(0.0))
+    // Integer output codecs clamp to their storage range. Float compositing
+    // must retain signed/HDR source values, including zero-glow identity.
+    (or, og, ob)
 }
 
 fn apply_mode(

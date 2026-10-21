@@ -1,0 +1,13 @@
+{
+  "src/backend.rs": "2bd04688c77c9226d491037811f73d0c5f2ade414720d15696f2f521770aee3f",
+  "src/gpu.rs": "74839734d58b07e2172be3bf5ce9af72fdecbcbc65ceac5d1c56bdebe6df3a6b",
+  "src/hash.rs": "939052bf54009a19126ff795882bec5a5d6bf9907cdbdc46b309ea7b0ef08ea8",
+  "src/layout.rs": "c7ecf6f1bf676e2058199cdee4f6cc7321021c7f1b6423d2a4eef866581bf58c",
+  "src/lib.rs": "8d28f06aa47c6a61081a3128f402e2c83cb4624128db7a03e5b9974d654f9414",
+  "src/pixel.rs": "cc65765eb9c3e14f3e24e268d6e4a9f202949aff258c8acdfa2acbcc25c9dcbb",
+  "src/raster.rs": "16f6a0098531970fd0e3e5cc0ecb23b8c17630c52527137e08906ee95915ee0a",
+  "src/shader.wgsl": "5b420ca6db2801e560c768152d9177f65ab05a89ecab31dfd8f046b40a69c375",
+  "tests/alpha.rs": "b8f38b66a51fd1827b7528ab6adb4d55c3b5b953395fc079e0d9d2099044834f",
+  "tests/gpu.rs": "fa0b7e55647195d25ecb6b3823625db41d2cfab5f32b615276b68a36c5a52534",
+  "tests/oracle.rs": "0a8167ea296dba7fb8bdcddf2a38073dd7f951aec682e425c24d70cd0c602350"
+}

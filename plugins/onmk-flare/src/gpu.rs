@@ -77,6 +77,7 @@ struct GpuParams {
 struct BufferState {
     width: u32,
     height: u32,
+    bytes_per_pixel: u64,
     source_buf: Buffer,
     output_buf: Buffer,
     staging_buf: Buffer,
@@ -151,9 +152,9 @@ fn combine_optical_layers(
             let (g, b, e, s) = (ghosts[i], bloom[i], ocular[i], source[i]);
             let safe = |v: f32| if v.is_finite() { v } else { 0.0 };
             *dst = [
-                safe(g[0] + b[0]) + safe(e[0] + s[0] * modern) / gain.max(0.001),
-                safe(g[1] + b[1]) + safe(e[1] + s[1] * modern) / gain.max(0.001),
-                safe(g[2] + b[2]) + safe(e[2] + s[2] * modern) / gain.max(0.001),
+                safe(g[0] + b[0]) * gain.max(0.0) + safe(e[0] + s[0] * modern),
+                safe(g[1] + b[1]) * gain.max(0.0) + safe(e[1] + s[1] * modern),
+                safe(g[2] + b[2]) * gain.max(0.0) + safe(e[2] + s[2] * modern),
                 0.0,
             ];
         }
@@ -623,12 +624,23 @@ mod cache_tests {
         gpu.bloom_gpu = None;
         gpu.resident_gpu = None;
         let mut stage = Some(crate::resident_gpu::ResidentGpu::new(&gpu.device).unwrap());
-        for case in 0..24 {
-            let (w, h) = match case % 4 {
-                0 => (1, 1),
-                1 => (1, 31),
-                2 => (31, 1),
-                _ => (97, 61),
+        let mut seed = 20261003_u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed as usize
+        };
+        for case in 0..48 {
+            // Keep one device/stage alive across random resizes: isolated AEX
+            // workers alone cannot catch stale same-process buffer/cache state.
+            let (w, h) = if case >= 24 {
+                (1 + next() % 1024, 1 + next() % 768)
+            } else {
+                match case % 4 {
+                    0 => (1, 1),
+                    1 => (1, 31),
+                    2 => (31, 1),
+                    _ => (97, 61),
+                }
             };
             let ep = EffectParams {
                 light_x: w as f64 * 0.6,
@@ -1045,12 +1057,86 @@ mod cache_tests {
             for (i, p) in actual.iter().enumerate() {
                 let safe = |v: f32| if v.is_finite() { v } else { 0.0 };
                 for c in 0..3 {
-                    let expected = safe(layer[i][c] + layer[i][c])
-                        + safe(layer[i][c] + layer[i][c] * modern) / gain.max(0.001);
+                    let expected = safe(layer[i][c] + layer[i][c]) * gain.max(0.0)
+                        + safe(layer[i][c] + layer[i][c] * modern);
                     assert_eq!(p[c].to_bits(), expected.to_bits());
                 }
                 assert_eq!(p[3], 0.0);
             }
+        }
+    }
+
+    #[test]
+    fn ghost_gain_does_not_scale_source_or_eye() {
+        let ghosts = [[1.0, 2.0, 3.0]];
+        let bloom = [[0.5, 1.0, 1.5]];
+        let eye = [[10.0, 20.0, 30.0]];
+        let source = [[100.0, 200.0, 300.0]];
+        assert_eq!(combine_optical_layers(&ghosts, &bloom, &eye, &source, 0.0, 1.0, 1)[0], [110.0, 220.0, 330.0, 0.0]);
+        assert_eq!(combine_optical_layers(&ghosts, &bloom, &eye, &source, 2.0, 1.0, 1)[0], [113.0, 226.0, 339.0, 0.0]);
+        assert_eq!(combine_optical_layers(&ghosts, &bloom, &eye, &source, 2.0, 0.0, 1)[0], [13.0, 26.0, 39.0, 0.0]);
+    }
+
+    #[test]
+    fn float_pipeline_preserves_16bit_steps_and_format_switches() {
+        let gpu = GpuProcessor::new();
+        let (w,h)=(257,129);
+        let mut src=vec![0.0_f32;w*h*4];
+        for (i,p) in src.chunks_exact_mut(4).enumerate() {
+            p.copy_from_slice(&[1.0,(i%32769) as f32/32768.0,((i+1)%32769) as f32/32768.0,0.12503052]);
+        }
+        let mut ep=EffectParams { style_preset:6, source_opacity:1.0,transfer_mode:4,global_scale:1.0,
+            light_x:120.0,light_y:60.0,source_mode:1, ..Default::default() };
+        assert_eq!(src,crate::flare::process_pixels(&ep,&src,w,h));
+        assert_eq!(src,gpu.process_pixels(&ep,&src,w,h));
+        let bytes=vec![128u8;w*h*4];
+        let old=gpu.process(&ep,&bytes,w,h);
+        assert_eq!(src,gpu.process_pixels(&ep,&src,w,h));
+        assert_eq!(old,gpu.process(&ep,&bytes,w,h));
+        // A faint analytic glow must produce more than 256 distinct output
+        // levels and agree with the independently implemented CPU fallback.
+        ep.global_brightness=1.0; ep.flare_opacity=1.0; ep.source_opacity=0.0;
+        ep.glow_intensity=0.01; ep.glow_radius=80.0; ep.glow_falloff=2.0;
+        ep.glow_color=[1.0;3];
+        let black=vec![0.0_f32;w*h*4];
+        let actual=gpu.process_pixels(&ep,&black,w,h);
+        let cpu=crate::flare::process_pixels(&ep,&black,w,h);
+        let levels: std::collections::HashSet<_>=actual.chunks_exact(4).map(|p|(p[1]*32768.0).round() as u16).collect();
+        assert!(levels.len()>256,"only {} levels",levels.len());
+        let max=actual.iter().zip(&cpu).map(|(a,b)|(a-b).abs()).fold(0.0_f32,f32::max);
+        assert!(max<2.0/32768.0,"float CPU/GPU error {max}");
+        assert!(gpu.is_healthy());
+    }
+
+    #[test]
+    #[ignore = "three reference looks: float CPU/GPU equivalence and native-resolution PNGs"]
+    fn reference_looks_quality() {
+        let gpu=GpuProcessor::new();
+        let (w,h)=(640,360);
+        let mut src=vec![0.0_f32;w*h*4];
+        for p in src.chunks_exact_mut(4) {p[0]=1.0;}
+        for style in 15..=17 {
+            let fov_h=50_f64.to_radians();
+            let fov_v=2.0*((h as f64/w as f64)*(fov_h*0.5).tan()).atan();
+            let mut ep=EffectParams {style_preset:style,light_x:(0.5-0.16/fov_h)*w as f64,
+                light_y:(0.5-0.07/fov_v)*h as f64,ray_grid:64,physical_gain:3000.,
+                ghost_normalize:true,max_area_boost:8.,physical_ghost_blur:0.005,physical_blur_passes:3,
+                bloom_strength:0.6,bloom_radius:0.018,bloom_passes:3,bloom_octaves:4,bloom_chromatic:true,
+                ghost_intensity:1.,global_brightness:1.,global_scale:1.,flare_opacity:1.,transfer_mode:4,
+                ..Default::default()};
+            crate::apply_style_preset(&mut ep);
+            let expected=crate::flare::process_pixels(&ep,&src,w,h);
+            let actual=gpu.process_pixels(&ep,&src,w,h);
+            let max=expected.iter().zip(&actual).map(|(a,b)|(a-b).abs()).fold(0.0_f32,f32::max);
+            let worst=expected.iter().zip(&actual).enumerate().max_by(|(_, (a,b)),(_, (c,d))| ((*a-*b).abs()).total_cmp(&(*c-*d).abs())).unwrap().0;
+            assert!(max<2.0/32768.0,"reference {style}: float CPU/GPU max {max} at {worst}, CPU {}, GPU {}",expected[worst],actual[worst]);
+            assert!(gpu.is_healthy());
+            assert!(actual.chunks_exact(4).any(|p|p[1]>0.01));
+            if let Ok(root)=std::env::var("ONMK_QUALITY_OUT") {
+                let rgb:Vec<u8>=actual.chunks_exact(4).flat_map(|p|p[1..4].iter().map(|v|(v.clamp(0.,1.)*255.).round() as u8)).collect();
+                image::RgbImage::from_raw(w as u32,h as u32,rgb).unwrap().save(format!("{root}/reference-{style}.png")).unwrap();
+            }
+            eprintln!("reference {style}: CPU/GPU max {max}");
         }
     }
 
@@ -1609,7 +1695,7 @@ impl GpuProcessor {
         }
     }
 
-    fn create_buffers(&self, w: u32, h: u32) -> BufferState {
+    fn create_buffers(&self, w: u32, h: u32, bytes_per_pixel: u64) -> BufferState {
         let n = (w * h) as u64;
         let mk = |sz: u64, usage: BufferUsages| {
             self.device.create_buffer(&BufferDescriptor {
@@ -1620,9 +1706,9 @@ impl GpuProcessor {
             })
         };
 
-        let source_buf = mk(n * 4, BufferUsages::STORAGE | BufferUsages::COPY_DST);
-        let output_buf = mk(n * 4, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
-        let staging_buf = mk(n * 4, BufferUsages::MAP_READ | BufferUsages::COPY_DST);
+        let source_buf = mk(n * bytes_per_pixel, BufferUsages::STORAGE | BufferUsages::COPY_DST);
+        let output_buf = mk(n * bytes_per_pixel, BufferUsages::STORAGE | BufferUsages::COPY_SRC);
+        let staging_buf = mk(n * bytes_per_pixel, BufferUsages::MAP_READ | BufferUsages::COPY_DST);
         let params_buf = mk(
             std::mem::size_of::<GpuParams>() as u64,
             BufferUsages::UNIFORM | BufferUsages::COPY_DST,
@@ -1655,6 +1741,7 @@ impl GpuProcessor {
         BufferState {
             width: w,
             height: h,
+            bytes_per_pixel,
             source_buf,
             output_buf,
             staging_buf,
@@ -1670,12 +1757,13 @@ impl GpuProcessor {
         &self,
         w: u32,
         h: u32,
+        bytes_per_pixel: u64,
     ) -> parking_lot::RwLockUpgradableReadGuard<'_, HashMap<usize, BufferState>> {
         let mut lock = self.state.upgradable_read();
         let tid = 0;
         if lock
             .get(&tid)
-            .map(|s| s.width != w || s.height != h)
+            .map(|s| s.width != w || s.height != h || s.bytes_per_pixel != bytes_per_pixel)
             .unwrap_or(true)
         {
             lock.with_upgraded(|x| {
@@ -1686,13 +1774,17 @@ impl GpuProcessor {
                 if let Some(gpu) = &self.resident_gpu {
                     gpu.release();
                 }
-                x.insert(tid, self.create_buffers(w, h));
+                x.insert(tid, self.create_buffers(w, h, bytes_per_pixel));
             });
         }
         lock
     }
 
     pub fn process(&self, ep: &EffectParams, src: &[u8], w: usize, h: usize) -> Vec<u8> {
+        self.process_pixels(ep,src,w,h)
+    }
+
+    pub(crate) fn process_pixels<T: crate::pixel::Channel>(&self, ep: &EffectParams, src: &[T], w: usize, h: usize) -> Vec<T> {
         // Bound in-flight work across processor instances in this plugin/DLL.
         static FRAME: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
         let _frame = FRAME.lock();
@@ -1704,7 +1796,7 @@ impl GpuProcessor {
         let n = w * h;
         let fits = w <= u32::MAX as usize
             && h <= u32::MAX as usize
-            && n as u64 <= (512 * 1024 * 1024) / 28
+            && n as u64 <= (512 * 1024 * 1024) / (16 + 12 * std::mem::size_of::<T>() as u64)
             && (n as u64) * 16 <= limits.max_storage_buffer_binding_size as u64
             && (n as u64) * 16 <= limits.max_buffer_size
             && w.div_ceil(16) <= limits.max_compute_workgroups_per_dimension as usize
@@ -1722,7 +1814,7 @@ impl GpuProcessor {
             }
         }
         self.release_caches();
-        crate::flare::process(ep, src, w, h)
+        crate::flare::process_pixels(ep, src, w, h)
     }
 
     pub(crate) fn is_healthy(&self) -> bool {
@@ -1743,15 +1835,17 @@ impl GpuProcessor {
         }
     }
 
-    fn process_inner(&self, ep: &EffectParams, src: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
+    fn process_inner<T: crate::pixel::Channel>(&self, ep: &EffectParams, src: &[T], w: usize, h: usize) -> Option<Vec<T>> {
         let (ww, hh, n) = (w as u32, h as u32, w * h);
-        let lock = self.get_state(ww, hh);
+        let bytes_per_pixel = 4 * std::mem::size_of::<T>();
+        let lock = self.get_state(ww, hh, bytes_per_pixel as u64);
         let state = lock.get(&0).unwrap();
 
-        self.queue.write_buffer(&state.source_buf, 0, &src[..n * 4]);
+        self.queue.write_buffer(&state.source_buf, 0, as_bytes_slice(&src[..n * 4]));
 
         let cfg = physical::Config {
-            ray_grid: ep.ray_grid.min(32),
+            wavelengths: [650.0,550.0,450.0],
+            ray_grid: ep.ray_grid.clamp(4, 128),
             min_ghost: 1e-7,
             gain: ep.physical_gain,
             normalize: ep.ghost_normalize,
@@ -1779,11 +1873,11 @@ impl GpuProcessor {
             sources.push(physical::BrightSource {
                 angle_x: (ep.light_x / w as f64 - 0.5) * fov_h,
                 angle_y: (ep.light_y / h as f64 - 0.5) * fov_v,
-                rgb: [1.0; 3],
+                rgb: if (15..=20).contains(&ep.style_preset) { [1.0, 0.92, 0.78] } else { [1.0; 3] },
             });
         }
         let key = optical_key(ep);
-        let resident = if let Some(gpu) = &self.resident_gpu {
+        let resident = if let Some(gpu) = self.resident_gpu.as_ref().filter(|_| !crate::rich::enabled(ep)) {
             let mut cache = state.resident_cache.lock();
             if cache
                 .as_ref()
@@ -1822,7 +1916,7 @@ impl GpuProcessor {
         if !resident {
             // If a resident attempt failed, use the CPU reference rather than
             // retrying the older GPU readback stages on the same device.
-            let allow_layer_gpu = self.resident_gpu.is_none();
+            let allow_layer_gpu = self.resident_gpu.is_none() && !crate::rich::enabled(ep);
             let cached = self
                 .optical_cache
                 .lock()
@@ -1843,7 +1937,8 @@ impl GpuProcessor {
                         let start = std::time::Instant::now();
                         if ep.physical_enabled {
                             let lens = physical::bundled_lens(ep.lens_preset);
-                            let result = physical::render(&lens, &sources, w, h, cfg);
+                            let result = if crate::rich::enabled(ep) {crate::rich::ghosts(ep,&sources,w,h,cfg)}
+                                else {physical::render(&lens, &sources, w, h, cfg)};
                             #[cfg(test)]
                             eprintln!("ghosts: {:?}", start.elapsed());
                             result
@@ -1905,7 +2000,7 @@ impl GpuProcessor {
                     &ocular,
                     &source_optics,
                     ep.ghost_intensity as f32,
-                    if ep.style_preset < 6 { 1.0 } else { 0.0 },
+                    if ep.style_preset < 6 || crate::rich::enabled(ep) { 1.0 } else { 0.0 },
                     workers,
                 );
                 #[cfg(test)]
@@ -1964,13 +2059,13 @@ impl GpuProcessor {
             global_brightness: ep.global_brightness as f32,
             global_scale: ep.global_scale as f32,
             flare_angle: ep.flare_angle as f32,
-            hotspot_intensity: if ep.style_preset < 6 {
+            hotspot_intensity: if ep.style_preset < 6 || crate::rich::enabled(ep) {
                 0.0
             } else {
                 ep.hotspot_intensity as f32
             },
             hotspot_size: ep.hotspot_size as f32,
-            glow_intensity: if ep.style_preset < 6 {
+            glow_intensity: if ep.style_preset < 6 || crate::rich::enabled(ep) {
                 0.0
             } else {
                 ep.glow_intensity as f32
@@ -1990,7 +2085,7 @@ impl GpuProcessor {
             ring_width: ep.ring_width as f32,
             ring_chromatic: ep.ring_chromatic as f32,
             ring_spectrum: if ep.ring_spectrum { 1 } else { 0 },
-            starburst_intensity: if ep.style_preset < 6 {
+            starburst_intensity: if ep.style_preset < 6 || crate::rich::enabled(ep) {
                 0.0
             } else {
                 ep.starburst_intensity as f32
@@ -2012,7 +2107,7 @@ impl GpuProcessor {
             flare_opacity: ep.flare_opacity as f32,
             transfer_mode: ep.transfer_mode as u32,
             source_mode: ep.source_mode as u32,
-            _padding: [0; 3],
+            _padding: [u32::from(T::FLOAT), u32::from((15..=20).contains(&ep.style_preset)), 0],
             glow_color: [
                 ep.glow_color[0] as f32,
                 ep.glow_color[1] as f32,
@@ -2069,7 +2164,7 @@ impl GpuProcessor {
             cp.set_bind_group(0, &state.bind_group, &[]);
             cp.dispatch_workgroups(wg_x, wg_y, 1);
         }
-        enc.copy_buffer_to_buffer(&state.output_buf, 0, &state.staging_buf, 0, (n * 4) as u64);
+        enc.copy_buffer_to_buffer(&state.output_buf, 0, &state.staging_buf, 0, (n * bytes_per_pixel) as u64);
         self.queue.submit(Some(enc.finish()));
 
         let slice = state.staging_buf.slice(..);
@@ -2081,10 +2176,10 @@ impl GpuProcessor {
             return None;
         }
 
-        let mut result = vec![0u8; n * 4];
+        let result;
         if let Ok(Ok(())) = rx.recv_timeout(std::time::Duration::from_secs(5)) {
             let data = slice.get_mapped_range();
-            result.copy_from_slice(&data[..n * 4]);
+            result = T::decode(&data[..n * bytes_per_pixel]);
             drop(data);
             state.staging_buf.unmap();
         } else {

@@ -34,8 +34,8 @@ struct Params {
     spectrum_offset: f32,
     spectrum_density: f32,
     spectrum_random: f32,
-    _pad0: u32,
-    _pad1: u32,
+    native_float: u32,
+    affect_alpha: u32,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -47,6 +47,19 @@ struct Params {
 @group(0) @binding(6) var<storage, read> luma_map: array<f32>;
 
 // ---- Helpers ----
+
+fn load_pixel(idx: u32) -> vec4<f32> {
+    if params.native_float == 0u { return unpack_argb(source[idx]); }
+    let o = idx * 4u;
+    return bitcast<vec4<f32>>(vec4<u32>(source[o], source[o+1u], source[o+2u], source[o+3u]));
+}
+
+fn store_pixel(idx: u32, pixel: vec4<f32>) {
+    if params.native_float == 0u { output[idx] = pack_argb(pixel); return; }
+    let p = bitcast<vec4<u32>>(pixel);
+    let o = idx * 4u;
+    output[o] = p.x; output[o+1u] = p.y; output[o+2u] = p.z; output[o+3u] = p.w;
+}
 
 fn unpack_argb(packed: u32) -> vec4<f32> {
     let a = f32((packed >> 24u) & 0xFFu) / 255.0;
@@ -85,10 +98,12 @@ fn extract_brightness(pixel: vec4<f32>) -> f32 {
 fn sample_colormap(t: f32) -> vec3<f32> {
     let tc = clamp(t, 0.0, 1.0);
     let seg = tc * 4.0;
-    let idx = u32(seg);
+    // Clamp the segment before computing its fraction: t=1 belongs to
+    // segment 3 at fraction 1, not segment 3 at fraction 0.
+    let idx = min(u32(seg), 3u);
     let frac = seg - f32(idx);
     var c0: vec3<f32>; var c1: vec3<f32>;
-    switch min(idx, 3u) {
+    switch idx {
         case 0u: { c0 = params.cm0.xyz; c1 = params.cm1.xyz; }
         case 1u: { c0 = params.cm1.xyz; c1 = params.cm2.xyz; }
         case 2u: { c0 = params.cm2.xyz; c1 = params.cm3.xyz; }
@@ -125,7 +140,7 @@ fn threshold_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= params.width || id.y >= params.height { return; }
     let idx = id.y * params.width + id.x;
 
-    let pixel = unpack_argb(source[idx]);
+    let pixel = load_pixel(idx);
     let bright = extract_brightness(pixel);
 
     let soft_range = max(params.threshold_soft, 0.001);
@@ -138,7 +153,13 @@ fn threshold_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         mask *= luma_map[idx];
     }
 
-    buf_a[idx] = vec4<f32>(pixel.y * mask, pixel.z * mask, pixel.w * mask, 0.0);
+    var transmission = 1.0;
+    if params.shimmer_amount > 0.0 {
+        let noise = value_noise(f32(id.x) * params.shimmer_detail * 0.02,
+            f32(id.y) * params.shimmer_detail * 0.02, params.shimmer_phase);
+        transmission = 1.0 - params.shimmer_amount * (1.0 - noise);
+    }
+    buf_a[idx] = vec4<f32>(pixel.y * mask, pixel.z * mask, pixel.w * mask, transmission);
 
     // Clear accumulator only on first direction
     if params.read_from_a == 1u {
@@ -148,7 +169,9 @@ fn threshold_pass(@builtin(global_invocation_id) id: vec3<u32>) {
 
 // ---- Pass 2: Additive parallel prefix scan ----
 // new[i] = current[i] + current[i - dir*step] * decay
-// Mathematically equivalent to sequential IIR after log2(length) passes.
+// For spatially varying decay, w carries the product of transmission through
+// the current scan segment. Compose affine recurrences instead of applying
+// only the destination pixel's shimmer once to an entire segment.
 
 @compute @workgroup_size(16, 16)
 fn streak_pass(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -158,16 +181,6 @@ fn streak_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let sx = i32(id.x) - params.dx * i32(params.step);
     let sy = i32(id.y) - params.dy * i32(params.step);
 
-    var effective_decay = params.decay;
-    if params.shimmer_amount > 0.0 {
-        let noise = value_noise(
-            f32(id.x) * params.shimmer_detail * 0.02,
-            f32(id.y) * params.shimmer_detail * 0.02,
-            params.shimmer_phase
-        );
-        effective_decay *= (1.0 - params.shimmer_amount * (1.0 - noise));
-    }
-
     var current: vec4<f32>;
     var prev = vec4<f32>(0.0);
 
@@ -176,14 +189,26 @@ fn streak_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         if sx >= 0 && sx < i32(params.width) && sy >= 0 && sy < i32(params.height) {
             prev = buf_a[u32(sy) * params.width + u32(sx)];
         }
-        buf_b[idx] = current + vec4<f32>(prev.xyz * effective_decay, 0.0);
     } else {
         current = buf_b[idx];
         if sx >= 0 && sx < i32(params.width) && sy >= 0 && sy < i32(params.height) {
             prev = buf_b[u32(sy) * params.width + u32(sx)];
         }
-        buf_a[idx] = current + vec4<f32>(prev.xyz * effective_decay, 0.0);
     }
+    var effective_decay = params.decay;
+    var transmission = 0.0;
+    if params.shimmer_amount > 0.0 {
+        effective_decay = current.w;
+        var upstream = prev.w;
+        if params.step == 1u {
+            effective_decay *= params.decay;
+            upstream *= params.decay;
+        }
+        transmission = effective_decay * upstream;
+    }
+    let result = vec4<f32>(current.xyz + prev.xyz * effective_decay, transmission);
+    if params.read_from_a != 0u { buf_b[idx] = result; }
+    else { buf_a[idx] = result; }
 }
 
 // ---- Spectrum helpers ----
@@ -233,7 +258,7 @@ fn accumulate_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     // Reconstruct original bright pixel value
-    let pixel = unpack_argb(source[idx]);
+    let pixel = load_pixel(idx);
     let bright = extract_brightness(pixel);
     let soft_range = max(params.threshold_soft, 0.001);
     let low = params.threshold - soft_range * 0.5;
@@ -248,6 +273,8 @@ fn accumulate_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let glow = max(streak.xyz - orig, vec3<f32>(0.0));
     let glow_lum = glow.x * 0.2126 + glow.y * 0.7152 + glow.z * 0.0722;
     let total_lum = streak.x * 0.2126 + streak.y * 0.7152 + streak.z * 0.0722;
+    // Match the CPU's per-direction negligible-streak cutoff.
+    if total_lum <= 0.0001 { return; }
 
     var depth = 0.0;
     if total_lum > 0.0001 {
@@ -265,6 +292,25 @@ fn accumulate_pass(@builtin(global_invocation_id) id: vec3<u32>) {
 
 // ---- Pass 4: Composite ----
 
+fn overlay(base: f32, blend: f32) -> f32 {
+    if base < 0.5 { return 2.0 * base * blend; }
+    return 1.0 - 2.0 * (1.0 - base) * (1.0 - blend);
+}
+fn soft_light(base: f32, blend: f32) -> f32 {
+    if blend < 0.5 { return base - (1.0 - 2.0 * blend) * base * (1.0 - base); }
+    var d = sqrt(max(base, 0.0));
+    if base < 0.25 { d = ((16.0 * base - 12.0) * base + 4.0) * base; }
+    return base + (2.0 * blend - 1.0) * (d - base);
+}
+fn dodge(base: f32, blend: f32) -> f32 {
+    if blend >= 1.0 { return 1.0; }
+    return min(base / (1.0 - blend), 1.0);
+}
+fn burn(base: f32, blend: f32) -> f32 {
+    if blend <= 0.0 { return 0.0; }
+    return max(1.0 - (1.0 - base) / blend, 0.0);
+}
+
 fn apply_blend(sr: f32, sg: f32, sb: f32, gr: f32, gg: f32, gb: f32) -> vec3<f32> {
     switch params.transfer_mode {
         case 1u: { return vec3<f32>(0.0); }
@@ -272,6 +318,14 @@ fn apply_blend(sr: f32, sg: f32, sb: f32, gr: f32, gg: f32, gb: f32) -> vec3<f32
         case 4u: { return vec3<f32>(gr, gg, gb); }
         case 5u: { return vec3<f32>(sr * gr, sg * gg, sb * gb); }
         case 6u: { return vec3<f32>(sr + gr - sr * gr, sg + gg - sg * gg, sb + gb - sb * gb); }
+        case 7u: { return vec3<f32>(overlay(sr, gr), overlay(sg, gg), overlay(sb, gb)); }
+        case 8u: { return vec3<f32>(soft_light(sr, gr), soft_light(sg, gg), soft_light(sb, gb)); }
+        case 9u: { return vec3<f32>(overlay(gr, sr), overlay(gg, sg), overlay(gb, sb)); }
+        case 11u: { return vec3<f32>(dodge(sr, gr), dodge(sg, gg), dodge(sb, gb)); }
+        case 12u: { return vec3<f32>(burn(sr, gr), burn(sg, gg), burn(sb, gb)); }
+        case 14u: { return min(vec3<f32>(sr, sg, sb), vec3<f32>(gr, gg, gb)); }
+        case 15u: { return max(vec3<f32>(sr, sg, sb), vec3<f32>(gr, gg, gb)); }
+        case 16u: { return abs(vec3<f32>(sr, sg, sb) - vec3<f32>(gr, gg, gb)); }
         default: { return vec3<f32>(gr, gg, gb); }
     }
 }
@@ -281,14 +335,18 @@ fn composite_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     if id.x >= params.width || id.y >= params.height { return; }
     let idx = id.y * params.width + id.x;
 
-    let pixel = unpack_argb(source[idx]);
+    let pixel = load_pixel(idx);
     let glow = accum[idx].xyz * params.starglow_opacity;
     let blended = apply_blend(pixel.y, pixel.z, pixel.w, glow.x, glow.y, glow.z);
+    var alpha = pixel.x;
+    if params.affect_alpha != 0u {
+        alpha += clamp(max(glow.x, max(glow.y, glow.z)), 0.0, 1.0) * (1.0 - alpha);
+    }
     let result = vec4<f32>(
-        pixel.x,
+        alpha,
         pixel.y * params.source_opacity + blended.x,
         pixel.z * params.source_opacity + blended.y,
         pixel.w * params.source_opacity + blended.z
     );
-    output[idx] = pack_argb(result);
+    store_pixel(idx, result);
 }

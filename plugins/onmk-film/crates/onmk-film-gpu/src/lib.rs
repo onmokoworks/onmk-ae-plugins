@@ -10,6 +10,70 @@ pub enum GpuError {
     Map,
 }
 
+// Validate before creating resources: both shaders use u32 scalar indices,
+// and blur also adds a radius of at most 128 to signed coordinates.
+fn checked_gpu_size(width: u32, height: u32, limits: &wgpu::Limits) -> Result<u64, GpuError> {
+    let channels = u64::from(width).checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4)).ok_or(GpuError::Device)?;
+    let size = channels.checked_mul(4).ok_or(GpuError::Device)?;
+    if width == 0 || height == 0
+        || width > i32::MAX as u32 - 128 || height > i32::MAX as u32 - 128
+        || channels > u64::from(u32::MAX)
+        || size > limits.max_buffer_size
+        || size > u64::from(limits.max_storage_buffer_binding_size)
+        || width.div_ceil(8) > limits.max_compute_workgroups_per_dimension
+        || height.div_ceil(8) > limits.max_compute_workgroups_per_dimension
+    {
+        return Err(GpuError::Device);
+    }
+    Ok(size)
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    #[test]
+    fn gpu_limits_are_checked_without_allocating_frames() {
+        let mut limits = wgpu::Limits::downlevel_defaults();
+        assert_eq!(checked_gpu_size(1920, 1080, &limits).unwrap(), 33_177_600);
+        assert!(checked_gpu_size(0, 1, &limits).is_err());
+        assert!(checked_gpu_size(u32::MAX, u32::MAX, &limits).is_err());
+        limits.max_buffer_size = 256;
+        limits.max_storage_buffer_binding_size = 256;
+        assert_eq!(checked_gpu_size(4, 4, &limits).unwrap(), 256);
+        assert!(checked_gpu_size(5, 4, &limits).is_err());
+        limits.max_buffer_size = 512;
+        assert!(checked_gpu_size(5, 4, &limits).is_err());
+        limits.max_storage_buffer_binding_size = 512;
+        limits.max_buffer_size = 256;
+        assert!(checked_gpu_size(5, 4, &limits).is_err());
+        limits.max_buffer_size = 512;
+        limits.max_compute_workgroups_per_dimension = 1;
+        assert!(checked_gpu_size(8, 1, &limits).is_ok());
+        assert!(checked_gpu_size(9, 1, &limits).is_err());
+        assert!(checked_gpu_size(1, 9, &limits).is_err());
+        limits.max_buffer_size = u64::MAX;
+        limits.max_storage_buffer_binding_size = u32::MAX;
+        limits.max_compute_workgroups_per_dimension = u32::MAX;
+        assert!(checked_gpu_size(i32::MAX as u32, 1, &limits).is_err());
+        assert!(checked_gpu_size(65_536, 65_536, &limits).is_err());
+    }
+}
+
+#[cfg(all(test,not(target_os="macos")))]
+mod fallback_tests {
+    use super::*;
+    #[test]
+    fn metal_unavailable_returns_error_without_changing_pixels() {
+        let original=[1.0f32,0.25,0.5,2.0];
+        let mut data=original;
+        let p=GrainParams {seed:1,mono:0,cell:2.0,amount:0.2,clump:0.5,shadows:1.0,mids:1.0,highlights:1.0,grain_base:1.0};
+        assert!(matches!(grain_rgba(&mut data,1,1,p),Err(GpuError::NoAdapter)));
+        assert_eq!(data,original);
+        assert!(matches!(blur_rgba(&original,1,1,1),Err(GpuError::NoAdapter)));
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct GrainParams {
@@ -47,9 +111,10 @@ pub fn grain_rgba(
     height: u32,
     p: GrainParams,
 ) -> Result<(), GpuError> {
-    if buf.len() != width as usize * height as usize * 4 {
+    if Some(buf.len()) != (width as usize).checked_mul(height as usize).and_then(|n|n.checked_mul(4)) {
         return Err(GpuError::Device);
     }
+    if !cfg!(target_os="macos") {return Err(GpuError::NoAdapter);}
     let result = pollster::block_on(run_grain(buf, width, height, p))?;
     buf.copy_from_slice(&result);
     Ok(())
@@ -61,6 +126,7 @@ async fn run_grain(
     height: u32,
     p: GrainParams,
 ) -> Result<Vec<f32>, GpuError> {
+    checked_gpu_size(width, height, &wgpu::Limits::downlevel_defaults())?;
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::METAL,
         ..Default::default()
@@ -82,6 +148,7 @@ async fn run_grain(
         })
         .await
         .map_err(|_| GpuError::Device)?;
+    checked_gpu_size(width, height, &device.limits())?;
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("grain"),
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("grain.wgsl"))),
@@ -169,20 +236,7 @@ async fn run_grain(
     }
     enc.copy_buffer_to_buffer(&data, 0, &staging, 0, size);
     queue.submit(Some(enc.finish()));
-    let slice = staging.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    let _ = device.poll(wgpu::PollType::Wait);
-    rx.recv()
-        .map_err(|_| GpuError::Map)?
-        .map_err(|_| GpuError::Map)?;
-    let mapped = slice.get_mapped_range();
-    Ok(mapped
-        .chunks_exact(4)
-        .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
-        .collect())
+    readback(&device, &staging, src.len())
 }
 
 #[repr(C)]
@@ -204,16 +258,18 @@ fn slice_bytes<T>(value: &[T]) -> &[u8] {
 
 /// Applies a two-pass separable box approximation to an RGBA float image.
 pub fn blur_rgba(src: &[f32], width: u32, height: u32, radius: u32) -> Result<Vec<f32>, GpuError> {
-    if src.len() != width as usize * height as usize * 4 {
+    if Some(src.len()) != (width as usize).checked_mul(height as usize).and_then(|n|n.checked_mul(4)) {
         return Err(GpuError::Device);
     }
     if radius == 0 || width == 0 || height == 0 {
         return Ok(src.to_vec());
     }
+    if !cfg!(target_os="macos") {return Err(GpuError::NoAdapter);}
     pollster::block_on(run(src, width, height, radius.min(128)))
 }
 
 async fn run(src: &[f32], width: u32, height: u32, radius: u32) -> Result<Vec<f32>, GpuError> {
+    checked_gpu_size(width, height, &wgpu::Limits::downlevel_defaults())?;
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::METAL,
         ..Default::default()
@@ -235,6 +291,7 @@ async fn run(src: &[f32], width: u32, height: u32, radius: u32) -> Result<Vec<f3
         })
         .await
         .map_err(|_| GpuError::Device)?;
+    checked_gpu_size(width, height, &device.limits())?;
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("onmk Film blur"),
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("blur.wgsl"))),
@@ -330,23 +387,74 @@ async fn run(src: &[f32], width: u32, height: u32, radius: u32) -> Result<Vec<f3
     }
     encoder.copy_buffer_to_buffer(&a, 0, &staging, 0, size);
     queue.submit(Some(encoder.finish()));
+    readback(&device, &staging, src.len())
+}
+
+fn with_readback_cleanup<T>(
+    wait: impl FnOnce() -> Result<(), GpuError>,
+    read: impl FnOnce() -> Result<T, GpuError>,
+    unmap: impl FnOnce(),
+) -> Result<T, GpuError> {
+    struct Cleanup<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for Cleanup<F> {
+        fn drop(&mut self) { if let Some(f) = self.0.take() { f(); } }
+    }
+    let _cleanup = Cleanup(Some(unmap));
+    wait()?;
+    read()
+}
+
+fn readback(device: &wgpu::Device, staging: &wgpu::Buffer, count: usize) -> Result<Vec<f32>, GpuError> {
+    // Reserve before requesting a mapping; no allocation while a view is live.
+    let mut out = Vec::new();
+    out.try_reserve_exact(count).map_err(|_| GpuError::Map)?;
     let slice = staging.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    let _ = device.poll(wgpu::PollType::Wait);
-    rx.recv()
-        .map_err(|_| GpuError::Map)?
-        .map_err(|_| GpuError::Map)?;
-    let mapped = slice.get_mapped_range();
-    let out = mapped
-        .chunks_exact(4)
-        .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
-        .collect();
-    drop(mapped);
-    staging.unmap();
-    Ok(out)
+    with_readback_cleanup(
+        || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+            device.poll(wgpu::PollType::Wait).map_err(|_| GpuError::Map)?;
+            rx.recv().map_err(|_| GpuError::Map)?.map_err(|_| GpuError::Map)
+        },
+        || {
+            let mapped = slice.get_mapped_range();
+            if Some(mapped.len()) != count.checked_mul(4) { return Err(GpuError::Map); }
+            out.extend(mapped.chunks_exact(4).map(|b| f32::from_ne_bytes(b.try_into().unwrap())));
+            Ok(out)
+        },
+        || staging.unmap(),
+    )
+}
+
+#[cfg(test)]
+mod readback_tests {
+    use super::*;
+    use std::cell::Cell;
+    #[test]
+    fn cleanup_runs_once_on_success_failure_and_unwind() {
+        for mode in 0..4 {
+            let cleaned = Cell::new(0);
+            let read = Cell::new(false);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_readback_cleanup(
+                    || if mode == 1 { Err(GpuError::Map) } else { Ok(()) },
+                    || {
+                        read.set(true);
+                        if mode == 3 { panic!("simulated mapped read failure"); }
+                        if mode == 2 { Err(GpuError::Map) } else { Ok(42) }
+                    },
+                    || cleaned.set(cleaned.get() + 1),
+                )
+            }));
+            assert_eq!(cleaned.get(), 1);
+            assert_eq!(read.get(), mode != 1);
+            match mode {
+                0 => assert_eq!(result.unwrap().unwrap(), 42),
+                3 => assert!(result.is_err()),
+                _ => assert!(matches!(result.unwrap(), Err(GpuError::Map))),
+            }
+        }
+    }
 }
 
 fn entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {

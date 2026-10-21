@@ -32,7 +32,7 @@ struct GpuParams {
 }
 
 pub fn render(input: FrameBuf<'_>, params: &Params, glow_only: bool) -> Result<Vec<f32>, String> {
-    let field = Field::build(input, params);
+    let field = Field::build(input, params).map_err(|e| e.to_string())?;
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,

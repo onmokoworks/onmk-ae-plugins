@@ -20,8 +20,8 @@ fn combine(@builtin(global_invocation_id) id: vec3<u32>) {
         if p.physical_enabled!=0u { g=ghosts[i*p.ghost_stride+c]; }
         if !finite(g) {atomicStore(&invalid,1u);}
         if p.ocular_enabled!=0u { e=ocular[i*3u+c]; }
-        result[c]=safe(g+bloom[i][c])
-            +safe(e+source[i][c]*p.modern)/max(p.gain,0.001);
+        result[c]=safe(g+bloom[i][c])*max(p.gain,0.0)
+            +safe(e+source[i][c]*p.modern);
         if !finite(result[c]) { atomicStore(&invalid,1u); }
     }
     combined[i]=result;

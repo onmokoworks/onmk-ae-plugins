@@ -7,6 +7,21 @@ pub const MODE_MAP_LAYER: i32 = 4;
 
 const INTERP_NEAREST: i32 = 1;
 
+#[test]
+fn varying_frames_select_and_interpolate_by_map() {
+    let mut params = SlitScanParams { time_frames:3,frame_step:1,time_direction:1,
+        slice_mode:MODE_HORIZONTAL,gradient_phase:0.0,center:(0.5,0.5),
+        interpolation:1,mix:1.0,invert_map:false };
+    let frames: Vec<Vec<u8>> = [10u8,110,210].into_iter()
+        .map(|v| (0..3).flat_map(|_|[255,v,v,v]).collect()).collect();
+    let map=[0.0,0.25,1.0];
+    let nearest=render(&params,&frames,3,1,&map,&frames[0]).unwrap();
+    assert_eq!([nearest[1],nearest[5],nearest[9]],[10,110,210]);
+    params.interpolation=2;
+    let linear=render(&params,&frames,3,1,&map,&frames[0]).unwrap();
+    assert_eq!([linear[1],linear[5],linear[9]],[10,60,210]);
+}
+
 pub fn generate_gradient_map(
     mode: i32,
     w: usize,
@@ -14,8 +29,9 @@ pub fn generate_gradient_map(
     phase: f64,
     center: (f64, f64),
     invert: bool,
-) -> Vec<f64> {
-    let mut map = vec![0.0f64; w * h];
+) -> Result<Vec<f64>,after_effects::Error> {
+    let mut map = crate::map_plane(w,h)?;
+    if map.is_empty() {return Ok(map);}
     let wf = (w as f64 - 1.0).max(1.0);
     let hf = (h as f64 - 1.0).max(1.0);
 
@@ -48,7 +64,7 @@ pub fn generate_gradient_map(
         }
     }
 
-    map
+    Ok(map)
 }
 
 pub fn render(
@@ -58,15 +74,20 @@ pub fn render(
     h: usize,
     map: &[f64],
     original: &[u8],
-) -> Vec<u8> {
+) -> Result<Vec<u8>,after_effects::Error> {
     let num_frames = frames.len();
-    let npx = w * h;
-
-    if num_frames < 2 {
-        return original.to_vec();
+    let count=crate::rgba_len(w,h)?;
+    let npx=count/4;
+    if original.len()!=count || map.len()!=npx || frames.iter().any(|f|f.len()!=count) {
+        return Err(after_effects::Error::BadCallbackParameter);
     }
 
-    let mut out = vec![0u8; npx * 4];
+    if num_frames < 2 {
+        return crate::copy_frame(original);
+    }
+
+    let mut out = crate::byte_plane(count)?;
+    if npx==0 { return Ok(out); }
     let max_idx = (num_frames - 1) as f64;
 
     for y in 0..h {
@@ -112,5 +133,20 @@ pub fn render(
         }
     }
 
-    out
+    Ok(out)
+}
+
+#[test]
+fn render_rejects_malformed_planes_before_sampling_or_passthrough() {
+    let params=SlitScanParams {time_frames:2,frame_step:1,time_direction:1,
+        slice_mode:MODE_HORIZONTAL,gradient_phase:0.0,center:(0.5,0.5),
+        interpolation:1,mix:1.0,invert_map:false};
+    for frames in [vec![],vec![vec![1;4]],vec![vec![1;4],vec![2;4]]] {
+        assert!(render(&params,&frames,1,1,&[],&[1;4]).is_err());
+        assert!(render(&params,&frames,1,1,&[0.0],&[1;3]).is_err());
+    }
+    assert!(render(&params,&[vec![1;3],vec![2;4]],1,1,&[0.0],&[1;4]).is_err());
+    assert!(render(&params,&[],usize::MAX,2,&[],&[]).is_err());
+    assert!(render(&params,&[vec![],vec![]],0,usize::MAX,&[],&[]).unwrap().is_empty());
+    assert_eq!(render(&params,&[],1,1,&[0.0],&[1,2,3,4]).unwrap(),[1,2,3,4]);
 }

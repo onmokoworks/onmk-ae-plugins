@@ -24,6 +24,33 @@ struct Params {
 @group(0) @binding(10) var<storage, read_write> rgb_b: array<vec4<f32>>;
 @group(0) @binding(11) var<storage, read_write> output_img: array<u32>;
 
+fn load_source(p: u32) -> vec4<f32> {
+    if params.mode2.w == 0u { return unpack_rgba(source[p]); }
+    let o = p * 4u;
+    return bitcast<vec4<f32>>(vec4<u32>(source[o],source[o+1u],source[o+2u],source[o+3u]));
+}
+fn load_mask(p: u32) -> vec4<f32> {
+    if params.mode2.w == 0u { return unpack_rgba(mask_layer[p]); }
+    let o = p * 4u;
+    return bitcast<vec4<f32>>(vec4<u32>(mask_layer[o],mask_layer[o+1u],mask_layer[o+2u],mask_layer[o+3u]));
+}
+fn load_background(p: u32) -> vec4<f32> {
+    if params.mode2.w == 0u { return unpack_rgba(background[p]); }
+    let o = p * 4u;
+    return bitcast<vec4<f32>>(vec4<u32>(background[o],background[o+1u],background[o+2u],background[o+3u]));
+}
+fn load_output(p: u32) -> vec4<f32> {
+    if params.mode2.w == 0u { return unpack_rgba(output_img[p]); }
+    let o = p * 4u;
+    return bitcast<vec4<f32>>(vec4<u32>(output_img[o],output_img[o+1u],output_img[o+2u],output_img[o+3u]));
+}
+fn store_output(p: u32, value: vec4<f32>) {
+    if params.mode2.w == 0u { output_img[p] = pack_rgba(value); return; }
+    let v = bitcast<vec4<u32>>(value);
+    let o = p * 4u;
+    output_img[o]=v.x; output_img[o+1u]=v.y; output_img[o+2u]=v.z; output_img[o+3u]=v.w;
+}
+
 fn idx(x: u32, y: u32) -> u32 {
     return y * params.size.x + x;
 }
@@ -67,10 +94,10 @@ fn sample_clamped(fx_in: f32, fy_in: f32) -> vec3<f32> {
     let dx = fx - f32(x0);
     let dy = fy - f32(y0);
 
-    let c00 = unpack_rgba(background[idx(x0, y0)]).rgb;
-    let c10 = unpack_rgba(background[idx(x1, y0)]).rgb;
-    let c01 = unpack_rgba(background[idx(x0, y1)]).rgb;
-    let c11 = unpack_rgba(background[idx(x1, y1)]).rgb;
+    let c00 = load_background(idx(x0, y0)).rgb;
+    let c10 = load_background(idx(x1, y0)).rgb;
+    let c01 = load_background(idx(x0, y1)).rgb;
+    let c11 = load_background(idx(x1, y1)).rgb;
     let cx0 = c00 * (1.0 - dx) + c10 * dx;
     let cx1 = c01 * (1.0 - dx) + c11 * dx;
     return cx0 * (1.0 - dy) + cx1 * dy;
@@ -229,7 +256,7 @@ fn init_planes(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let p = idx(id.x, id.y);
-    let c = unpack_rgba(mask_layer[p]);
+    let c = load_mask(p);
     let a = c.a / 255.0;
     let r = c.r / 255.0;
     let g = c.g / 255.0;
@@ -320,11 +347,11 @@ fn render_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let x = id.x;
     let y = id.y;
     let p = idx(x, y);
-    let src = unpack_rgba(source[p]);
+    let src = load_source(p);
     let m = clamp(comp_mask[p], 0.0, 1.0);
 
     if m <= 0.0001 {
-        output_img[p] = source[p];
+        store_output(p, src);
         return;
     }
 
@@ -496,7 +523,7 @@ fn render_main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     let comp = src.rgb * (1.0 - m) + acc * m;
     let fin = src.rgb * (1.0 - params.color.x) + comp * params.color.x;
-    output_img[p] = pack_rgba(vec4<f32>(fin, src.a));
+    store_output(p, vec4<f32>(fin, src.a));
 }
 
 @compute @workgroup_size(16, 16, 1)
@@ -505,7 +532,7 @@ fn init_rgb_blur(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let p = idx(id.x, id.y);
-    rgb_a[p] = unpack_rgba(output_img[p]);
+    rgb_a[p] = load_output(p);
 }
 
 @compute @workgroup_size(16, 16, 1)
@@ -534,10 +561,10 @@ fn apply_rgb_blur(@builtin(global_invocation_id) id: vec3<u32>) {
     if m <= 0.0001 {
         return;
     }
-    let cur = unpack_rgba(output_img[p]);
+    let cur = load_output(p);
     let blurred = rgb_a[p];
     let rgb = cur.rgb * (1.0 - m) + blurred.rgb * m;
-    output_img[p] = pack_rgba(vec4<f32>(rgb, cur.a));
+    store_output(p, vec4<f32>(rgb, cur.a));
 }
 
 @compute @workgroup_size(16, 16, 1)
@@ -546,13 +573,13 @@ fn apply_output_mode(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let p = idx(id.x, id.y);
-    let src = unpack_rgba(source[p]);
+    let src = load_source(p);
     if params.mode.x == 3u {
         let v = clamp(comp_mask[p], 0.0, 1.0) * 255.0;
-        output_img[p] = pack_rgba(vec4<f32>(v, v, v, src.a));
+        store_output(p, vec4<f32>(v, v, v, src.a));
     } else if params.mode.x == 4u {
-        let out = unpack_rgba(output_img[p]);
+        let out = load_output(p);
         let d = abs(out.rgb - src.rgb);
-        output_img[p] = pack_rgba(vec4<f32>(d, src.a));
+        store_output(p, vec4<f32>(d, src.a));
     }
 }

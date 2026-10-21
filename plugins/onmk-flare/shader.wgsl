@@ -459,7 +459,7 @@ fn flare_pass(@builtin(global_invocation_id) id: vec3<u32>) {
 
     // Manual source guarantee: independent of input luminance and resilient
     // to invalid values in optional physical layers.
-    if p.source_mode == 1u || p.source_mode == 3u {
+    if (p.source_mode == 1u || p.source_mode == 3u) && p.hotspot_intensity > 0.0 {
         let sigma = max(2.2 * scale, 0.75);
         let manual_core = 3.5 * exp(-dist * dist / (2.0 * sigma * sigma))
             + 0.22 / (1.0 + pow(dist / (18.0 * max(scale, 0.1)), 3.0));
@@ -467,13 +467,28 @@ fn flare_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         // itself, while this bound also rejects infinities and absurd values.
         let flare_is_finite = all(flare == flare) && all(abs(flare) < vec3<f32>(1.0e20));
         flare = select(vec3<f32>(0.0), flare, flare_is_finite);
-        flare += manual_core * vec3<f32>(1.0, 0.92, 0.76);
+        flare += manual_core * (p.hotspot_intensity / 1.6) * vec3<f32>(1.0, 0.92, 0.76);
     }
 
+    // Only reference looks reproduce the comparison PNG's display transform.
+    // Other looks and the source plate retain their existing color pipeline.
+    if p._padding_1 != 0u {
+        let v = max(flare, vec3<f32>(0.0));
+        let mapped = v / (vec3<f32>(1.0) + v);
+        // Finite derivative at black; agree with the CPU reference path.
+        flare = select(pow(mapped, vec3<f32>(1.0 / 2.2)),
+            mapped * pow(1.0e-5, 1.0 / 2.2 - 1.0), mapped < vec3<f32>(1.0e-5));
+    }
     flare *= brightness * p.flare_opacity;
 
     // Composite
-    let pixel = unpack_argb(source[idx]);
+    var pixel: vec4<f32>;
+    if p._padding_0 != 0u {
+        let o = idx * 4u;
+        pixel = bitcast<vec4<f32>>(vec4<u32>(source[o],source[o+1u],source[o+2u],source[o+3u]));
+    } else {
+        pixel = unpack_argb(source[idx]);
+    }
     let src_rgb = vec3<f32>(pixel.y, pixel.z, pixel.w);
     let blended = apply_blend(src_rgb, flare);
     let result = vec4<f32>(
@@ -482,5 +497,11 @@ fn flare_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         src_rgb.y * p.source_opacity + blended.y,
         src_rgb.z * p.source_opacity + blended.z
     );
-    output[idx] = pack_argb(result);
+    if p._padding_0 != 0u {
+        let o = idx * 4u;
+        let words = bitcast<vec4<u32>>(result);
+        output[o]=words.x; output[o+1u]=words.y; output[o+2u]=words.z; output[o+3u]=words.w;
+    } else {
+        output[idx] = pack_argb(result);
+    }
 }

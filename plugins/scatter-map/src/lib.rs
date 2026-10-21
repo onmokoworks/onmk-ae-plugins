@@ -1,6 +1,8 @@
 use after_effects as ae;
 
 mod scatter;
+mod pixels;
+use pixels::Channel;
 
 // ---- Parameter IDs ----
 
@@ -129,64 +131,74 @@ fn get_params(params: &ae::Parameters<Params>) -> Result<ScatterParams, ae::Erro
 
 // ---- Layer helpers ----
 
-fn layer_to_flat(layer: &ae::Layer) -> (Vec<u8>, usize, usize) {
-    let w = layer.width() as usize;
-    let h = layer.height() as usize;
-    let stride = layer.buffer_stride();
-    let buf = layer.buffer();
-    let mut flat = vec![0u8; w * h * 4];
-    for y in 0..h {
-        let src_off = y * stride;
-        let dst_off = y * w * 4;
-        let row_len = w * 4;
-        if src_off + row_len <= buf.len() && dst_off + row_len <= flat.len() {
-            flat[dst_off..dst_off + row_len].copy_from_slice(&buf[src_off..src_off + row_len]);
-        }
+fn process_worlds(sp: &ScatterParams, input: &ae::Layer, output: &mut ae::Layer, map: Option<&[f64]>) -> Result<(), ae::Error> {
+    fn typed<T: Channel>(sp: &ScatterParams, input: &ae::Layer, output: &mut ae::Layer, map: Option<&[f64]>) -> Result<(), ae::Error> {
+        let (src, w, h) = pixels::read::<T>(input)?;
+        let result = scatter::scatter(sp, &src, w, h, map)?;
+        pixels::write(&result, output, w, h)
     }
-    (flat, w, h)
-}
-
-fn flat_to_layer(flat: &[u8], layer: &mut ae::Layer, w: usize, h: usize) {
-    let stride = layer.buffer_stride();
-    let buf = layer.buffer_mut();
-    for y in 0..h {
-        let src_off = y * w * 4;
-        let dst_off = y * stride;
-        let row_len = w * 4;
-        if src_off + row_len <= flat.len() && dst_off + row_len <= buf.len() {
-            buf[dst_off..dst_off + row_len].copy_from_slice(&flat[src_off..src_off + row_len]);
-        }
+    match pixels::channel_bytes(input)? {
+        1 => typed::<u8>(sp, input, output, map),
+        2 => typed::<u16>(sp, input, output, map),
+        4 => typed::<f32>(sp, input, output, map),
+        _ => Err(ae::Error::BadCallbackParameter),
     }
 }
 
 // ---- Luminance map ----
 
-fn build_luminance_map(buf: &[u8], w: usize, h: usize, invert: bool) -> Vec<f64> {
-    let mut map = vec![0.0f64; w * h];
-    for i in 0..(w * h) {
-        let off = i * 4;
-        let r = buf[off + 1] as f64;
-        let g = buf[off + 2] as f64;
-        let b = buf[off + 3] as f64;
-        let luma = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
-        map[i] = if invert { 1.0 - luma } else { luma };
-    }
-    map
+fn map_buffer(w:usize,h:usize)->Result<Vec<f64>,ae::Error> {
+    let n=w.checked_mul(h).ok_or(ae::Error::OutOfMemory)?;
+    let mut map=Vec::new();
+    map.try_reserve_exact(n).map_err(|_|ae::Error::OutOfMemory)?;
+    map.resize(n,0.0);
+    Ok(map)
 }
 
-fn build_luminance_map_resample(
-    buf: &[u8], mw: usize, mh: usize, w: usize, h: usize, invert: bool,
-) -> Vec<f64> {
-    let src_map = build_luminance_map(buf, mw, mh, invert);
-    let mut map = vec![0.0f64; w * h];
+fn build_luminance_map<T: Channel>(buf: &[T], w: usize, h: usize, invert: bool) -> Result<Vec<f64>,ae::Error> {
+    let n=w.checked_mul(h).and_then(|v|v.checked_mul(4)).ok_or(ae::Error::OutOfMemory)?;
+    if buf.len()!=n {return Err(ae::Error::BadCallbackParameter);}
+    let mut map = map_buffer(w,h)?;
+    for i in 0..map.len() {
+        let off = i * 4;
+        let r = buf[off + 1].normalized();
+        let g = buf[off + 2].normalized();
+        let b = buf[off + 3].normalized();
+        let luma = (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0);
+        map[i] = if invert { 1.0 - luma } else { luma };
+    }
+    Ok(map)
+}
+
+fn build_luminance_map_resample<T: Channel>(
+    buf: &[T], mw: usize, mh: usize, w: usize, h: usize, invert: bool,
+) -> Result<Vec<f64>,ae::Error> {
+    if w==0 || h==0 {return Ok(Vec::new());}
+    if mw==0 || mh==0 {return Err(ae::Error::BadCallbackParameter);}
+    let src_map = build_luminance_map(buf, mw, mh, invert)?;
+    if (mw,mh)==(w,h) {return Ok(src_map);}
+    let mut map = map_buffer(w,h)?;
     for y in 0..h {
-        let sy = (y * mh / h).min(mh - 1);
+        let sy = ((y as u128 * mh as u128) / h as u128) as usize;
         for x in 0..w {
-            let sx = (x * mw / w).min(mw - 1);
+            let sx = ((x as u128 * mw as u128) / w as u128) as usize;
             map[y * w + x] = src_map[sy * mw + sx];
         }
     }
-    map
+    Ok(map)
+}
+
+fn map_from_world(layer: &ae::Layer, w: usize, h: usize, invert: bool) -> Result<Vec<f64>, ae::Error> {
+    fn typed<T: Channel>(layer: &ae::Layer, w: usize, h: usize, invert: bool) -> Result<Vec<f64>, ae::Error> {
+        let (flat, mw, mh) = pixels::read::<T>(layer)?;
+        build_luminance_map_resample(&flat, mw, mh, w, h, invert)
+    }
+    match pixels::channel_bytes(layer)? {
+        1 => typed::<u8>(layer, w, h, invert),
+        2 => typed::<u16>(layer, w, h, invert),
+        4 => typed::<f32>(layer, w, h, invert),
+        _ => Err(ae::Error::BadCallbackParameter),
+    }
 }
 
 // ---- Legacy Render ----
@@ -198,12 +210,10 @@ fn render_cpu(
     out_layer: &mut ae::Layer,
 ) -> Result<(), ae::Error> {
     let sp = get_params(params)?;
-    let (src, w, h) = layer_to_flat(in_layer);
+    let (w, h) = (in_layer.width(), in_layer.height());
 
     let luma_map = get_map_layer_luma(params, in_data, w, h, sp.invert_map);
-    let result = scatter::scatter(&sp, &src, w, h, luma_map.as_deref());
-    flat_to_layer(&result, out_layer, w, h);
-    Ok(())
+    process_worlds(&sp, in_layer, out_layer, luma_map.as_deref())
 }
 
 fn get_map_layer_luma(
@@ -219,17 +229,33 @@ fn get_map_layer_luma(
     ).ok()?;
     let layer_def = checkout.as_layer().ok()?;
     let layer = layer_def.value()?;
-    let (flat, mw, mh) = layer_to_flat(&layer);
-    if mw == w && mh == h {
-        Some(build_luminance_map(&flat, w, h, invert))
-    } else {
-        Some(build_luminance_map_resample(&flat, mw, mh, w, h, invert))
-    }
+    map_from_world(&layer, w, h, invert).ok()
 }
 
 // ---- SmartFX ----
 
 const MAP_CHECKOUT_ID: i32 = 1;
+
+#[cfg(test)]
+mod map_tests {
+    use super::*;
+    #[test]
+    fn map_geometry_and_nearest_resampling_are_checked() {
+        assert!(build_luminance_map_resample::<u8>(&[],0,1,2,3,false).is_err());
+        assert!(build_luminance_map::<u8>(&[0;3],1,1,false).is_err());
+        assert!(build_luminance_map::<u8>(&[],usize::MAX,2,false).is_err());
+        assert!(map_buffer(usize::MAX,2).is_err());
+        assert!(map_buffer(usize::MAX,1).is_err());
+        assert_eq!(build_luminance_map_resample::<u8>(&[],0,0,0,3,false).unwrap(),Vec::<f64>::new());
+        let src=[255u8,0,0,0,255,255,255,255];
+        let original=build_luminance_map(&src,2,1,false).unwrap();
+        assert_eq!(build_luminance_map_resample(&src,2,1,2,1,false).unwrap(),original);
+        let resized=build_luminance_map_resample(&src,2,1,3,2,false).unwrap();
+        assert_eq!(resized,[original[0],original[0],original[1],original[0],original[0],original[1]]);
+        let inv=build_luminance_map_resample(&src,2,1,3,2,true).unwrap();
+        for (a,b) in resized.iter().zip(inv) {assert!((a+b-1.0).abs()<1e-12);}
+    }
+}
 
 fn smart_pre_render(
     in_data: &ae::InData,
@@ -275,25 +301,22 @@ fn smart_render_cpu(
     let cb = extra.callbacks();
 
     let input_world = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
+    let mut map_checked_out = false;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), ae::Error> {
     let mut output_world = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
-    let (src, w, h) = layer_to_flat(&input_world);
+    let (w, h) = (input_world.width(), input_world.height());
 
     let invert = sp.invert_map;
     let luma_map = if let Ok(Some(map_world)) = cb.checkout_layer_pixels(MAP_CHECKOUT_ID as u32) {
-        let (map_flat, mw, mh) = layer_to_flat(&map_world);
-        if mw == w && mh == h {
-            Some(build_luminance_map(&map_flat, w, h, invert))
-        } else {
-            Some(build_luminance_map_resample(&map_flat, mw, mh, w, h, invert))
-        }
+        map_checked_out = true;
+        Some(map_from_world(&map_world, w, h, invert)?)
     } else {
         None
     };
 
-    let result = scatter::scatter(&sp, &src, w, h, luma_map.as_deref());
-    flat_to_layer(&result, &mut output_world, w, h);
-
-    cb.checkin_layer_pixels(0)?;
-    let _ = cb.checkin_layer_pixels(MAP_CHECKOUT_ID as u32);
-    Ok(())
+    process_worlds(&sp, &input_world, &mut output_world, luma_map.as_deref())
+    })).unwrap_or(Err(ae::Error::InternalStructDamaged));
+    let input_checkin = cb.checkin_layer_pixels(0);
+    let map_checkin = if map_checked_out { cb.checkin_layer_pixels(MAP_CHECKOUT_ID as u32) } else { Ok(()) };
+    result.and(input_checkin).and(map_checkin)
 }

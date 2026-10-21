@@ -80,7 +80,7 @@ impl DepthEngine {
     }
 
     pub fn configure(&mut self, model_dir: PathBuf, manifest: ModelManifest) {
-        if self.model_dir == model_dir && self.manifest.id == manifest.id {
+        if self.model_dir == model_dir && self.manifest == manifest {
             return;
         }
         self.model_dir = model_dir;
@@ -180,4 +180,41 @@ fn build_session(model_path: &Path) -> Result<Session, EngineError> {
     builder
         .commit_from_file(model_path)
         .map_err(|e| EngineError::SessionInit(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_id_configuration_accepts_changed_manifest() {
+        let original = ModelManifest {
+            id: "stable-id".into(), label: "Model".into(),
+            preprocess: "imagenet_rgb".into(), input_name: "input".into(),
+            output_name: "output".into(),
+            variants: [("266".into(), "old.onnx".into())].into(),
+        };
+        // No runtime or fake Session: exercise the actual configuration method.
+        for change in 0..5 {
+            let mut engine = DepthEngine {
+                model_dir: PathBuf::from("test-model"), manifest: original.clone(),
+                sessions: Mutex::new(HashMap::new()),
+            };
+            let mut revised = original.clone();
+            match change {
+                0 => { revised.variants.insert("266".into(), "new.onnx".into()); }
+                1 => revised.input_name = "new_input".into(),
+                2 => revised.output_name = "new_output".into(),
+                3 => revised.preprocess = "revised-preprocess".into(),
+                _ => revised.label = "New label".into(),
+            }
+            engine.configure(PathBuf::from("test-model"), revised.clone());
+            assert_eq!(engine.manifest, revised, "change={change}");
+            engine.configure(PathBuf::from("test-model"), revised.clone());
+            assert_eq!(engine.manifest, revised);
+            engine.configure(PathBuf::from("other-model"), original.clone());
+            assert_eq!(engine.model_dir, PathBuf::from("other-model"));
+            assert_eq!(engine.manifest, original);
+        }
+    }
 }

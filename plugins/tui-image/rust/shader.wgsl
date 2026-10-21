@@ -10,9 +10,10 @@ struct Params {
     edge_boost: f32,
     invert: u32,
     source_mix: f32,
-    _pad0: f32,
+    source_flags: u32,
     foreground: vec4<f32>,
     background: vec4<f32>,
+    glyph_layout: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -28,7 +29,8 @@ fn unpack_rgba8(px: u32) -> vec4<f32> {
 }
 
 fn pack_rgba8(c: vec4<f32>) -> u32 {
-    let q = vec4<u32>(clamp(c, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0);
+    // Match CPU to_u8: nearest integer, positive half ties round up.
+    let q = vec4<u32>(clamp(c, vec4<f32>(0.0), vec4<f32>(1.0)) * 255.0 + 0.5);
     return (q.r << 24u) | (q.g << 16u) | (q.b << 8u) | q.a;
 }
 
@@ -40,9 +42,9 @@ fn band_fill(local_y: u32, cell_h: u32, coverage: f32) -> bool {
     return (f32(cell_h) - f32(local_y)) / f32(cell_h) <= coverage;
 }
 
-fn near_line(v: u32, target: u32, thickness: u32) -> bool {
-    let lo = select(0u, target - thickness, target > thickness);
-    let hi = target + thickness;
+fn near_line(v: u32, line_position: u32, thickness: u32) -> bool {
+    let lo = select(0u, line_position - thickness, line_position > thickness);
+    let hi = line_position + thickness;
     return v >= lo && v <= hi;
 }
 
@@ -142,7 +144,22 @@ fn tui_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let avg_rgb = sum_rgb / max(count, 1.0);
-    var y = pow(clamp((sum_luma / max(count, 1.0)) * params.contrast, 0.0, 1.0), max(params.gamma, 0.001));
+    var edge_sum = 0.0;
+    var edge_count = 0.0;
+    if (params.edge_boost > 0.0 && params.width >= 3u && params.height >= 3u) {
+        for (var ey = max(y0, 1u); ey < min(y1, params.height - 1u); ey += 1u) {
+            for (var ex = max(x0, 1u); ex < min(x1, params.width - 1u); ex += 1u) {
+                let left = luma(unpack_rgba8(source_pixels[ey * params.width + ex - 1u]).rgb);
+                let right = luma(unpack_rgba8(source_pixels[ey * params.width + ex + 1u]).rgb);
+                let up = luma(unpack_rgba8(source_pixels[(ey - 1u) * params.width + ex]).rgb);
+                let down = luma(unpack_rgba8(source_pixels[(ey + 1u) * params.width + ex]).rgb);
+                edge_sum += (abs(right - left) + abs(down - up)) * 0.5;
+                edge_count += 1.0;
+            }
+        }
+    }
+    let edge = clamp(edge_sum / max(edge_count, 1.0), 0.0, 1.0);
+    var y = pow(clamp((sum_luma / max(count, 1.0) + edge * params.edge_boost) * params.contrast, 0.0, 1.0), max(params.gamma, 0.001));
     if (params.invert != 0u) {
         y = 1.0 - y;
     }
@@ -153,18 +170,31 @@ fn tui_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
     } else if (params.preset == 4u) {
         levels = 12.0;
     }
-    let coverage = round(y * levels) / levels;
+    let density_luma = select(1.0, y, (params.source_flags & 1u) != 0u);
+    let density_level = floor(density_luma * levels + 0.5);
+    let coverage = density_level / levels;
     let local_x = gid.x - x0;
     let local_y = gid.y - y0;
-    let fill = select(
+    let actual_w = x1 - x0;
+    let actual_h = y1 - y0;
+    let glyph_w = clamp(u32(floor(f32(actual_w) * params.glyph_layout.x + 0.5)), 1u, actual_w);
+    let glyph_h = clamp(u32(floor(f32(actual_h) * params.glyph_layout.y + 0.5)), 1u, actual_h);
+    let glyph_x = (actual_w - glyph_w) / 2u;
+    let glyph_y = (actual_h - glyph_h) / 2u;
+    var fill = false;
+    if (local_x >= glyph_x && local_x < glyph_x + glyph_w && local_y >= glyph_y && local_y < glyph_y + glyph_h) {
+    let gx = local_x - glyph_x;
+    let gy = local_y - glyph_y;
+    fill = select(
         select(
-            band_fill(local_y, cell_h, coverage),
-            braille_fill(u32(clamp(floor(y * 8.0 + 0.5), 0.0, 8.0)), local_x, local_y, cell_w, cell_h),
+            band_fill(gy, glyph_h, coverage),
+            braille_fill(u32(clamp(density_level, 0.0, 8.0)), gx, gy, glyph_w, glyph_h),
             params.preset == 3u
         ),
-        ascii_fill(u32(clamp(floor(y * 9.0 + 0.5), 0.0, 9.0)), local_x, local_y, cell_w, cell_h),
+        ascii_fill(u32(clamp(density_level, 0.0, 9.0)), gx, gy, glyph_w, glyph_h),
         params.preset == 1u
     );
+    }
 
     var fg = params.foreground.rgb;
     if (params.color_mode == 2u) {
@@ -179,7 +209,8 @@ fn tui_pass(@builtin(global_invocation_id) gid: vec3<u32>) {
         );
     }
 
-    let cell_color = vec4<f32>(select(params.background.rgb, fg, fill), 1.0);
+    let fill_color = select(fg, src.rgb, (params.source_flags & 2u) != 0u);
+    let cell_color = vec4<f32>(select(params.background.rgb, fill_color, fill), 1.0);
     let mixed = mix(cell_color, src, params.source_mix);
     output_pixels[idx] = pack_rgba8(vec4<f32>(mixed.rgb, 1.0));
 }

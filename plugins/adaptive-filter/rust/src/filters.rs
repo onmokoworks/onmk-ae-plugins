@@ -1,23 +1,37 @@
 /// CPU filter implementations for AdaptiveFilter.
-/// All filters operate on flat &[u8] pixel slices (ARGB 8-bit, 4 bytes per pixel).
+/// Filters retain the native channel type. Color-distance math uses the original
+/// 0..255 scale so edge parameters keep the same meaning at every depth.
 /// When a luminance map is provided, the effective radius is scaled per-pixel:
 ///   effective_radius = max(1, round(radius * luma))
 /// Bright map areas → full filter strength, dark areas → minimal filtering.
 
-#[inline]
-fn clamp8(v: i32) -> u8 {
-    v.clamp(0, 255) as u8
+/// Conversion uses f64 without reducing deep/float channels to eight bits.
+pub trait Channel: Copy + Default {
+    fn value(self) -> f64;
+    fn from_value(v: f64) -> Self;
+}
+impl Channel for u8 {
+    fn value(self) -> f64 { self as f64 }
+    fn from_value(v: f64) -> Self { (v + 0.5).clamp(0.0, 255.0) as u8 }
+}
+impl Channel for u16 {
+    fn value(self) -> f64 { self as f64 * (255.0 / 32768.0) }
+    fn from_value(v: f64) -> Self { (v * (32768.0 / 255.0)).round().clamp(0.0, 32768.0) as u16 }
+}
+impl Channel for f32 {
+    fn value(self) -> f64 { self as f64 * 255.0 }
+    fn from_value(v: f64) -> Self { (v / 255.0) as f32 }
 }
 
 #[inline]
-fn lerp8(a: u8, b: u8, t: f64) -> u8 {
-    clamp8((a as f64 * (1.0 - t) + b as f64 * t + 0.5) as i32)
+fn lerp<T: Channel>(a: T, b: T, t: f64) -> T {
+    T::from_value(a.value() * (1.0 - t) + b.value() * t)
 }
 
 /// Read pixel ARGB from a flat buffer with clamped coordinates.
 /// Returns (A, R, G, B).
 #[inline]
-fn read_pixel(buf: &[u8], w: usize, h: usize, x: i32, y: i32) -> (u8, u8, u8, u8) {
+fn read_pixel<T: Channel>(buf: &[T], w: usize, h: usize, x: i32, y: i32) -> (T, T, T, T) {
     let cx = x.clamp(0, w as i32 - 1) as usize;
     let cy = y.clamp(0, h as i32 - 1) as usize;
     let off = (cy * w + cx) * 4;
@@ -25,7 +39,7 @@ fn read_pixel(buf: &[u8], w: usize, h: usize, x: i32, y: i32) -> (u8, u8, u8, u8
 }
 
 #[inline]
-fn write_pixel(buf: &mut [u8], w: usize, x: usize, y: usize, a: u8, r: u8, g: u8, b: u8) {
+fn write_pixel<T: Channel>(buf: &mut [T], w: usize, x: usize, y: usize, a: T, r: T, g: T, b: T) {
     let off = (y * w + x) * 4;
     buf[off] = a;
     buf[off + 1] = r;
@@ -47,9 +61,9 @@ fn effective_radius(base_radius: usize, luma_map: Option<&[f64]>, px_index: usiz
 
 // ---- 1. Kuwahara (4 quadrants) ----
 
-pub fn filter_kuwahara(
-    src: &[u8],
-    dst: &mut [u8],
+pub fn filter_kuwahara<T: Channel>(
+    src: &[T],
+    dst: &mut [T],
     w: usize,
     h: usize,
     radius: usize,
@@ -84,7 +98,7 @@ pub fn filter_kuwahara(
                 for ky in y0..=y1 {
                     for kx in x0..=x1 {
                         let (_, pr, pg, pb) = read_pixel(src, w, h, x + kx, y + ky);
-                        let (rf, gf, bf) = (pr as f64, pg as f64, pb as f64);
+                        let (rf, gf, bf) = (pr.value(), pg.value(), pb.value());
                         sum_r += rf;
                         sum_g += gf;
                         sum_b += bf;
@@ -116,9 +130,9 @@ pub fn filter_kuwahara(
                 x as usize,
                 y as usize,
                 a,
-                clamp8((best_r + 0.5) as i32),
-                clamp8((best_g + 0.5) as i32),
-                clamp8((best_b + 0.5) as i32),
+                T::from_value(best_r),
+                T::from_value(best_g),
+                T::from_value(best_b),
             );
         }
     }
@@ -126,9 +140,9 @@ pub fn filter_kuwahara(
 
 // ---- 2. Generalized Kuwahara (8 sectors, weighted blending) ----
 
-pub fn filter_gen_kuwahara(
-    src: &[u8],
-    dst: &mut [u8],
+pub fn filter_gen_kuwahara<T: Channel>(
+    src: &[T],
+    dst: &mut [T],
     w: usize,
     h: usize,
     radius: usize,
@@ -166,7 +180,7 @@ pub fn filter_gen_kuwahara(
                     let sw = (-(dist * dist) / (2.0 * rf * rf * 0.25)).exp();
 
                     let (_, pr, pg, pb) = read_pixel(src, w, h, x + kx, y + ky);
-                    let (rv, gv, bv) = (pr as f64, pg as f64, pb as f64);
+                    let (rv, gv, bv) = (pr.value(), pg.value(), pb.value());
                     s_r[sec] += rv * sw;
                     s_g[sec] += gv * sw;
                     s_b[sec] += bv * sw;
@@ -209,9 +223,9 @@ pub fn filter_gen_kuwahara(
                 x as usize,
                 y as usize,
                 a,
-                clamp8((total_r / total_w + 0.5) as i32),
-                clamp8((total_g / total_w + 0.5) as i32),
-                clamp8((total_b / total_w + 0.5) as i32),
+                T::from_value(total_r / total_w),
+                T::from_value(total_g / total_w),
+                T::from_value(total_b / total_w),
             );
         }
     }
@@ -219,9 +233,9 @@ pub fn filter_gen_kuwahara(
 
 // ---- 3. Bilateral Filter ----
 
-pub fn filter_bilateral(
-    src: &[u8],
-    dst: &mut [u8],
+pub fn filter_bilateral<T: Channel>(
+    src: &[T],
+    dst: &mut [T],
     w: usize,
     h: usize,
     radius: usize,
@@ -240,7 +254,7 @@ pub fn filter_bilateral(
             let inv_sr2 = 1.0 / (2.0 * sigma_r * sigma_r);
 
             let (ca, cr, cg, cb) = read_pixel(src, w, h, x, y);
-            let (crf, cgf, cbf) = (cr as f64, cg as f64, cb as f64);
+            let (crf, cgf, cbf) = (cr.value(), cg.value(), cb.value());
             let mut sum_r = 0.0f64;
             let mut sum_g = 0.0f64;
             let mut sum_b = 0.0f64;
@@ -249,15 +263,15 @@ pub fn filter_bilateral(
             for ky in -r..=r {
                 for kx in -r..=r {
                     let (_, pr, pg, pb) = read_pixel(src, w, h, x + kx, y + ky);
-                    let dr = pr as f64 - crf;
-                    let dg = pg as f64 - cgf;
-                    let db = pb as f64 - cbf;
+                    let dr = pr.value() - crf;
+                    let dg = pg.value() - cgf;
+                    let db = pb.value() - cbf;
                     let wt = (-(kx * kx + ky * ky) as f64 * inv_ss2
                         - (dr * dr + dg * dg + db * db) * inv_sr2)
                         .exp();
-                    sum_r += pr as f64 * wt;
-                    sum_g += pg as f64 * wt;
-                    sum_b += pb as f64 * wt;
+                    sum_r += pr.value() * wt;
+                    sum_g += pg.value() * wt;
+                    sum_b += pb.value() * wt;
                     sum_w += wt;
                 }
             }
@@ -271,9 +285,9 @@ pub fn filter_bilateral(
                 x as usize,
                 y as usize,
                 ca,
-                clamp8((sum_r / sum_w + 0.5) as i32),
-                clamp8((sum_g / sum_w + 0.5) as i32),
-                clamp8((sum_b / sum_w + 0.5) as i32),
+                T::from_value(sum_r / sum_w),
+                T::from_value(sum_g / sum_w),
+                T::from_value(sum_b / sum_w),
             );
         }
     }
@@ -281,10 +295,10 @@ pub fn filter_bilateral(
 
 // ---- Dispatch ----
 
-pub fn dispatch_filter(
+pub fn dispatch_filter<T: Channel>(
     filter_type: i32,
-    src: &[u8],
-    dst: &mut [u8],
+    src: &[T],
+    dst: &mut [T],
     w: usize,
     h: usize,
     radius: usize,
@@ -301,15 +315,55 @@ pub fn dispatch_filter(
 
 // ---- Mix ----
 
-pub fn mix_buffers(original: &[u8], filtered: &[u8], output: &mut [u8], mix: f64) {
+pub fn mix_buffers<T: Channel>(original: &[T], filtered: &[T], output: &mut [T], mix: f64) {
     if mix >= 1.0 - 1e-6 {
         output.copy_from_slice(filtered);
     } else {
         for i in (0..original.len()).step_by(4) {
             output[i] = original[i]; // alpha
-            output[i + 1] = lerp8(original[i + 1], filtered[i + 1], mix);
-            output[i + 2] = lerp8(original[i + 2], filtered[i + 2], mix);
-            output[i + 3] = lerp8(original[i + 3], filtered[i + 3], mix);
+            output[i + 1] = lerp(original[i + 1], filtered[i + 1], mix);
+            output[i + 2] = lerp(original[i + 2], filtered[i + 2], mix);
+            output[i + 3] = lerp(original[i + 3], filtered[i + 3], mix);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_sixteen_bit_codes_survive_conversion() {
+        for value in 0u16..=32768 {
+            assert_eq!(u16::from_value(value.value()), value);
+        }
+    }
+
+    #[test]
+    fn deep_filters_preserve_constant_sub_byte_detail() {
+        for mode in 1..=3 {
+            let source = [32768u16, 16385, 16387, 1];
+            let mut output = [0u16; 4];
+            dispatch_filter(mode, &source, &mut output, 1, 1, 2, 50.0, None);
+            assert_eq!(output, source, "16-bit mode {mode}");
+            let source = [0.75f32, -0.125, 2.0, 0.000030517578];
+            let mut output = [0f32; 4];
+            dispatch_filter(mode, &source, &mut output, 1, 1, 2, 50.0, None);
+            for (actual, expected) in output.iter().zip(source) {
+                assert!((actual - expected).abs() < 1e-7, "float mode {mode}");
+            }
+        }
+    }
+
+    #[test]
+    fn deep_bilateral_produces_non_byte_aligned_output() {
+        let source = [32768u16,16385,16385,16385,32768,16387,16387,16387];
+        let mut output = [0u16; 8];
+        dispatch_filter(3, &source, &mut output, 2, 1, 1, 100.0, None);
+        // The spatial weights average both levels to 16386 after native
+        // rounding; neither an 8-bit conversion nor a passthrough can pass.
+        assert_eq!(output[1], 16386);
+        assert_eq!(output[5], 16386);
+        assert_eq!(output[0], 32768);
     }
 }

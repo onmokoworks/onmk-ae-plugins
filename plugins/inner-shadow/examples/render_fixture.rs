@@ -48,6 +48,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         save(&dest.join(label), w, h, &px)?;
     }
+    let mut shadow_plan = plan.clone();
+    shadow_plan.keep_source = false;
+    let (shadow_pixels, shadow_route) =
+        render(&image, &image.rect(), &shadow_plan, GpuMode::Gpu).map_err(|e| format!("{e:?}"))?;
+    println!("shadow only: {shadow_route:?}");
+    save(&dest.join("shadow-only"), w, h, &shadow_pixels)?;
     let hard = ShadowParams {
         distance: 0.0,
         size: 10.0,

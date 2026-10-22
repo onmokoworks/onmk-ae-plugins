@@ -1,6 +1,6 @@
 [package]
 name = "inner-shadow"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 publish = false
 description = "onmk Inner Shadow: conventional inset shadow for After Effects (CPU + wgpu compute)"

@@ -165,3 +165,11 @@ tests/oracle.rs tests/gpu.rs examples/render_fixture.rs
 - PAR ≠ 1 や downsample のときのホスト上の見え方。
 - AE の 32 bit Legacy Render の有無。
 - 実機 AE の MFR 下での GPU 直列化の性能。
+
+## 0.2.0: Keep Source / macOS
+
+`KeepSource` checkbox is appended after `GpuMode`, default true. The original alpha-preserving compositing and identity rules above apply with Keep Source enabled. Existing parameter variant names and indices remain unchanged.
+
+When disabled, output straight RGB is the selected shadow color and output alpha is `clamp(input_alpha, 0, 1) * clamp(shadow_amount, 0, 1)`. Shadow amount includes opacity. Blend Mode has no effect in this mode. Zero opacity returns transparent output without initializing the GPU. CPU and wgpu share this finalization; the GPU still computes the shadow mask.
+
+The pinned wgpu dependency enables Metal. `build_macos_release.sh` packages a native Apple Silicon or Intel `.plugin` with PiPL, Info.plist, executable and ad-hoc signature. macOS compilation, Metal execution and AE loading remain unverified; see [macOS instructions](macos.md).

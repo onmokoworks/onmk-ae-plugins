@@ -24,6 +24,7 @@ enum Params {
     Choke,
     Size,
     GpuMode,
+    KeepSource,
 }
 
 #[derive(Clone)]
@@ -119,6 +120,14 @@ impl AdobePluginGlobal for Plugin {
                 f.set_default(1);
             }),
         )?;
+        params.add(
+            Params::KeepSource,
+            "Keep Source",
+            ae::CheckBoxDef::setup(|f| {
+                f.set_default(true);
+                f.set_label("Keep Source");
+            }),
+        )?;
         Ok(())
     }
 
@@ -132,7 +141,7 @@ impl AdobePluginGlobal for Plugin {
         match cmd {
             ae::Command::About => {
                 out_data.set_return_msg(
-                    "onmk Inner Shadow v0.1\rConventional inset shadow: angle, distance, choke, size.\rStraight RGB, original alpha. CPU or wgpu compute (Render Device).",
+                    "onmk Inner Shadow v0.2\rInner shadow with optional source.\rCPU or wgpu compute (Render Device).",
                 );
             }
             ae::Command::Render {
@@ -210,7 +219,9 @@ fn host_scale(i: &ae::InData) -> Result<Scale, ae::Error> {
 
 fn plan_for(i: &ae::InData, p: &ae::Parameters<Params>) -> Result<(Plan, GpuMode), ae::Error> {
     let (shadow, mode) = read_params(p)?;
-    let plan = Plan::new(&shadow, &host_scale(i)?).map_err(|_| ae::Error::BadCallbackParameter)?;
+    let mut plan =
+        Plan::new(&shadow, &host_scale(i)?).map_err(|_| ae::Error::BadCallbackParameter)?;
+    plan.keep_source = p.get(Params::KeepSource)?.as_checkbox()?.value();
     Ok((plan, mode))
 }
 
@@ -305,7 +316,7 @@ fn smart_pre_render(
         i.time_scale(),
     )?;
     let input_rect = rect64(got.result_rect.into());
-    // Alpha is preserved: the output never extends beyond the input.
+    // Both modes stay within the input alpha support.
     extra.set_result_rect(ae_rect(input_rect.intersect(&out_rect))?);
     extra.set_max_result_rect(got.max_result_rect.into());
     extra.set_pre_render_data(PreState {
@@ -362,6 +373,7 @@ mod tests {
             Params::Choke,
             Params::Size,
             Params::GpuMode,
+            Params::KeepSource,
         ]
         .iter()
         .map(|p| format!("{p:?}"))
@@ -376,7 +388,8 @@ mod tests {
                 "Distance",
                 "Choke",
                 "Size",
-                "GpuMode"
+                "GpuMode",
+                "KeepSource"
             ]
         );
     }

@@ -70,6 +70,8 @@ pub struct GpuRun {
 pub enum Route {
     /// Opacity 0 or empty output: copy only, no mask, no GPU initialisation.
     Identity,
+    /// Zero-opacity shadow-only output: fully transparent, no GPU initialisation.
+    Transparent,
     Cpu,
     Gpu(GpuRun),
     /// Auto mode: GPU unavailable/unsupported/failed, CPU used. Reason kept.
@@ -217,7 +219,12 @@ where
     G: FnOnce(&Prepared, &Plan) -> Result<(Vec<[f32; 4]>, GpuRun), String>,
 {
     if plan.identity || out.is_empty() {
-        return Ok((copy_region(input, out)?, Route::Identity));
+        let mut pixels = copy_region(input, out)?;
+        if !plan.keep_source {
+            pixels.fill([plan.color[0], plan.color[1], plan.color[2], 0.0]);
+            return Ok((pixels, Route::Transparent));
+        }
+        return Ok((pixels, Route::Identity));
     }
     let prep = prepare(input, out, plan)?;
     let checked = |r: Result<(Vec<[f32; 4]>, GpuRun), String>| match r {
@@ -244,7 +251,19 @@ where
         prep.src
             .iter()
             .zip(&shaded)
-            .map(|(s, d)| finalize(*s, *d))
+            .map(|(s, d)| {
+                if plan.keep_source {
+                    finalize(*s, *d)
+                } else {
+                    // Shadow colour remains straight: coverage is carried only in alpha.
+                    [
+                        plan.color[0],
+                        plan.color[1],
+                        plan.color[2],
+                        coverage(s[3]) * coverage(d[3]),
+                    ]
+                }
+            })
             .collect(),
         route,
     ))

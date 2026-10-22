@@ -180,6 +180,8 @@ pub struct Dilation {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
+    /// True overlays the shadow on the source; false returns straight shadow RGBA.
+    pub keep_source: bool,
     /// Opacity 0: bit-exact copy, no mask, no GPU initialisation.
     pub identity: bool,
     pub blend: Blend,
@@ -342,6 +344,7 @@ impl Plan {
         let pad_x = (kernel_x.len() / 2) as i64 + reach(|d| d.reach_x);
         let pad_y = (kernel_y.len() / 2) as i64 + reach(|d| d.reach_y);
         Ok(Plan {
+            keep_source: true,
             identity: p.opacity == 0.0,
             blend: p.blend,
             color: p.color,

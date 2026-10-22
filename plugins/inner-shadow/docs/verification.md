@@ -56,3 +56,12 @@ Set Choke=100% to remove Gaussian softness. For an inward outline use Distance=0
 ## Deployment — 2026-10-21
 
 At the user's explicit request, InnerShadow.aex was copied to the Adobe Common Plug-ins/7.0/MediaCore/onmk directory. Source and destination SHA256 both match the artifact identity above. AE was not started or restarted; actual AE loading remains unverified.
+
+## 0.2.0 update — 2026-10-22
+
+- Keep Source defaults on; off produces straight-color shadow-only output with coverage-weighted alpha. Zero opacity is transparent in this mode.
+- 49 tests passed with `INNER_SHADOW_REQUIRE_GPU=1`: the previous 46 plus 3 shadow-only tests, including actual NVIDIA RTX 4070 Ti Vulkan execution. Independent alpha-ladder and opaque-rectangle expectations, 8/16-bit encoding and a deliberately premultiplied negative control are included.
+- Windows x64 release build passed. SHA256 of `dist/InnerShadow.aex`: `D69336F4A7300D3054BCB3BE755FB62FE53F077B3A5061A1E2CBE8AFB3B6A9D8`.
+- CPU, GPU and shadow-only GPU fixtures generated under local ignored `verification/v0.2/`. The Keep Source comparison image was inspected.
+- Mac script passed Bash syntax checking. Pinned wgpu Metal features and PiPL resource output paths were inspected. Mac compilation/linking, Metal execution, signing execution and AE loading are unverified in this Windows environment.
+- AE was not launched or restarted. The earlier AEXCompat host audit failure remains unresolved; no AE host validation is claimed.

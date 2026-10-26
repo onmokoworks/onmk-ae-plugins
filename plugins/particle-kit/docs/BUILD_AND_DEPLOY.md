@@ -221,3 +221,7 @@ Some AE installs do not scan the user MediaCore folder for native `.aex`
 effects. If the smoke report can add `ParticleKit` but fails to add
 `LatticeLab`, deploy to `SystemMediaCore` from an elevated shell and rerun the
 same smoke command.
+
+## macOS
+
+See [macos.md](./macos.md). In short: run `bash build_macos_release.sh` to get Universal `dist/ParticleKit.plugin` and `dist/LatticeLab.plugin`.

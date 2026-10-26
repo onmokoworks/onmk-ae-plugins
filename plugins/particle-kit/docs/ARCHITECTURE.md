@@ -3,8 +3,7 @@
 This project should keep three concerns separate:
 
 - ParticleLab: the stable particle effect.
-- Lattice Lab: the standalone point-network effect, formerly discussed with
-  the internal Network prototype name.
+- Lattice Lab: the standalone point-network effect.
 - Node UI: the graph editor and graph document model that can drive ParticleLab
   later without turning every node into AE host parameters.
 
@@ -210,8 +209,8 @@ sequence data remains the host-owned persistence layer.
 
 ## Naming
 
-Do not ship the standalone point-network effect as `Network`. Use that only as a
-legacy/internal reference when dealing with old prototype parameter slots.
+The legacy `Network` parameter slots in Particle Kit exist only so that old projects
+keep loading. The standalone point-network effect ships as Lattice Lab.
 
 Working title: `Lattice Lab`
 

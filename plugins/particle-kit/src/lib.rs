@@ -1,12 +1,8 @@
 use after_effects as ae;
-#[cfg(windows)]
 use std::fs;
-#[cfg(windows)]
 use std::fs::OpenOptions;
-#[cfg(windows)]
 use std::io::Write;
 use std::panic::{self, AssertUnwindSafe};
-#[cfg(windows)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -64,6 +60,59 @@ mod file_dialog {
             None
         } else {
             Some(PathBuf::from(path_str))
+        }
+    }
+}
+
+// ---- File dialog via osascript (macOS) ----
+#[cfg(target_os = "macos")]
+mod file_dialog {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn applescript_string(text: &str) -> String {
+        format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    fn run(script: &str) -> Option<PathBuf> {
+        let output = Command::new("osascript")
+            .args(["-e", script])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path_str.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(path_str))
+        }
+    }
+
+    pub fn open_file_dialog(initial_dir: &str, title: &str) -> Option<PathBuf> {
+        run(&format!(
+            "activate\nPOSIX path of (choose file with prompt {} default location (POSIX file {}) of type {{\"json\", \"public.json\"}})",
+            applescript_string(title),
+            applescript_string(initial_dir)
+        ))
+    }
+
+    pub fn save_file_dialog(initial_dir: &str, title: &str, default_name: &str) -> Option<PathBuf> {
+        let path = run(&format!(
+            "activate\nPOSIX path of (choose file name with prompt {} default name {} default location (POSIX file {}))",
+            applescript_string(title),
+            applescript_string(default_name),
+            applescript_string(initial_dir)
+        ))?;
+        // Match the Windows dialog's DefaultExt = json.
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
+            Some(path)
+        } else {
+            Some(path.with_extension("json"))
         }
     }
 }
@@ -427,7 +476,6 @@ const MAX_SMART_PRE_RENDER_MARGIN: i32 = 4096;
 const RENDER_TIME_BUDGET_MS: u128 = 10_000;
 const AE_PARAM_DYNAMIC_NAME_MAX_CHARS: usize = 31;
 
-#[cfg(windows)]
 fn debug_log(level: &str, message: impl AsRef<str>) {
     let sanitize = |text: &str| text.replace(['\r', '\n', '\t'], " ");
     let line = format!(
@@ -439,6 +487,7 @@ fn debug_log(level: &str, message: impl AsRef<str>) {
         sanitize(message.as_ref()),
     );
 
+    #[cfg(windows)]
     if let Ok(mut pipe) = OpenOptions::new()
         .write(true)
         .open(r"\\.\pipe\AEExternalDebug")
@@ -448,11 +497,8 @@ fn debug_log(level: &str, message: impl AsRef<str>) {
     }
 
     // Also write to file for post-mortem debugging
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        let log_path = std::path::Path::new(&profile)
-            .join("Documents")
-            .join("Particle Kit")
-            .join("debug.log");
+    if let Ok(root) = particle_kit_documents_dir() {
+        let log_path = root.join("debug.log");
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -461,9 +507,6 @@ fn debug_log(level: &str, message: impl AsRef<str>) {
         }
     }
 }
-
-#[cfg(not(windows))]
-fn debug_log(_level: &str, _message: impl AsRef<str>) {}
 
 fn debug_info(message: impl AsRef<str>) {
     debug_log("INFO", message);
@@ -2351,32 +2394,35 @@ impl AdobePluginInstance for ParticleLabProjectState {
 
 // ---- Extract all parameters into configs ----
 
-#[cfg(windows)]
 fn preset_root_dir() -> Result<PathBuf, ae::Error> {
-    let userprofile = std::env::var("USERPROFILE").map_err(|_| ae::Error::Generic)?;
-    Ok(PathBuf::from(userprofile)
-        .join("Documents")
-        .join("Particle Kit")
-        .join("presets"))
+    Ok(particle_kit_documents_dir()?.join("presets"))
 }
 
-#[cfg(not(windows))]
-fn preset_root_dir() -> Result<std::path::PathBuf, ae::Error> {
-    Err(ae::Error::Generic)
+/// `Documents/Particle Kit` in the user's home folder (Windows: USERPROFILE, macOS: HOME).
+fn particle_kit_documents_dir() -> Result<PathBuf, ae::Error> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    let home = home.filter(|h| !h.is_empty()).ok_or(ae::Error::Generic)?;
+    Ok(PathBuf::from(home).join("Documents").join("Particle Kit"))
 }
 
-#[cfg(windows)]
+/// Opens a file or folder with the system shell (Explorer / Finder).
+fn reveal_in_shell(path: &std::path::Path) -> Result<(), ae::Error> {
+    #[cfg(windows)]
+    let program = "explorer.exe";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    std::process::Command::new(program)
+        .arg(path.as_os_str())
+        .spawn()
+        .map_err(|_| ae::Error::Generic)?;
+    Ok(())
+}
+
 fn node_graph_state_root_dir() -> Result<PathBuf, ae::Error> {
-    let userprofile = std::env::var("USERPROFILE").map_err(|_| ae::Error::Generic)?;
-    Ok(PathBuf::from(userprofile)
-        .join("Documents")
-        .join("Particle Kit")
-        .join("node-graphs"))
-}
-
-#[cfg(not(windows))]
-fn node_graph_state_root_dir() -> Result<std::path::PathBuf, ae::Error> {
-    Err(ae::Error::Generic)
+    Ok(particle_kit_documents_dir()?.join("node-graphs"))
 }
 
 fn node_ui_shell_assets() -> [(&'static str, &'static str); 4] {
@@ -2399,21 +2445,10 @@ fn node_ui_shell_startup_payload_js(
     ))
 }
 
-#[cfg(windows)]
 fn node_ui_shell_root_dir() -> Result<PathBuf, ae::Error> {
-    let userprofile = std::env::var("USERPROFILE").map_err(|_| ae::Error::Generic)?;
-    Ok(PathBuf::from(userprofile)
-        .join("Documents")
-        .join("Particle Kit")
-        .join("node-ui-shell"))
+    Ok(particle_kit_documents_dir()?.join("node-ui-shell"))
 }
 
-#[cfg(not(windows))]
-fn node_ui_shell_root_dir() -> Result<std::path::PathBuf, ae::Error> {
-    Err(ae::Error::Generic)
-}
-
-#[cfg(windows)]
 fn install_node_ui_shell_assets(
     project_state: &ParticleLabProjectState,
 ) -> Result<PathBuf, ae::Error> {
@@ -2430,30 +2465,12 @@ fn install_node_ui_shell_assets(
     Ok(dir.join("index.html"))
 }
 
-#[cfg(not(windows))]
-fn install_node_ui_shell_assets(
-    _project_state: &ParticleLabProjectState,
-) -> Result<std::path::PathBuf, ae::Error> {
-    Err(ae::Error::Generic)
-}
-
-#[cfg(windows)]
 fn open_node_ui_shell_sidecar(
     project_state: &ParticleLabProjectState,
 ) -> Result<PathBuf, ae::Error> {
     let index_path = install_node_ui_shell_assets(project_state)?;
-    std::process::Command::new("explorer.exe")
-        .arg(index_path.as_os_str())
-        .spawn()
-        .map_err(|_| ae::Error::Generic)?;
+    reveal_in_shell(&index_path)?;
     Ok(index_path)
-}
-
-#[cfg(not(windows))]
-fn open_node_ui_shell_sidecar(
-    _project_state: &ParticleLabProjectState,
-) -> Result<std::path::PathBuf, ae::Error> {
-    Err(ae::Error::Generic)
 }
 
 fn epoch_days_to_date(days: i64) -> (i64, u32, u32) {
@@ -2490,20 +2507,10 @@ fn timestamped_json_name(prefix: &str) -> String {
     )
 }
 
-#[cfg(windows)]
 fn open_preset_folder() -> Result<(), ae::Error> {
     let dir = preset_root_dir()?;
     fs::create_dir_all(&dir).map_err(|_| ae::Error::Generic)?;
-    std::process::Command::new("explorer.exe")
-        .arg(dir.as_os_str())
-        .spawn()
-        .map_err(|_| ae::Error::Generic)?;
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn open_preset_folder() -> Result<(), ae::Error> {
-    Err(ae::Error::Generic)
+    reveal_in_shell(&dir)
 }
 
 fn handle_preset_command(

@@ -1,7 +1,5 @@
 use after_effects as ae;
-#[cfg(windows)]
 use std::fs;
-#[cfg(windows)]
 use std::path::PathBuf;
 
 #[cfg(windows)]
@@ -55,6 +53,59 @@ mod file_dialog {
             None
         } else {
             Some(PathBuf::from(path))
+        }
+    }
+}
+
+// ---- File dialog via osascript (macOS) ----
+#[cfg(target_os = "macos")]
+mod file_dialog {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn applescript_string(text: &str) -> String {
+        format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    fn run(script: &str) -> Option<PathBuf> {
+        let output = Command::new("osascript")
+            .args(["-e", script])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path_str.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(path_str))
+        }
+    }
+
+    pub fn open_file_dialog(initial_dir: &str, title: &str) -> Option<PathBuf> {
+        run(&format!(
+            "activate\nPOSIX path of (choose file with prompt {} default location (POSIX file {}) of type {{\"json\", \"public.json\"}})",
+            applescript_string(title),
+            applescript_string(initial_dir)
+        ))
+    }
+
+    pub fn save_file_dialog(initial_dir: &str, title: &str, default_name: &str) -> Option<PathBuf> {
+        let path = run(&format!(
+            "activate\nPOSIX path of (choose file name with prompt {} default name {} default location (POSIX file {}))",
+            applescript_string(title),
+            applescript_string(default_name),
+            applescript_string(initial_dir)
+        ))?;
+        // Match the Windows dialog's DefaultExt = json.
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        {
+            Some(path)
+        } else {
+            Some(path.with_extension("json"))
         }
     }
 }
@@ -545,7 +596,6 @@ fn export_lattice_node_graph_state(
     state: &LatticeLabProjectState,
     out_data: &mut ae::OutData,
 ) -> Result<(), ae::Error> {
-    #[cfg(windows)]
     {
         let dir = lattice_node_graph_state_root_dir()?;
         fs::create_dir_all(&dir).map_err(|_| ae::Error::Generic)?;
@@ -562,11 +612,6 @@ fn export_lattice_node_graph_state(
             ));
         }
     }
-    #[cfg(not(windows))]
-    {
-        let _ = state;
-        out_data.set_return_msg("Lattice Lab node graph export is not available on this platform.");
-    }
     Ok(())
 }
 
@@ -574,7 +619,6 @@ fn import_lattice_node_graph_state(
     state: &mut LatticeLabProjectState,
     out_data: &mut ae::OutData,
 ) -> Result<(), ae::Error> {
-    #[cfg(windows)]
     {
         let dir = lattice_node_graph_state_root_dir()?;
         fs::create_dir_all(&dir).map_err(|_| ae::Error::Generic)?;
@@ -603,11 +647,6 @@ fn import_lattice_node_graph_state(
             out_data.set_out_flag(ae::OutFlags::RefreshUi, true);
             out_data.set_force_rerender();
         }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = state;
-        out_data.set_return_msg("Lattice Lab node graph import is not available on this platform.");
     }
     Ok(())
 }
@@ -657,21 +696,33 @@ fn open_lattice_node_ui_shell(
     }
 }
 
-#[cfg(windows)]
 fn lattice_node_ui_shell_root_dir() -> Result<PathBuf, ae::Error> {
-    let userprofile = std::env::var("USERPROFILE").map_err(|_| ae::Error::Generic)?;
-    Ok(PathBuf::from(userprofile)
-        .join("Documents")
-        .join("Lattice Lab")
-        .join("node-ui-shell"))
+    Ok(lattice_lab_documents_dir()?.join("node-ui-shell"))
 }
 
-#[cfg(not(windows))]
-fn lattice_node_ui_shell_root_dir() -> Result<std::path::PathBuf, ae::Error> {
-    Err(ae::Error::Generic)
+/// `Documents/Lattice Lab` in the user's home folder (Windows: USERPROFILE, macOS: HOME).
+fn lattice_lab_documents_dir() -> Result<PathBuf, ae::Error> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    let home = home.filter(|h| !h.is_empty()).ok_or(ae::Error::Generic)?;
+    Ok(PathBuf::from(home).join("Documents").join("Lattice Lab"))
 }
 
-#[cfg(windows)]
+/// Opens a file or folder with the system shell (Explorer / Finder).
+fn reveal_in_shell(path: &std::path::Path) -> Result<(), ae::Error> {
+    #[cfg(windows)]
+    let program = "explorer.exe";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    std::process::Command::new(program)
+        .arg(path.as_os_str())
+        .spawn()
+        .map_err(|_| ae::Error::Generic)?;
+    Ok(())
+}
+
 fn install_lattice_node_ui_shell_assets(
     state: &LatticeLabProjectState,
 ) -> Result<PathBuf, ae::Error> {
@@ -688,39 +739,16 @@ fn install_lattice_node_ui_shell_assets(
     Ok(dir.join("index.html"))
 }
 
-#[cfg(not(windows))]
-fn install_lattice_node_ui_shell_assets(
-    _state: &LatticeLabProjectState,
-) -> Result<std::path::PathBuf, ae::Error> {
-    Err(ae::Error::Generic)
-}
-
-#[cfg(windows)]
 fn open_lattice_node_ui_shell_sidecar(
     state: &LatticeLabProjectState,
 ) -> Result<PathBuf, ae::Error> {
     let index_path = install_lattice_node_ui_shell_assets(state)?;
-    std::process::Command::new("explorer.exe")
-        .arg(index_path.as_os_str())
-        .spawn()
-        .map_err(|_| ae::Error::Generic)?;
+    reveal_in_shell(&index_path)?;
     Ok(index_path)
 }
 
-#[cfg(not(windows))]
-fn open_lattice_node_ui_shell_sidecar(
-    _state: &LatticeLabProjectState,
-) -> Result<std::path::PathBuf, ae::Error> {
-    Err(ae::Error::Generic)
-}
-
-#[cfg(windows)]
 fn lattice_node_graph_state_root_dir() -> Result<PathBuf, ae::Error> {
-    let userprofile = std::env::var("USERPROFILE").map_err(|_| ae::Error::Generic)?;
-    Ok(PathBuf::from(userprofile)
-        .join("Documents")
-        .join("Lattice Lab")
-        .join("node-graphs"))
+    Ok(lattice_lab_documents_dir()?.join("node-graphs"))
 }
 
 fn timestamped_json_name(prefix: &str) -> String {
